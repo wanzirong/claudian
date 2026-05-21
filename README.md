@@ -30,12 +30,20 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 
 - **Claude provider**: [Claude Code CLI](https://code.claude.com/docs/en/overview) installed (native install recommended). Claude subscription/API or compatible provider ([Openrouter](https://openrouter.ai/docs/guides/guides/claude-code-integration), [Kimi](https://platform.moonshot.ai/docs/guide/agent-support), etc.).
 - **Optional providers**: [Codex CLI](https://github.com/openai/codex), [Opencode](https://opencode.ai/).
-- Obsidian v1.4.5+
+- Obsidian v1.7.2+
 - Desktop only (macOS, Linux, Windows)
 
 ## Installation
 
-### From GitHub Release (recommended)
+### From Obsidian Community Plugins (recommended)
+
+1. Open Obsidian → Settings → Community plugins → Browse
+2. Search for "Claudian" and click Install
+3. Enable the plugin
+
+Or install directly from the [community plugin page](https://community.obsidian.md/plugins/realclaudian).
+
+### From GitHub Release
 
 1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/YishenTu/claudian/releases/latest)
 2. Create a folder called `claudian` in your vault's plugins folder:
@@ -45,19 +53,6 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 3. Copy the downloaded files into the `claudian` folder
 4. Enable the plugin in Obsidian:
    - Settings → Community plugins → Enable "Claudian"
-
-### Using BRAT
-
-[BRAT](https://github.com/TfTHacker/obsidian42-brat) (Beta Reviewers Auto-update Tester) allows you to install and automatically update plugins directly from GitHub.
-
-1. Install the BRAT plugin from Obsidian Community Plugins
-2. Enable BRAT in Settings → Community plugins
-3. Open BRAT settings and click "Add Beta plugin"
-4. Enter the repository URL: `https://github.com/YishenTu/claudian`
-5. Click "Add Plugin" and BRAT will install Claudian automatically
-6. Enable Claudian in Settings → Community plugins
-
-> **Tip**: BRAT will automatically check for updates and notify you when a new version is available.
 
 ### From source (development)
 
@@ -87,13 +82,13 @@ npm run dev
 npm run build
 ```
 
-> **Tip**: Copy `.env.local.example` to `.env.local` or `npm install` and setup your vault path to auto-copy files during development.
-
 ## Privacy & Data Use
 
-- **Sent to API**: Your input, attached files, images, and tool call outputs. Default: Anthropic (Claude) or OpenAI (Codex); configurable via environment variables.
+- **Sent to API**: Your input, attached files, images, and tool call outputs. Default: Anthropic (Claude) or OpenAI (Codex); configurable via provider settings and environment variables.
 - **Local storage**: Claudian settings and session metadata in `vault/.claudian/`; Claude provider files in `vault/.claude/`; transcripts in `~/.claude/projects/` (Claude) and `~/.codex/sessions/` (Codex).
-- **No telemetry**: No tracking beyond your configured API provider.
+- **Environment variables**: Provider subprocesses inherit the Obsidian process environment plus any variables you configure in Claudian. This is needed for CLI authentication, proxies, certificates, and PATH resolution.
+- **Device-specific paths**: Per-device CLI paths use an opaque local key stored in browser local storage, not your system hostname.
+- **Background activity**: Claudian does not run telemetry beacons. UI polling timers read local Obsidian/editor selection state only. Network activity is limited to explicit provider runtime work, configured MCP endpoints, and provider SDK/CLI calls needed to answer your requests.
 
 ## Troubleshooting
 

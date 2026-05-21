@@ -93,6 +93,8 @@ export interface ChatRewindResult {
   deletions?: number;
 }
 
+export type ChatRewindMode = 'conversation' | 'code-and-conversation';
+
 export interface SubagentRuntimeState {
   hasRunning: boolean;
 }
@@ -108,6 +110,8 @@ export interface AutoTurnResult {
   chunks: StreamChunk[];
   metadata: ChatTurnMetadata;
 }
+
+export type AutoTurnCallback = (result: AutoTurnResult) => void | Promise<void>;
 
 export type {
   ApprovalDecision,

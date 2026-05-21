@@ -1,4 +1,4 @@
-import { Notice } from 'obsidian';
+import { Notice, setIcon } from 'obsidian';
 
 import {
   type BuiltInCommand,
@@ -14,6 +14,11 @@ import {
   type TitleGenerationService,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
+import {
+  cloneChatTurnRequest,
+  mergeQueuedChatTurns,
+  type QueuedChatTurn,
+} from '../../../core/runtime/QueuedTurn';
 import type {
   ApprovalCallbackOptions,
   ApprovalDecisionOption,
@@ -62,6 +67,10 @@ const DEFAULT_APPROVAL_DECISION_OPTIONS: ApprovalDecisionOption[] =
     value: label,
     decision,
   }));
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
 
 export interface InputControllerDeps {
   plugin: ClaudianPlugin;
@@ -185,6 +194,8 @@ export class InputController {
     browserContextOverride?: BrowserSelectionContext | null;
     canvasContextOverride?: CanvasSelectionContext | null;
     content?: string;
+    images?: ChatMessage['images'];
+    turnRequestOverride?: ChatTurnRequest;
   }): Promise<void> {
     const {
       plugin,
@@ -207,7 +218,10 @@ export class InputController {
     const contentOverride = options?.content;
     const shouldUseInput = contentOverride === undefined;
     const content = (contentOverride ?? inputEl.value).trim();
-    const hasImages = imageContextManager?.hasImages() ?? false;
+    const imageOverride = options?.images;
+    const hasImages = imageOverride !== undefined
+      ? imageOverride.length > 0
+      : (imageContextManager?.hasImages() ?? false);
     if (!content && !hasImages) return;
 
     // Check for built-in commands first (e.g., /clear, /new, /add-dir)
@@ -223,23 +237,31 @@ export class InputController {
 
     // If agent is working, queue the message instead of dropping it
     if (state.isStreaming) {
-      const images = hasImages ? [...(imageContextManager?.getAttachedImages() || [])] : undefined;
+      const images = hasImages
+        ? [...(imageOverride ?? imageContextManager?.getAttachedImages() ?? [])]
+        : undefined;
       const editorContext = selectionController.getContext();
       const browserContext = browserSelectionController?.getContext() ?? null;
       const canvasContext = canvasSelectionController.getContext();
-      state.queuedMessage = this.mergeQueuedMessages(state.queuedMessage, {
+      const { displayContent, turnRequest } = this.buildTurnSubmission({
         content,
         images,
-        editorContext,
-        browserContext,
-        canvasContext,
+        editorContextOverride: editorContext,
+        browserContextOverride: browserContext,
+        canvasContextOverride: canvasContext,
       });
+      state.queuedMessage = this.mergeQueuedMessages(
+        state.queuedMessage,
+        this.createQueuedMessage(displayContent, turnRequest),
+      );
 
       if (shouldUseInput) {
         inputEl.value = '';
         this.deps.resetInputHeight();
       }
-      imageContextManager?.clearImages();
+      if (shouldUseInput) {
+        imageContextManager?.clearImages();
+      }
       this.updateQueueIndicator();
       return;
     }
@@ -258,14 +280,14 @@ export class InputController {
     // Hide welcome message when sending first message
     const welcomeEl = this.deps.getWelcomeEl();
     if (welcomeEl) {
-      welcomeEl.style.display = 'none';
+      welcomeEl.addClass('claudian-hidden');
     }
 
     fileContextManager?.startSession();
 
     // Slash commands are passed directly to SDK for handling
     // SDK handles expansion, $ARGUMENTS, @file references, and frontmatter options
-    const images = imageContextManager?.getAttachedImages() || [];
+    const images = imageOverride ?? imageContextManager?.getAttachedImages() ?? [];
     const imagesForMessage = images.length > 0 ? [...images] : undefined;
     const isCompact = /^\/compact(\s|$)/i.test(content);
 
@@ -274,15 +296,20 @@ export class InputController {
       imageContextManager?.clearImages();
     }
 
-    const submission = this.buildTurnSubmission({
-      content,
-      images: imagesForMessage,
-      editorContextOverride: options?.editorContextOverride,
-      browserContextOverride: options?.browserContextOverride,
-      canvasContextOverride: options?.canvasContextOverride,
-    });
-    const { displayContent } = submission;
-    let { turnRequest } = submission;
+    const turnSubmission = options?.turnRequestOverride
+      ? {
+        displayContent: content,
+        turnRequest: cloneChatTurnRequest(options.turnRequestOverride),
+      }
+      : this.buildTurnSubmission({
+        content,
+        images: imagesForMessage,
+        editorContextOverride: options?.editorContextOverride,
+        browserContextOverride: options?.browserContextOverride,
+        canvasContextOverride: options?.canvasContextOverride,
+      });
+    const { displayContent } = turnSubmission;
+    let { turnRequest } = turnSubmission;
 
     if (turnRequest.lineRangeMentions && turnRequest.lineRangeMentions.size > 0) {
       const vault = this.deps.plugin.app.vault;
@@ -563,27 +590,53 @@ export class InputController {
         text: `${isPendingSteerOnly ? '⌙ Steering: ' : '⌙ Queued: '}${this.getQueuedMessageDisplay(visibleQueuedMessage)}`,
       });
 
-      if (state.queuedMessage && this.canSteerQueuedMessage()) {
-        const steerButton = indicatorEl.createEl('button', {
-          cls: 'claudian-queue-indicator-action',
-          text: this.steerInFlight ? 'Steering...' : 'Steer Now',
-        });
-        steerButton.setAttribute('type', 'button');
-        if (this.steerInFlight) {
-          steerButton.setAttribute('disabled', 'true');
-        } else {
-          steerButton.addEventListener('click', (event) => {
-            event.stopPropagation();
-            void this.steerQueuedMessage();
+      if (state.queuedMessage) {
+        const actionsEl = indicatorEl.createDiv({ cls: 'claudian-queue-indicator-actions' });
+
+        if (this.canSteerQueuedMessage()) {
+          const steerButton = actionsEl.createEl('button', {
+            cls: 'claudian-queue-indicator-action',
+            text: this.steerInFlight ? 'Steering...' : 'Steer Now',
           });
+          steerButton.setAttribute('type', 'button');
+          if (this.steerInFlight) {
+            steerButton.setAttribute('disabled', 'true');
+          } else {
+            steerButton.addEventListener('click', (event) => {
+              event.stopPropagation();
+              void this.steerQueuedMessage();
+            });
+          }
         }
+
+        const editButton = this.createQueueIconButton(
+          actionsEl,
+          'pencil',
+          'Edit queued message',
+        );
+        editButton.addEventListener('click', (event) => {
+          event.stopPropagation();
+          this.withdrawQueuedMessageToComposer();
+        });
+
+        const discardButton = this.createQueueIconButton(
+          actionsEl,
+          'trash-2',
+          'Discard queued message',
+        );
+        discardButton.addEventListener('click', (event) => {
+          event.stopPropagation();
+          this.clearQueuedMessage();
+        });
       }
 
-      indicatorEl.style.display = 'flex';
+      indicatorEl.addClass('claudian-visible-flex');
+      indicatorEl.removeClass('claudian-hidden');
       return;
     }
 
-    indicatorEl.style.display = 'none';
+    indicatorEl.removeClass('claudian-visible-flex');
+    indicatorEl.addClass('claudian-hidden');
   }
 
   clearQueuedMessage(): void {
@@ -592,15 +645,39 @@ export class InputController {
     this.updateQueueIndicator();
   }
 
-  private restoreMessageToInput(message: QueuedMessage | null): void {
+  withdrawQueuedMessageToComposer(): void {
+    const { state } = this.deps;
+    if (!state.queuedMessage) return;
+
+    const queuedMessage = this.cloneQueuedMessage(state.queuedMessage);
+    state.queuedMessage = null;
+    this.restoreMessageToInput(queuedMessage, { mergeWithComposer: true });
+    this.updateQueueIndicator();
+  }
+
+  private restoreMessageToInput(
+    message: QueuedMessage | null,
+    options: { mergeWithComposer?: boolean } = {},
+  ): void {
     if (!message) return;
 
     const { content, images } = message;
     const inputEl = this.deps.getInputEl();
-    inputEl.value = content;
-    if (images && images.length > 0) {
-      this.deps.getImageContextManager()?.setImages(images);
+    const currentContent = options.mergeWithComposer ? inputEl.value.trim() : '';
+    inputEl.value = currentContent
+      ? appendMarkdownSnippet(content, currentContent)
+      : content;
+
+    const imageContextManager = this.deps.getImageContextManager();
+    const currentImages = options.mergeWithComposer
+      ? (imageContextManager?.getAttachedImages() ?? [])
+      : [];
+    const restoredImages = [...(images ?? []), ...currentImages];
+    if (restoredImages.length > 0) {
+      imageContextManager?.setImages(restoredImages);
     }
+    this.deps.resetInputHeight();
+    inputEl.focus();
   }
 
   private restorePendingMessagesToInput(): void {
@@ -609,7 +686,7 @@ export class InputController {
       this.pendingSteerMessage,
       state.queuedMessage,
     );
-    this.restoreMessageToInput(combinedMessage);
+    this.restoreMessageToInput(combinedMessage, { mergeWithComposer: true });
     state.queuedMessage = null;
     this.clearPendingSteerState();
     this.updateQueueIndicator();
@@ -619,22 +696,18 @@ export class InputController {
     const { state } = this.deps;
     if (!state.queuedMessage) return;
 
-    const { content, images, editorContext, browserContext, canvasContext } = state.queuedMessage;
+    const queuedMessage = this.cloneQueuedMessage(state.queuedMessage);
     state.queuedMessage = null;
     this.updateQueueIndicator();
 
-    const inputEl = this.deps.getInputEl();
-    inputEl.value = content;
-    if (images && images.length > 0) {
-      this.deps.getImageContextManager()?.setImages(images);
-    }
-
-    setTimeout(
-      () => this.sendMessage({
-        editorContextOverride: editorContext,
-        browserContextOverride: browserContext ?? null,
-        canvasContextOverride: canvasContext,
-      }),
+    window.setTimeout(
+      () => {
+        void this.sendMessage({
+          content: queuedMessage.content,
+          images: queuedMessage.images,
+          turnRequestOverride: this.toQueuedChatTurn(queuedMessage).request,
+        });
+      },
       0
     );
   }
@@ -720,6 +793,23 @@ export class InputController {
     return preview;
   }
 
+  private createQueueIconButton(
+    parentEl: HTMLElement,
+    icon: string,
+    label: string,
+  ): HTMLElement {
+    const button = parentEl.createEl('button', {
+      cls: 'claudian-queue-indicator-icon-action',
+      attr: {
+        'aria-label': label,
+        title: label,
+        type: 'button',
+      },
+    });
+    setIcon(button, icon);
+    return button;
+  }
+
   private canSteerQueuedMessage(): boolean {
     const agentService = this.getAgentService();
     return this.deps.state.isStreaming
@@ -731,6 +821,41 @@ export class InputController {
     return {
       ...message,
       images: message.images ? [...message.images] : undefined,
+      turnRequest: message.turnRequest
+        ? cloneChatTurnRequest(message.turnRequest)
+        : undefined,
+    };
+  }
+
+  private createQueuedMessage(displayContent: string, turnRequest: ChatTurnRequest): QueuedMessage {
+    const request = cloneChatTurnRequest(turnRequest);
+    return {
+      content: displayContent,
+      images: request.images,
+      editorContext: request.editorSelection ?? null,
+      browserContext: request.browserSelection ?? null,
+      canvasContext: request.canvasSelection ?? null,
+      turnRequest: request,
+    };
+  }
+
+  private toQueuedChatTurn(message: QueuedMessage): QueuedChatTurn {
+    if (message.turnRequest) {
+      return {
+        displayContent: message.content,
+        request: cloneChatTurnRequest(message.turnRequest),
+      };
+    }
+
+    return {
+      displayContent: message.content,
+      request: {
+        text: message.content,
+        images: message.images ? [...message.images] : undefined,
+        editorSelection: message.editorContext,
+        browserSelection: message.browserContext ?? null,
+        canvasSelection: message.canvasContext,
+      },
     };
   }
 
@@ -777,23 +902,14 @@ export class InputController {
     incoming: QueuedMessage,
   ): QueuedMessage {
     if (!existing) {
-      return {
-        ...incoming,
-        images: incoming.images ? [...incoming.images] : undefined,
-      };
+      return this.cloneQueuedMessage(incoming);
     }
 
-    const contentParts = [existing.content, incoming.content].filter(part => part.length > 0);
-
-    return {
-      content: contentParts.join('\n\n'),
-      images: [...(existing.images || []), ...(incoming.images || [])].filter(Boolean).length > 0
-        ? [...(existing.images || []), ...(incoming.images || [])]
-        : undefined,
-      editorContext: incoming.editorContext,
-      browserContext: incoming.browserContext,
-      canvasContext: incoming.canvasContext,
-    };
+    const mergedTurn = mergeQueuedChatTurns(
+      this.toQueuedChatTurn(existing),
+      this.toQueuedChatTurn(incoming),
+    );
+    return this.createQueuedMessage(mergedTurn.displayContent, mergedTurn.request);
   }
 
   private async steerQueuedMessage(): Promise<void> {
@@ -814,15 +930,9 @@ export class InputController {
     this.updateQueueIndicator();
 
     try {
-      const { displayContent, turnRequest } = this.buildTurnSubmission({
-        content: queuedMessage.content,
-        images: queuedMessage.images,
-        editorContextOverride: queuedMessage.editorContext,
-        browserContextOverride: queuedMessage.browserContext ?? null,
-        canvasContextOverride: queuedMessage.canvasContext,
-      });
+      const { displayContent, request } = this.toQueuedChatTurn(queuedMessage);
 
-      const preparedTurn = agentService.prepareTurn(turnRequest);
+      const preparedTurn = agentService.prepareTurn(request);
       const accepted = await agentService.steer(preparedTurn);
       if (state.cancelRequested || !this.pendingSteerMessage) {
         return;
@@ -840,7 +950,7 @@ export class InputController {
         currentNote: preparedTurn.isCompact
           ? undefined
           : preparedTurn.request.currentNotePath,
-        images: queuedMessage.images,
+        images: request.images,
       });
     } catch {
       this.restoreQueuedMessageAfterSteerFailure(queuedMessage);
@@ -866,14 +976,14 @@ export class InputController {
       return;
     }
 
-    this.restoreMessageToInput(message);
+    this.restoreMessageToInput(message, { mergeWithComposer: true });
     this.updateQueueIndicator();
   }
 
   private activateStreamingAssistantMessage(message: ChatMessage): void {
     const { state, renderer } = this.deps;
     const msgEl = renderer.addMessage(message);
-    const contentEl = msgEl.querySelector('.claudian-message-content') as HTMLElement | null;
+    const contentEl = msgEl.querySelector<HTMLElement>('.claudian-message-content');
 
     if (!contentEl) {
       return;
@@ -1111,7 +1221,7 @@ export class InputController {
     if (!(plugin.settings.enableAutoScroll ?? true)) return;
     if (!state.autoScrollEnabled) return;
 
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       if (!(this.deps.plugin.settings.enableAutoScroll ?? true)) return;
       if (!this.deps.state.autoScrollEnabled) return;
 
@@ -1141,13 +1251,15 @@ export class InputController {
         plugin.app,
         rawInstruction,
         {
-          onAccept: async (finalInstruction) => {
-            const currentPrompt = plugin.settings.systemPrompt;
-            plugin.settings.systemPrompt = appendMarkdownSnippet(currentPrompt, finalInstruction);
-            await plugin.saveSettings();
+          onAccept: (finalInstruction) => {
+            void (async (): Promise<void> => {
+              const currentPrompt = plugin.settings.systemPrompt;
+              plugin.settings.systemPrompt = appendMarkdownSnippet(currentPrompt, finalInstruction);
+              await plugin.saveSettings();
 
-            new Notice('Instruction added to custom system prompt');
-            instructionModeManager?.clear();
+              new Notice('Instruction added to custom system prompt');
+              instructionModeManager?.clear();
+            })();
           },
           onReject: () => {
             wasCancelled = true;
@@ -1356,7 +1468,7 @@ export class InputController {
       } catch (err) {
         setPending(null);
         this.restoreInputContainer(inputContainerEl);
-        reject(err);
+        reject(toError(err));
       }
     });
   }
@@ -1403,7 +1515,7 @@ export class InputController {
       } catch (err) {
         this.pendingExitPlanModeInline = null;
         this.restoreInputContainer(inputContainerEl);
-        reject(err);
+        reject(toError(err));
       }
     });
   }
@@ -1457,7 +1569,7 @@ export class InputController {
         this.pendingPlanApproval = null;
         this.pendingPlanApprovalInvalidated = false;
         this.restoreInputContainer(inputContainerEl);
-        reject(err);
+        reject(toError(err));
       }
     });
   }
@@ -1476,21 +1588,21 @@ export class InputController {
 
   private hideInputContainer(inputContainerEl: HTMLElement): void {
     this.inputContainerHideDepth++;
-    inputContainerEl.style.display = 'none';
+    inputContainerEl.addClass('claudian-hidden');
   }
 
   private restoreInputContainer(inputContainerEl: HTMLElement): void {
     if (this.inputContainerHideDepth <= 0) return;
     this.inputContainerHideDepth--;
     if (this.inputContainerHideDepth === 0) {
-      inputContainerEl.style.display = '';
+      inputContainerEl.removeClass('claudian-hidden');
     }
   }
 
   private resetInputContainerVisibility(): void {
     if (this.inputContainerHideDepth > 0) {
       this.inputContainerHideDepth = 0;
-      this.deps.getInputContainerEl().style.display = '';
+      this.deps.getInputContainerEl().removeClass('claudian-hidden');
     }
   }
 
@@ -1540,9 +1652,14 @@ export class InputController {
         await this.deps.onForkAll();
         break;
       }
-      default:
+      default: {
         // Unknown command - notify user
-        new Notice(`Unknown command: ${command.action}`);
+        const unknownAction = typeof (command as { action?: unknown }).action === 'string'
+          ? (command as { action: string }).action
+          : 'unknown';
+        new Notice(`Unknown command: ${unknownAction}`);
+        break;
+      }
     }
   }
 

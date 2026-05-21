@@ -50,9 +50,13 @@ describe('ClaudianPlugin', () => {
         getRightLeaf: jest.fn().mockReturnValue({
           setViewState: jest.fn().mockResolvedValue(undefined),
         }),
+        getLeftLeaf: jest.fn().mockReturnValue({
+          setViewState: jest.fn().mockResolvedValue(undefined),
+        }),
         getLeaf: jest.fn().mockReturnValue({
           setViewState: jest.fn().mockResolvedValue(undefined),
         }),
+        setActiveLeaf: jest.fn(),
         revealLeaf: jest.fn(),
       },
     };
@@ -130,7 +134,7 @@ describe('ClaudianPlugin', () => {
       expect(mockApp.workspace.revealLeaf).toHaveBeenCalledWith(mockLeaf);
     });
 
-    it('should create new leaf in right sidebar if view does not exist', async () => {
+    it('should create new leaf in right sidebar by default if view does not exist', async () => {
       const mockRightLeaf = {
         setViewState: jest.fn().mockResolvedValue(undefined),
       };
@@ -147,6 +151,26 @@ describe('ClaudianPlugin', () => {
       });
     });
 
+    it('should create new leaf in left sidebar when chatViewPlacement is left-sidebar', async () => {
+      const mockLeftLeaf = {
+        setViewState: jest.fn().mockResolvedValue(undefined),
+      };
+      mockApp.workspace.getLeavesOfType.mockReturnValue([]);
+      mockApp.workspace.getLeftLeaf.mockReturnValue(mockLeftLeaf);
+
+      await plugin.onload();
+      plugin.settings.chatViewPlacement = 'left-sidebar';
+      await plugin.activateView();
+
+      expect(mockApp.workspace.getLeftLeaf).toHaveBeenCalledWith(false);
+      expect(mockApp.workspace.getRightLeaf).not.toHaveBeenCalled();
+      expect(mockApp.workspace.getLeaf).not.toHaveBeenCalled();
+      expect(mockLeftLeaf.setViewState).toHaveBeenCalledWith({
+        type: VIEW_TYPE_CLAUDIAN,
+        active: true,
+      });
+    });
+
     it('should handle null right leaf gracefully', async () => {
       mockApp.workspace.getLeavesOfType.mockReturnValue([]);
       mockApp.workspace.getRightLeaf.mockReturnValue(null);
@@ -157,7 +181,7 @@ describe('ClaudianPlugin', () => {
       await expect(plugin.activateView()).resolves.not.toThrow();
     });
 
-    it('should create new leaf in main editor area when openInMainTab is enabled', async () => {
+    it('should create new leaf in main editor area when chatViewPlacement is main-tab', async () => {
       const mockMainLeaf = {
         setViewState: jest.fn().mockResolvedValue(undefined),
       };
@@ -165,23 +189,24 @@ describe('ClaudianPlugin', () => {
       mockApp.workspace.getLeaf.mockReturnValue(mockMainLeaf);
 
       await plugin.onload();
-      plugin.settings.openInMainTab = true;
+      plugin.settings.chatViewPlacement = 'main-tab';
       await plugin.activateView();
 
       expect(mockApp.workspace.getLeaf).toHaveBeenCalledWith('tab');
       expect(mockApp.workspace.getRightLeaf).not.toHaveBeenCalled();
+      expect(mockApp.workspace.getLeftLeaf).not.toHaveBeenCalled();
       expect(mockMainLeaf.setViewState).toHaveBeenCalledWith({
         type: VIEW_TYPE_CLAUDIAN,
         active: true,
       });
     });
 
-    it('should handle null main leaf gracefully when openInMainTab is enabled', async () => {
+    it('should handle null main leaf gracefully when chatViewPlacement is main-tab', async () => {
       mockApp.workspace.getLeavesOfType.mockReturnValue([]);
       mockApp.workspace.getLeaf.mockReturnValue(null);
 
       await plugin.onload();
-      plugin.settings.openInMainTab = true;
+      plugin.settings.chatViewPlacement = 'main-tab';
 
       await expect(plugin.activateView()).resolves.not.toThrow();
     });
@@ -257,6 +282,29 @@ describe('ClaudianPlugin', () => {
       await plugin.loadSettings();
 
       expect(plugin.settings).toEqual(DEFAULT_SETTINGS);
+    });
+
+    it('should migrate legacy openInMainTab true to main-tab placement', async () => {
+      mockApp.vault.adapter.exists.mockImplementation(async (path: string) => {
+        return path === '.claudian/claudian-settings.json';
+      });
+      mockApp.vault.adapter.read.mockImplementation(async (path: string) => {
+        if (path === '.claudian/claudian-settings.json') {
+          return JSON.stringify({ openInMainTab: true });
+        }
+        return '';
+      });
+
+      await plugin.loadSettings();
+
+      expect(plugin.settings.chatViewPlacement).toBe('main-tab');
+      const writeCall = (mockApp.vault.adapter.write as jest.Mock).mock.calls.find(
+        ([path]) => path === '.claudian/claudian-settings.json',
+      );
+      expect(writeCall).toBeDefined();
+      const content = JSON.parse(writeCall[1]);
+      expect(content.chatViewPlacement).toBe('main-tab');
+      expect(content).not.toHaveProperty('openInMainTab');
     });
 
     it('should reconcile model from environment and persist when changed', async () => {
@@ -531,6 +579,19 @@ describe('ClaudianPlugin', () => {
       const command = getRegisteredCommand('new-tab');
 
       expect(command.checkCallback(true)).toBe(false);
+    });
+
+    it('keeps tab commands unavailable while a Claudian leaf view is not initialized', async () => {
+      await plugin.onload();
+
+      mockApp.workspace.getLeavesOfType.mockReturnValue([{ view: {} }]);
+
+      for (const commandId of ['new-tab', 'new-session', 'close-current-tab']) {
+        const command = getRegisteredCommand(commandId);
+
+        expect(() => command.checkCallback(true)).not.toThrow();
+        expect(command.checkCallback(true)).toBe(false);
+      }
     });
 
     it('stays unavailable when reopening the persisted layout would already hit the tab limit', async () => {

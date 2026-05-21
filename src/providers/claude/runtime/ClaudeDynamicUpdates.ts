@@ -11,7 +11,6 @@ import type {
 import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
 import {
   resolveAdaptiveEffortLevel,
-  resolveThinkingTokens,
 } from '../types/models';
 import type {
   ClaudeEnsureReadyOptions,
@@ -77,23 +76,6 @@ export async function applyClaudeDynamicUpdates(
     }
   }
 
-  const thinkingTokens = resolveThinkingTokens(selectedModel, settings.thinkingBudget);
-  const currentThinking = deps.getCurrentConfig()?.thinkingTokens ?? null;
-  if (thinkingTokens !== currentThinking) {
-    try {
-      await persistentQuery.setMaxThinkingTokens(thinkingTokens);
-      deps.mutateCurrentConfig(config => {
-        config.thinkingTokens = thinkingTokens;
-      });
-    } catch {
-      deps.notifyFailure('Failed to update thinking budget');
-    }
-  } else {
-    deps.mutateCurrentConfig(config => {
-      config.thinkingTokens = thinkingTokens;
-    });
-  }
-
   const effortLevel = resolveAdaptiveEffortLevel(selectedModel, settings.effortLevel);
   if (effortLevel !== null) {
     const currentEffort = deps.getCurrentConfig()?.effortLevel ?? null;
@@ -150,7 +132,7 @@ export async function applyClaudeDynamicUpdates(
   if (deps.getCurrentConfig() && mcpServersKey !== deps.getCurrentConfig()!.mcpServersKey) {
     const serverConfigs: Record<string, McpServerConfig> = {};
     for (const [name, config] of Object.entries(mcpServers)) {
-      serverConfigs[name] = config as McpServerConfig;
+      serverConfigs[name] = config;
     }
 
     try {
