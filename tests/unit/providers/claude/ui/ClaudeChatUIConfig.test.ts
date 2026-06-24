@@ -15,17 +15,17 @@ describe('claudeChatUIConfig', () => {
         'haiku',
         'sonnet',
         'opus',
-        'claude-opus-4-6',
-        'claude-opus-4-6[1m]',
+        'claude-code/claude-opus-4-6',
+        'claude-code/claude-opus-4-6[1m]',
       ]);
       expect(options.slice(-2)).toEqual([
         {
-          value: 'claude-opus-4-6',
+          value: 'claude-code/claude-opus-4-6',
           label: 'Opus 4.6',
           description: 'Custom model',
         },
         {
-          value: 'claude-opus-4-6[1m]',
+          value: 'claude-code/claude-opus-4-6[1m]',
           label: 'Opus 4.6 (1M)',
           description: 'Custom model',
         },
@@ -45,7 +45,7 @@ describe('claudeChatUIConfig', () => {
         'haiku',
         'sonnet',
         'opus',
-        'claude-opus-4-6',
+        'claude-code/claude-opus-4-6',
       ]);
     });
 
@@ -59,8 +59,27 @@ describe('claudeChatUIConfig', () => {
       });
 
       expect(options.at(-1)).toEqual({
-        value: 'claude-opus-4-5-20251101',
+        value: 'claude-code/claude-opus-4-5-20251101',
         label: 'Opus 4.5 (2511)',
+        description: 'Custom model',
+      });
+    });
+
+    it('uses custom model aliases for settings-defined custom model labels', () => {
+      const options = claudeChatUIConfig.getModelOptions({
+        customModelAliases: {
+          'claude-opus-4-6': 'Work Opus',
+        },
+        providerConfigs: {
+          claude: {
+            customModels: 'claude-opus-4-6',
+          },
+        },
+      });
+
+      expect(options.at(-1)).toEqual({
+        value: 'claude-code/claude-opus-4-6',
+        label: 'Work Opus',
         description: 'Custom model',
       });
     });
@@ -77,8 +96,29 @@ describe('claudeChatUIConfig', () => {
 
       expect(options).toEqual([
         {
-          value: 'claude-sonnet-4-5',
+          value: 'claude-code/claude-sonnet-4-5',
           label: 'Sonnet 4.5',
+          description: 'Custom model (model)',
+        },
+      ]);
+    });
+
+    it('uses custom model aliases for environment-defined custom model labels', () => {
+      const options = claudeChatUIConfig.getModelOptions({
+        customModelAliases: {
+          'claude-sonnet-4-5': 'Gateway Sonnet',
+        },
+        providerConfigs: {
+          claude: {
+            environmentVariables: 'ANTHROPIC_MODEL=claude-sonnet-4-5',
+          },
+        },
+      });
+
+      expect(options).toEqual([
+        {
+          value: 'claude-code/claude-sonnet-4-5',
+          label: 'Gateway Sonnet',
           description: 'Custom model (model)',
         },
       ]);
@@ -96,6 +136,13 @@ describe('claudeChatUIConfig', () => {
       const options = claudeChatUIConfig.getReasoningOptions('claude-opus-4-7', {});
 
       expect(options.map(option => option.value)).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    });
+
+    it('uses effort options for custom model ids', () => {
+      const options = claudeChatUIConfig.getReasoningOptions('custom-model', {});
+
+      expect(options.map(option => option.value)).toEqual(['low', 'medium', 'high', 'max']);
+      expect(options.some(option => option.tokens !== undefined)).toBe(false);
     });
   });
 

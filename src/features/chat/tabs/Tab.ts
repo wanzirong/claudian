@@ -49,7 +49,7 @@ import { StatusPanel } from '../ui/StatusPanel';
 import { autoResizeTextarea } from '../ui/textareaResize';
 import { recalculateUsageForModel } from '../utils/usageInfo';
 import { getTabProviderId } from './providerResolution';
-import type { TabData, TabDOMElements, TabId, TabProviderContext } from './types';
+import type { TabData, TabDOMElements, TabId, TabManagerViewHost, TabProviderContext } from './types';
 import { generateTabId } from './types';
 
 type TabProviderSettings = Record<string, unknown> & {
@@ -60,6 +60,11 @@ type TabProviderSettings = Record<string, unknown> & {
   permissionMode: string;
   customContextLimits?: Record<string, number>;
 };
+
+function getSharedSelectionFocusScopeEls(component: Component): HTMLElement[] {
+  const host = component as Partial<TabManagerViewHost>;
+  return host.getSharedSelectionFocusScopeEls?.() ?? [];
+}
 
 /**
  * Returns model options for a blank tab.
@@ -170,23 +175,86 @@ function getTabHiddenCommands(
   );
 }
 
-function shouldSendMessageFromEnterKey(
-  e: KeyboardEvent,
-  settings: Pick<ClaudianSettings, 'requireCommandOrControlEnterToSend'>,
-): boolean {
+function isEnterWithoutShiftOrComposition(e: KeyboardEvent): boolean {
   if (e.key !== 'Enter' || e.shiftKey || e.isComposing) {
     return false;
   }
 
-  if (settings.requireCommandOrControlEnterToSend !== true) {
-    return true;
-  }
+  return true;
+}
 
+function hasPlatformSendModifier(e: KeyboardEvent): boolean {
   if (Platform.isMacOS) {
     return e.metaKey === true && !e.ctrlKey && !e.altKey;
   }
 
   return e.ctrlKey === true && !e.metaKey && !e.altKey;
+}
+
+function shouldSendMessageFromExplicitEnterShortcut(e: KeyboardEvent): boolean {
+  return isEnterWithoutShiftOrComposition(e) && hasPlatformSendModifier(e);
+}
+
+function shouldSendMessageFromEnterKey(
+  e: KeyboardEvent,
+  settings: Pick<ClaudianSettings, 'requireCommandOrControlEnterToSend'>,
+): boolean {
+  if (!isEnterWithoutShiftOrComposition(e)) {
+    return false;
+  }
+
+  if (settings.requireCommandOrControlEnterToSend === true) {
+    return hasPlatformSendModifier(e);
+  }
+
+  return true;
+}
+
+function isTabInputFocused(tab: TabData): boolean {
+  return tab.dom.inputEl.ownerDocument.activeElement === tab.dom.inputEl;
+}
+
+function sendTabInputMessage(
+  tab: TabData,
+  e: KeyboardEvent,
+  options?: { requireInputFocus?: boolean },
+): boolean {
+  if (options?.requireInputFocus && !isTabInputFocused(tab)) {
+    return false;
+  }
+
+  const inputController = tab.controllers.inputController;
+  if (!inputController) {
+    return false;
+  }
+
+  e.preventDefault();
+  void inputController.sendMessage();
+  return true;
+}
+
+export function sendTabInputMessageFromExplicitEnterShortcut(
+  tab: TabData,
+  e: KeyboardEvent,
+  options?: { requireInputFocus?: boolean },
+): boolean {
+  if (!shouldSendMessageFromExplicitEnterShortcut(e)) {
+    return false;
+  }
+
+  return sendTabInputMessage(tab, e, options);
+}
+
+function sendTabInputMessageFromEnterKey(
+  tab: TabData,
+  settings: Pick<ClaudianSettings, 'requireCommandOrControlEnterToSend'>,
+  e: KeyboardEvent,
+): boolean {
+  if (!shouldSendMessageFromEnterKey(e, settings)) {
+    return false;
+  }
+
+  return sendTabInputMessage(tab, e);
 }
 
 type ProviderCatalogInfo = {
@@ -467,7 +535,8 @@ function buildTabDOM(contentEl: HTMLElement): TabDOMElements {
   const messagesEl = messagesWrapperEl.createDiv({ cls: 'claudian-messages' });
   const welcomeEl = messagesEl.createDiv({ cls: 'claudian-welcome' });
   const statusPanelContainerEl = contentEl.createDiv({ cls: 'claudian-status-panel-container' });
-  const inputContainerEl = contentEl.createDiv({ cls: 'claudian-input-container' });
+  const inputComposerEl = contentEl.createDiv({ cls: 'claudian-input-composer' });
+  const inputContainerEl = inputComposerEl.createDiv({ cls: 'claudian-input-container' });
   const queueIndicatorEl = inputContainerEl.createDiv({ cls: 'claudian-input-queue-row' });
   const navRowEl = inputContainerEl.createDiv({ cls: 'claudian-input-nav-row' });
   const inputWrapper = inputContainerEl.createDiv({ cls: 'claudian-input-wrapper' });
@@ -486,6 +555,7 @@ function buildTabDOM(contentEl: HTMLElement): TabDOMElements {
     messagesEl,
     welcomeEl,
     statusPanelContainerEl,
+    inputComposerEl,
     inputContainerEl,
     queueIndicatorEl,
     inputWrapper,
@@ -829,6 +899,7 @@ function initializeInputToolbar(
         const newContextWindow = uiConfig.getContextWindowSize(
           model,
           providerSettings.customContextLimits,
+          providerSettings,
         );
         tab.state.usage = recalculateUsageForModel(currentUsage, model, newContextWindow);
       }
@@ -1205,7 +1276,7 @@ export function initializeTabControllers(
     dom.inputEl,
     dom.contextRowEl,
     () => autoResizeTextarea(dom.inputEl),
-    dom.contentEl,
+    [dom.contentEl, dom.inputComposerEl, ...getSharedSelectionFocusScopeEls(component)],
   );
 
   tab.controllers.browserSelectionController = new BrowserSelectionController(
@@ -1447,6 +1518,10 @@ export function wireTabInputEvents(tab: TabData, plugin: ClaudianPlugin): void {
       return;
     }
 
+    if (sendTabInputMessageFromExplicitEnterShortcut(tab, e)) {
+      return;
+    }
+
     if (controllers.inputController?.handleResumeKeydown(e)) {
       return;
     }
@@ -1466,9 +1541,8 @@ export function wireTabInputEvents(tab: TabData, plugin: ClaudianPlugin): void {
       return;
     }
 
-    if (shouldSendMessageFromEnterKey(e, plugin.settings)) {
-      e.preventDefault();
-      void controllers.inputController?.sendMessage();
+    if (sendTabInputMessageFromEnterKey(tab, plugin.settings, e)) {
+      return;
     }
   };
   dom.inputEl.addEventListener('keydown', keydownHandler);
@@ -1485,14 +1559,6 @@ export function wireTabInputEvents(tab: TabData, plugin: ClaudianPlugin): void {
   };
   dom.inputEl.addEventListener('input', inputHandler);
   dom.eventCleanups.push(() => dom.inputEl.removeEventListener('input', inputHandler));
-
-  // Sidebar focus handler — show selection highlight when focus enters the tab from outside
-  const focusHandler = (e: FocusEvent) => {
-    if (e.relatedTarget && dom.contentEl.contains(e.relatedTarget as Node)) return;
-    controllers.selectionController?.showHighlight();
-  };
-  dom.contentEl.addEventListener('focusin', focusHandler);
-  dom.eventCleanups.push(() => dom.contentEl.removeEventListener('focusin', focusHandler));
 
   // Scroll listener for auto-scroll control (tracks position always, not just during streaming)
   const SCROLL_THRESHOLD = 20; // pixels from bottom to consider "at bottom"

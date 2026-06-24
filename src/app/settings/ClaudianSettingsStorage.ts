@@ -33,6 +33,10 @@ import {
   getOpencodeProviderSettings,
   updateOpencodeProviderSettings,
 } from '../../providers/opencode/settings';
+import {
+  getPiProviderSettings,
+  updatePiProviderSettings,
+} from '../../providers/pi/settings';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './defaultSettings';
 
 export {
@@ -132,6 +136,7 @@ const HOST_SCOPED_PROVIDER_CONFIG_FIELDS: Record<string, string[]> = {
   claude: ['cliPathsByHost'],
   codex: ['cliPathsByHost', 'installationMethodsByHost', 'wslDistroOverridesByHost'],
   opencode: ['cliPathsByHost'],
+  pi: ['cliPathsByHost'],
 };
 
 function hasHostScopedProviderConfigNormalization(
@@ -182,6 +187,27 @@ function normalizeContextLimits(value: unknown): Record<string, number> | undefi
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function normalizeModelAliases(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const result: Record<string, string> = {};
+  for (const [key, alias] of Object.entries(value)) {
+    if (typeof alias !== 'string') {
+      continue;
+    }
+
+    const modelId = key.trim();
+    const normalizedAlias = alias.trim();
+    if (modelId && normalizedAlias) {
+      result[modelId] = normalizedAlias;
+    }
+  }
+
+  return result;
+}
+
 function normalizeEnvSnippets(value: unknown): EnvSnippet[] {
   if (!Array.isArray(value)) {
     return [];
@@ -203,6 +229,10 @@ function normalizeEnvSnippets(value: unknown): EnvSnippet[] {
       continue;
     }
 
+    const modelAliases = 'modelAliases' in candidate
+      ? normalizeModelAliases(candidate.modelAliases)
+      : undefined;
+
     snippets.push({
       id: candidate.id,
       name: candidate.name,
@@ -215,6 +245,7 @@ function normalizeEnvSnippets(value: unknown): EnvSnippet[] {
           : inferEnvironmentSnippetScope(candidate.envVars),
       ),
       contextLimits: normalizeContextLimits(candidate.contextLimits),
+      modelAliases,
     });
   }
 
@@ -256,6 +287,7 @@ export class ClaudianSettingsStorage {
       stored.hiddenSlashCommands,
     );
     const envSnippets = normalizeEnvSnippets(stored.envSnippets);
+    const customModelAliases = normalizeModelAliases(stored.customModelAliases);
     const providerConfigs = normalizeProviderConfigs(stored.providerConfigs);
     const chatViewPlacement = normalizeChatViewPlacement(
       stored.chatViewPlacement,
@@ -274,6 +306,7 @@ export class ClaudianSettingsStorage {
       ...storedWithoutLegacy,
       sharedEnvironmentVariables: getSharedEnvironmentVariables(legacyProviderSettings),
       envSnippets,
+      customModelAliases,
       hiddenProviderCommands,
       providerConfigs,
       chatViewPlacement,
@@ -296,6 +329,10 @@ export class ClaudianSettingsStorage {
       merged,
       getOpencodeProviderSettings(legacyProviderSettings),
     );
+    updatePiProviderSettings(
+      merged,
+      getPiProviderSettings(legacyProviderSettings),
+    );
     const didNormalizeHostScopedProviderConfigs = hasHostScopedProviderConfigNormalization(
       providerConfigs,
       merged.providerConfigs,
@@ -315,6 +352,10 @@ export class ClaudianSettingsStorage {
       || 'blockedCommands' in stored
       || shouldPersistChatViewPlacementMigration(stored, chatViewPlacement)
       || JSON.stringify(envSnippets) !== JSON.stringify(stored.envSnippets ?? [])
+      || (
+        'customModelAliases' in stored
+        && JSON.stringify(customModelAliases) !== JSON.stringify(stored.customModelAliases ?? {})
+      )
       || didNormalizeHostScopedProviderConfigs
       )
     ) {

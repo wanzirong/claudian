@@ -12,14 +12,14 @@ import {
 } from '../../../core/prompt/mainAgent';
 import type { AppPluginManager } from '../../../core/providers/types';
 import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
+import { toClaudeRuntimeModelId } from '../modelSelection';
 import {
   type ClaudeSafeMode,
   getClaudeProviderSettings,
   resolveClaudeSettingSources,
 } from '../settings';
 import {
-  resolveAdaptiveEffortLevel,
-  resolveThinkingTokens,
+  resolveEffortLevel,
 } from '../types/models';
 import { createCustomSpawnFunction } from './customSpawn';
 import {
@@ -80,10 +80,6 @@ export class QueryOptionsBuilder {
     // Note: Permission mode is handled dynamically via setPermissionMode() in ClaudianService.
     // Since allowDangerouslySkipPermissions is always true, both directions work without restart.
 
-    // Fixed thinking budgets are startup query options. Adaptive effort remains
-    // dynamic via applyFlagSettings(), but fixed budgets require query rebuilds.
-    if (currentConfig.thinkingTokens !== newConfig.thinkingTokens) return true;
-
     if (currentConfig.enableChrome !== newConfig.enableChrome) return true;
     if (currentConfig.enableAutoMode !== newConfig.enableAutoMode) return true;
 
@@ -116,11 +112,11 @@ export class QueryOptionsBuilder {
     const pluginsKey = ctx.pluginManager.getPluginsKey();
 
     const settingSources = resolveClaudeSettingSources(claudeSettings.loadUserSettings);
+    const runtimeModel = toClaudeRuntimeModelId(ctx.settings.model);
 
     return {
-      model: ctx.settings.model,
-      thinkingTokens: resolveThinkingTokens(ctx.settings.model, ctx.settings.thinkingBudget),
-      effortLevel: resolveAdaptiveEffortLevel(ctx.settings.model, ctx.settings.effortLevel),
+      model: runtimeModel,
+      effortLevel: resolveEffortLevel(runtimeModel, ctx.settings.effortLevel),
       permissionMode: ctx.settings.permissionMode,
       sdkPermissionMode,
       systemPromptKey: computeSystemPromptKey(systemPromptSettings),
@@ -136,9 +132,10 @@ export class QueryOptionsBuilder {
   }
 
   static buildPersistentQueryOptions(ctx: PersistentQueryContext): Options {
+    const runtimeModel = toClaudeRuntimeModelId(ctx.settings.model);
     const { options, claudeSettings } = QueryOptionsBuilder.buildBaseOptions(
       ctx,
-      ctx.settings.model,
+      runtimeModel,
       ctx.abortController,
     );
 
@@ -154,7 +151,7 @@ export class QueryOptionsBuilder {
       claudeSettings.safeMode,
       ctx.canUseTool,
     );
-    QueryOptionsBuilder.applyThinking(options, ctx.settings, ctx.settings.model);
+    QueryOptionsBuilder.applyThinking(options, ctx.settings, runtimeModel);
     options.hooks = ctx.hooks;
 
     options.enableFileCheckpointing = true;
@@ -177,7 +174,7 @@ export class QueryOptionsBuilder {
   }
 
   static buildColdStartQueryOptions(ctx: ColdStartQueryContext): Options {
-    const selectedModel = ctx.modelOverride ?? ctx.settings.model;
+    const selectedModel = toClaudeRuntimeModelId(ctx.modelOverride ?? ctx.settings.model);
     const { options, claudeSettings } = QueryOptionsBuilder.buildBaseOptions(
       ctx,
       selectedModel,
@@ -207,7 +204,7 @@ export class QueryOptionsBuilder {
       ctx.canUseTool,
     );
     options.hooks = ctx.hooks;
-    QueryOptionsBuilder.applyThinking(options, ctx.settings, ctx.modelOverride ?? ctx.settings.model);
+    QueryOptionsBuilder.applyThinking(options, ctx.settings, selectedModel);
 
     if (ctx.allowedTools !== undefined && ctx.allowedTools.length > 0) {
       options.tools = ctx.allowedTools;
@@ -302,19 +299,11 @@ export class QueryOptionsBuilder {
     settings: ClaudianSettings,
     model: string
   ): void {
-    const effortLevel = resolveAdaptiveEffortLevel(model, settings.effortLevel);
-    if (effortLevel !== null) {
-      options.thinking = { type: 'adaptive' };
-      // SDK runtime accepts `xhigh` on Opus 4.7+ and silently falls back to
-      // `high` elsewhere, but its type definition lags our local EffortLevel.
-      options.effort = effortLevel;
-      return;
-    }
-
-    const thinkingTokens = resolveThinkingTokens(model, settings.thinkingBudget);
-    if (thinkingTokens !== null) {
-      options.thinking = { type: 'enabled', budgetTokens: thinkingTokens };
-    }
+    const effortLevel = resolveEffortLevel(model, settings.effortLevel);
+    options.thinking = { type: 'adaptive' };
+    // SDK runtime accepts `xhigh` on Opus 4.7+ and silently falls back to
+    // `high` elsewhere, but its type definition lags our local EffortLevel.
+    options.effort = effortLevel;
   }
 
   private static pathsChanged(a?: string[], b?: string[]): boolean {

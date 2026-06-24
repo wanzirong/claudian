@@ -106,7 +106,7 @@ describe('ProviderSettingsCoordinator', () => {
   });
 
   describe('reconcileTitleGenerationModelSelection', () => {
-    it('keeps custom title models while they are still available', () => {
+    it('migrates available Claude custom title models to provider-qualified ids', () => {
       const settings: Record<string, unknown> = {
         titleGenerationModel: 'claude-opus-4-6',
         providerConfigs: {
@@ -119,8 +119,8 @@ describe('ProviderSettingsCoordinator', () => {
 
       expect(
         ProviderSettingsCoordinator.reconcileTitleGenerationModelSelection(settings),
-      ).toBe(false);
-      expect(settings.titleGenerationModel).toBe('claude-opus-4-6');
+      ).toBe(true);
+      expect(settings.titleGenerationModel).toBe('claude-code/claude-opus-4-6');
     });
 
     it('clears titleGenerationModel when no provider exposes the saved model', () => {
@@ -140,7 +140,24 @@ describe('ProviderSettingsCoordinator', () => {
       expect(settings.titleGenerationModel).toBe('');
     });
 
-    it('keeps Codex custom title models while they are still available', () => {
+    it('clears stale provider-qualified custom title models instead of retargeting to a fallback', () => {
+      const settings: Record<string, unknown> = {
+        titleGenerationModel: 'openai-codex/my-custom-model',
+        providerConfigs: {
+          codex: {
+            enabled: true,
+            customModels: '',
+          },
+        },
+      };
+
+      expect(
+        ProviderSettingsCoordinator.reconcileTitleGenerationModelSelection(settings),
+      ).toBe(true);
+      expect(settings.titleGenerationModel).toBe('');
+    });
+
+    it('migrates available Codex custom title models to provider-qualified ids', () => {
       const settings: Record<string, unknown> = {
         titleGenerationModel: 'my-custom-model',
         providerConfigs: {
@@ -153,13 +170,13 @@ describe('ProviderSettingsCoordinator', () => {
 
       expect(
         ProviderSettingsCoordinator.reconcileTitleGenerationModelSelection(settings),
-      ).toBe(false);
-      expect(settings.titleGenerationModel).toBe('my-custom-model');
+      ).toBe(true);
+      expect(settings.titleGenerationModel).toBe('openai-codex/my-custom-model');
     });
   });
 
   describe('projectActiveProviderState', () => {
-    it('projects saved model/effort/budget for the settings provider', () => {
+    it('projects saved model and effort for the settings provider', () => {
       const settings: Record<string, unknown> = {
         settingsProvider: 'codex',
         providerConfigs: {
@@ -182,7 +199,7 @@ describe('ProviderSettingsCoordinator', () => {
       expect(settings.model).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
       expect(settings.effortLevel).toBe('medium');
       expect(settings.serviceTier).toBe('fast');
-      expect(settings.thinkingBudget).toBe('1024');
+      expect(settings.thinkingBudget).toBe('off');
       expect(settings.permissionMode).toBe('normal');
     });
 
@@ -225,7 +242,7 @@ describe('ProviderSettingsCoordinator', () => {
       expect(settings.model).toBe('sonnet');
       expect(settings.effortLevel).toBe('high');
       expect(settings.serviceTier).toBe('default');
-      expect(settings.thinkingBudget).toBe('off');
+      expect(settings.thinkingBudget).toBe('500');
     });
 
     it('does not overwrite when no saved values exist', () => {

@@ -4,13 +4,13 @@
 ![GitHub release](https://img.shields.io/github/v/release/YishenTu/claudian)
 ![License](https://img.shields.io/github/license/YishenTu/claudian)
 
-![Preview](Preview.png)
+![Preview](assets/Preview.png)
 
-An Obsidian plugin that embeds AI coding agents (Claude Code, Codex, Opencode and more to come) in your vault. Your vault becomes the agent's working directory — file read/write, search, bash, and multi-step workflows all work out of the box.
+An Obsidian plugin that embeds AI coding agents (Claude Code, Codex, Opencode, Pi, and more to come) in your vault. Your vault becomes the agent's working directory — file read/write, search, bash, and multi-step workflows all work out of the box.
 
 ## Features & Usage
 
-Open the chat sidebar from the ribbon icon or command palette. Select text and use the hotkey for inline edit. Everything works like your familiar coding agent, Claude Code, Codex and Opencode — talk to the agent, and it reads, writes, edits, and searches files in your vault.
+Open the chat sidebar from the ribbon icon or command palette. Select text and use the hotkey for inline edit. Everything works like your familiar coding agent, Claude Code, Codex, Opencode, and Pi — talk to the agent, and it reads, writes, edits, and searches files in your vault.
 
 **Inline Edit** — Select text or start at the cursor position + hotkey to edit directly in notes with word-level diff preview.
 
@@ -29,7 +29,7 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 ## Requirements
 
 - **Claude provider**: [Claude Code CLI](https://code.claude.com/docs/en/overview) installed (native install recommended). Claude subscription/API or compatible provider ([Openrouter](https://openrouter.ai/docs/guides/guides/claude-code-integration), [Kimi](https://platform.moonshot.ai/docs/guide/agent-support), etc.).
-- **Optional providers**: [Codex CLI](https://github.com/openai/codex), [Opencode](https://opencode.ai/).
+- **Optional providers**: [Codex CLI](https://github.com/openai/codex), [Opencode](https://opencode.ai/), [Pi](https://github.com/earendil-works/pi).
 - Obsidian v1.7.2+
 - Desktop only (macOS, Linux, Windows)
 
@@ -84,8 +84,8 @@ npm run build
 
 ## Privacy & Data Use
 
-- **Sent to API**: Your input, attached files, images, and tool call outputs. Default: Anthropic (Claude) or OpenAI (Codex); configurable via provider settings and environment variables.
-- **Local storage**: Claudian settings and session metadata in `vault/.claudian/`; Claude provider files in `vault/.claude/`; transcripts in `~/.claude/projects/` (Claude) and `~/.codex/sessions/` (Codex).
+- **Sent to API**: Your input, attached files, images, and tool call outputs. Default: Anthropic (Claude), OpenAI (Codex), or the provider configured in Opencode/Pi; configurable via provider settings and environment variables.
+- **Local storage**: Claudian settings and session metadata in `vault/.claudian/`; Claude provider files in `vault/.claude/`; transcripts in `~/.claude/projects/` (Claude), `~/.codex/sessions/` (Codex), and `.pi/agent/sessions/` or `~/.pi/agent/sessions/` (Pi).
 - **Environment variables**: Provider subprocesses inherit the Obsidian process environment plus any variables you configure in Claudian. This is needed for CLI authentication, proxies, certificates, and PATH resolution.
 - **Device-specific paths**: Per-device CLI paths use an opaque local key stored in browser local storage, not your system hostname.
 - **Background activity**: Claudian does not run telemetry beacons. UI polling timers read local Obsidian/editor selection state only. Network activity is limited to explicit provider runtime work, configured MCP endpoints, and provider SDK/CLI calls needed to answer your requests.
@@ -124,7 +124,7 @@ If different, GUI apps like Obsidian may not find Node.js.
 
 ### Other providers
 
-Codex and Opencode support are live but features might be incomplete, and still need more testing across platforms and installation methods. If you have feature request or run into any bugs, please [submit a GitHub issue](https://github.com/YishenTu/claudian/issues).
+Codex, Opencode, and Pi support are live but features might be incomplete, and still need more testing across platforms and installation methods. If you have feature request or run into any bugs, please [submit a GitHub issue](https://github.com/YishenTu/claudian/issues).
 
 ## Architecture
 
@@ -143,6 +143,7 @@ src/
 │   ├── claude/                  # Claude SDK adaptor, prompt encoding, storage, MCP, plugins
 │   ├── codex/                   # Codex app-server adaptor, JSON-RPC transport, JSONL history
 │   ├── opencode/                # Opencode adaptor
+│   ├── pi/                      # Pi RPC adaptor, model discovery, JSONL history
 │   └── acp/                     # Agent Client Protocol shared transport
 ├── features/
 │   ├── chat/                    # Sidebar chat: tabs, controllers, renderers
@@ -155,16 +156,20 @@ src/
 └── style/                       # Modular CSS
 ```
 
-## Roadmap
-
-- [x] 1M Opus and Sonnet models
-- [x] Codex provider integration
-- [x] Opencode support
-- [ ] More to come!
-
 ## License
 
 Licensed under the [MIT License](LICENSE).
+
+## Sponsorship
+
+### Ke Holdings Inc. (BEIKE)
+
+<img src="assets/sponsors/MOMA.png" alt="MOMA" width="90%">
+
+Claudian is proudly sponsored by Ke Holdings Inc. (BEIKE) and the MOMA team. Their support helps Claudian continue to
+improve through ongoing development and maintenance.
+
+> Want to support Claudian or appear here? Contact me: [tysk01213@gmail.com](mailto:tysk01213@gmail.com).
 
 ## Star History
 
@@ -182,3 +187,4 @@ Licensed under the [MIT License](LICENSE).
 - [Anthropic](https://anthropic.com) for Claude and the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview)
 - [OpenAI](https://openai.com) for [Codex](https://github.com/openai/codex)
 - [Opencode](https://opencode.ai/) 
+- [Pi](https://github.com/earendil-works/pi)

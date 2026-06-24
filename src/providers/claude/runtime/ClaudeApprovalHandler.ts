@@ -82,6 +82,18 @@ export function createClaudeApprovalCallback(
     const askUserQuestionCallback = deps.getAskUserQuestionCallback();
     if (toolName === TOOL_ASK_USER_QUESTION && askUserQuestionCallback) {
       try {
+        // The SDK's JSDoc says "Other will be provided automatically" but
+        // the SDK doesn't inject isOther into the canUseTool input. Claudian
+        // intercepts at canUseTool and renders its own UI, so we must inject
+        // isOther here to match the Claude Code CLI's built-in behavior.
+        const questions = input.questions;
+        if (Array.isArray(questions)) {
+          for (const q of questions) {
+            if (isObjectRecord(q) && !('isOther' in q)) {
+              q.isOther = true;
+            }
+          }
+        }
         const answers = await askUserQuestionCallback(input, options.signal);
         if (answers === null) {
           return { behavior: 'deny', message: 'User declined to answer.', interrupt: true };
@@ -134,4 +146,8 @@ export function createClaudeApprovalCallback(
       };
     }
   };
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
