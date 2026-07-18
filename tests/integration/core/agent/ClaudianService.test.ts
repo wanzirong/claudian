@@ -600,14 +600,13 @@ describe('ClaudianService', () => {
   // MessageChannel tests moved to tests/unit/core/agent/MessageChannel.test.ts
 
   describe('persistent query updates', () => {
-    it('updates model on the active persistent query', async () => {
+    it('uses a query model override when starting the persistent query', async () => {
       const chunks: any[] = [];
       for await (const chunk of service.query('hello', undefined, undefined, { model: 'claude-opus-4-5' })) {
         chunks.push(chunk);
       }
 
-      const response = getLastResponse();
-      expect(response?.setModel).toHaveBeenCalledWith('claude-opus-4-5');
+      expect(getLastOptions()?.model).toBe('claude-opus-4-5');
     });
   });
 
@@ -1139,7 +1138,7 @@ describe('ClaudianService', () => {
       // Now test the standalone function directly
       const context = buildContextFromHistory(messages);
 
-      expect(context).toContain('<current_note>');
+      expect(context).toContain('<linked_note>');
       expect(context).toContain('notes/file.md');
     });
 
@@ -1201,7 +1200,7 @@ describe('ClaudianService', () => {
       expect(prompts[0]).toBe('Follow up');
       expect(prompts[1]).toContain('User: First question');
       expect(prompts[1]).toContain('Assistant: Answer');
-      expect(prompts[1]).toContain('<current_note>');
+      expect(prompts[1]).toContain('<linked_note>');
       expect(prompts[1]).toContain('note.md');
       expect(chunks.some((c) => c.type === 'text' && c.content === 'Recovered')).toBe(true);
       expect(service.getSessionId()).toBeNull();
@@ -1651,8 +1650,7 @@ describe('ClaudianService', () => {
         model: 'claude-opus-4-5',
       })) chunks2.push(c);
 
-      const response = getLastResponse();
-      expect(response?.setModel).toHaveBeenCalledWith('claude-opus-4-5');
+      expect(getLastOptions()?.model).toBe('claude-opus-4-5');
     });
 
     it('falls back to cold-start when restart fails during dynamic updates', async () => {

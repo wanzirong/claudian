@@ -174,6 +174,133 @@ describe('ClaudianView tab controls', () => {
 
     expect(historyDropdown.hasClass('visible')).toBe(false);
   });
+
+  it('defers hidden history rendering and coalesces invalidations until the dropdown opens', () => {
+    const historyDropdown = createMockEl();
+    const renderHistoryDropdown = jest.fn();
+    const view = Object.create(ClaudianView.prototype) as any;
+
+    view.historyDropdown = historyDropdown;
+    view.historyDropdownDirty = true;
+    view.historyDropdownRendered = false;
+    view.tabManager = {
+      getActiveTab: jest.fn().mockReturnValue({
+        controllers: {
+          conversationController: { renderHistoryDropdown },
+        },
+      }),
+    };
+
+    view.updateHistoryDropdown();
+    view.updateHistoryDropdown();
+
+    expect(renderHistoryDropdown).not.toHaveBeenCalled();
+
+    view.toggleHistoryDropdown();
+
+    expect(renderHistoryDropdown).toHaveBeenCalledTimes(1);
+    const firstRenderSignal = renderHistoryDropdown.mock.calls[0][1].signal as AbortSignal;
+    expect(firstRenderSignal.aborted).toBe(false);
+
+    view.updateHistoryDropdown();
+
+    expect(renderHistoryDropdown).toHaveBeenCalledTimes(2);
+
+    view.toggleHistoryDropdown();
+    expect(firstRenderSignal.aborted).toBe(true);
+    view.updateHistoryDropdown();
+
+    expect(renderHistoryDropdown).toHaveBeenCalledTimes(2);
+  });
+
+  it('persists expanded title tab ids with the tab layout snapshot', () => {
+    const view = Object.create(ClaudianView.prototype) as any;
+
+    view.tabManager = {
+      getPersistedState: jest.fn().mockReturnValue({
+        openTabs: [
+          { tabId: 'tab-1', conversationId: null },
+          { tabId: 'tab-2', conversationId: 'conv-2' },
+        ],
+        activeTabId: 'tab-2',
+      }),
+    };
+    view.tabBar = {
+      getExpandedTitleTabIds: jest.fn().mockReturnValue(['tab-2', 'closed-tab']),
+    };
+
+    expect(view.getPersistedTabState()).toEqual({
+      openTabs: [
+        { tabId: 'tab-1', conversationId: null },
+        { tabId: 'tab-2', conversationId: 'conv-2' },
+      ],
+      activeTabId: 'tab-2',
+      expandedTitleTabIds: ['tab-2'],
+    });
+  });
+
+  it('restores expanded title tab ids after restoring tabs', async () => {
+    const persistedState = {
+      openTabs: [{ tabId: 'tab-1', conversationId: null }],
+      activeTabId: 'tab-1',
+      expandedTitleTabIds: ['tab-1'],
+    };
+    const view = Object.create(ClaudianView.prototype) as any;
+
+    view.plugin = {
+      storage: {
+        getTabManagerState: jest.fn().mockResolvedValue(persistedState),
+      },
+    };
+    view.tabManager = {
+      restoreState: jest.fn().mockResolvedValue(undefined),
+      createTab: jest.fn(),
+    };
+    view.tabBar = {
+      setExpandedTitleTabIds: jest.fn(),
+    };
+    view.updateTabBar = jest.fn();
+
+    await view.restoreOrCreateTabs();
+
+    expect(view.tabManager.restoreState).toHaveBeenCalledWith(persistedState);
+    expect(view.tabBar.setExpandedTitleTabIds).toHaveBeenCalledWith(['tab-1']);
+    expect(view.updateTabBar).toHaveBeenCalledTimes(1);
+    expect(view.tabManager.createTab).not.toHaveBeenCalled();
+  });
+});
+
+describe('ClaudianView shutdown', () => {
+  it('disposes view resources when the final tab-state flush fails', async () => {
+    const error = new Error('disk full');
+    const view = Object.create(ClaudianView.prototype) as any;
+    const destroy = jest.fn().mockResolvedValue(undefined);
+    const tabBarDestroy = jest.fn();
+    const persistenceDispose = jest.fn();
+
+    Object.assign(view, {
+      cancelHistoryRendering: jest.fn(),
+      eventRefs: [],
+      mentionCacheCoordinator: {},
+      pendingTabBarUpdate: null,
+      persistTabStateImmediate: jest.fn().mockRejectedValue(error),
+      plugin: { app: { vault: { offref: jest.fn() } } },
+      restoreActiveInputToTabContent: jest.fn(),
+      scope: {},
+      tabBar: { destroy: tabBarDestroy },
+      tabManager: { destroy },
+      tabStatePersistence: { dispose: persistenceDispose },
+    });
+
+    await expect(view.onClose()).resolves.toBeUndefined();
+
+    expect(persistenceDispose).toHaveBeenCalledTimes(1);
+    expect(view.restoreActiveInputToTabContent).toHaveBeenCalledTimes(1);
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(tabBarDestroy).toHaveBeenCalledTimes(1);
+    expect(view.tabManager).toBeNull();
+    expect(view.scope).toBeNull();
+  });
 });
 
 describe('ClaudianView Escape handling', () => {

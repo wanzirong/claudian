@@ -10,7 +10,20 @@ jest.mock('os', () => ({
 }));
 
 // Mock fs module
-jest.mock('fs');
+jest.mock('fs', () => {
+  const actual = jest.requireActual('fs');
+  return {
+    ...actual,
+    existsSync: jest.fn(),
+    readFileSync: jest.fn(),
+    realpathSync: jest.fn(),
+    promises: {
+      ...actual.promises,
+      readFile: jest.fn(),
+      realpath: jest.fn(),
+    },
+  };
+});
 
 // Mock obsidian
 jest.mock('obsidian', () => ({
@@ -22,6 +35,7 @@ import { Notice } from 'obsidian';
 import { PluginManager } from '@/providers/claude/plugins/PluginManager';
 
 const mockFs = fs as jest.Mocked<typeof fs>;
+const mockFsPromises = jest.mocked(fs.promises);
 
 // Create a mock CCSettingsStorage
 function createMockCCSettingsStorage() {
@@ -34,10 +48,26 @@ function createMockCCSettingsStorage() {
 const installedPluginsPath = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
 const globalSettingsPath = path.join(homeDir, '.claude', 'settings.json');
 const projectSettingsPath = path.join(vaultPath, '.claude', 'settings.json');
+const customConfigDir = '/custom/claude';
+const customInstalledPluginsPath = path.join(customConfigDir, 'plugins', 'installed_plugins.json');
+const customGlobalSettingsPath = path.join(customConfigDir, 'settings.json');
 
 describe('PluginManager', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    (mockFsPromises.readFile as jest.Mock).mockImplementation(
+      async (...args: Parameters<typeof fs.readFileSync>) => {
+        if (!mockFs.existsSync(args[0] as fs.PathLike)) throw new Error('ENOENT');
+        return mockFs.readFileSync(...args);
+      },
+    );
+    (mockFsPromises.realpath as jest.Mock).mockImplementation(
+      async (filePath: fs.PathLike) => {
+        const resolved = mockFs.realpathSync(filePath);
+        if (!resolved) throw new Error('ENOENT');
+        return resolved;
+      },
+    );
   });
 
   describe('loadPlugins', () => {
@@ -87,6 +117,43 @@ describe('PluginManager', () => {
       expect(plugins[0].enabled).toBe(true);
       expect(plugins[0].scope).toBe('user');
       expect(plugins[0].installPath).toBe('/path/to/test-plugin');
+    });
+
+    it('loads global plugin data from the effective Claude config directory', async () => {
+      const installedPlugins = {
+        version: 2,
+        plugins: {
+          'custom-plugin@marketplace': [{
+            scope: 'user',
+            installPath: '/path/to/custom-plugin',
+            version: '1.0.0',
+            installedAt: '2026-01-01T00:00:00.000Z',
+            lastUpdated: '2026-01-01T00:00:00.000Z',
+          }],
+        },
+      };
+      const globalSettings = {
+        enabledPlugins: { 'custom-plugin@marketplace': false },
+      };
+
+      mockFs.existsSync.mockReturnValue(true);
+      mockFs.readFileSync.mockImplementation((p: fs.PathOrFileDescriptor) => {
+        if (String(p) === customInstalledPluginsPath) return JSON.stringify(installedPlugins);
+        if (String(p) === customGlobalSettingsPath) return JSON.stringify(globalSettings);
+        return '{}';
+      });
+
+      const manager = new PluginManager(
+        vaultPath,
+        createMockCCSettingsStorage(),
+        customConfigDir,
+      );
+
+      await manager.loadPlugins();
+
+      expect(manager.getPlugins()).toEqual([
+        expect.objectContaining({ id: 'custom-plugin@marketplace', enabled: false }),
+      ]);
     });
 
     it('defaults to enabled for installed plugins not in settings', async () => {
@@ -332,6 +399,35 @@ describe('PluginManager', () => {
       await manager.togglePlugin('nonexistent-plugin');
 
       expect(ccSettings.setPluginEnabled).not.toHaveBeenCalled();
+    });
+
+    it('rolls back the in-memory enabled state when persistence fails', async () => {
+      const installedPlugins = {
+        version: 2,
+        plugins: {
+          'test-plugin@marketplace': [{
+            scope: 'user',
+            installPath: '/path/to/test-plugin',
+            version: '1.0.0',
+            installedAt: '2026-01-01T00:00:00.000Z',
+            lastUpdated: '2026-01-01T00:00:00.000Z',
+          }],
+        },
+      };
+
+      mockFs.existsSync.mockImplementation((p: fs.PathLike) => {
+        return String(p) === installedPluginsPath;
+      });
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(installedPlugins));
+
+      const ccSettings = createMockCCSettingsStorage();
+      ccSettings.setPluginEnabled.mockRejectedValue(new Error('write failed'));
+      const manager = new PluginManager(vaultPath, ccSettings);
+      await manager.loadPlugins();
+
+      await expect(manager.togglePlugin('test-plugin@marketplace')).rejects.toThrow('write failed');
+
+      expect(manager.getPlugins()[0].enabled).toBe(true);
     });
   });
 

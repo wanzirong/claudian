@@ -21,6 +21,7 @@ export interface MockElement {
   createDiv: (opts?: { cls?: string; text?: string }) => MockElement;
   createSpan: (opts?: { cls?: string; text?: string }) => MockElement;
   createEl: (tag: string, opts?: { cls?: string; text?: string; attr?: Record<string, string> }) => MockElement;
+  createSvg: (tag: string, opts?: { cls?: string; attr?: Record<string, string> }) => MockElement;
   appendChild: (child: any) => any;
   insertBefore: (el: MockElement, ref: MockElement | null) => void;
   firstChild: MockElement | null;
@@ -68,15 +69,10 @@ export interface MockElement {
 }
 
 const CLASS_DISPLAY: Record<string, string> = {
-  'claudian-browser-selection-indicator': 'block',
-  'claudian-canvas-indicator': 'block',
   'claudian-context-meter': 'flex',
-  'claudian-file-indicator': 'none',
-  'claudian-image-preview': 'none',
   'claudian-mcp-selector': 'flex',
   'claudian-mode-selector': 'flex',
   'claudian-permission-toggle': 'flex',
-  'claudian-selection-indicator': 'block',
   'claudian-service-tier-toggle': 'flex',
   'claudian-status-panel-bash': 'block',
   'claudian-status-panel-bash-content': 'block',
@@ -263,6 +259,17 @@ export function createMockEl(tag = 'div'): any {
       const child = createMockEl(tagName);
       if (opts?.cls) child.addClass(opts.cls);
       if (opts?.text) child.textContent = opts.text;
+      if (opts?.attr) {
+        for (const [name, value] of Object.entries(opts.attr)) {
+          child.setAttribute(name, value);
+        }
+      }
+      children.push(child);
+      return child;
+    },
+    createSvg(tagName: string, opts?: { cls?: string; attr?: Record<string, string> }) {
+      const child = createMockEl(tagName);
+      if (opts?.cls) child.addClass(opts.cls);
       if (opts?.attr) {
         for (const [name, value] of Object.entries(opts.attr)) {
           child.setAttribute(name, value);

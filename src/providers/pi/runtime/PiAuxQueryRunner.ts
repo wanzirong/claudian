@@ -1,7 +1,7 @@
 import type { AuxQueryConfig, AuxQueryRunner } from '../../../core/auxiliary/AuxQueryRunner';
 import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
-import type ClaudianPlugin from '../../../main';
 import { parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
 import { decodePiModelId } from '../models';
@@ -27,7 +27,7 @@ export class PiAuxQueryRunner implements AuxQueryRunner {
   private transport: PiRpcTransport | null = null;
 
   constructor(
-    private readonly plugin: ClaudianPlugin,
+    private readonly plugin: ProviderHost,
     private readonly options: PiAuxQueryRunnerOptions,
   ) {}
 
@@ -156,7 +156,7 @@ export class PiAuxQueryRunner implements AuxQueryRunner {
   private async ensureReady(systemPrompt: string): Promise<void> {
     const settingsBag = this.plugin.settings as unknown as Record<string, unknown>;
     const settings = getPiProviderSettings(settingsBag);
-    const command = this.plugin.getResolvedProviderCliPath('pi') ?? 'pi';
+    const command = await this.plugin.getResolvedProviderCliPath('pi') ?? 'pi';
     const cwd = getVaultPath(this.plugin.app) ?? process.cwd();
     const envText = getRuntimeEnvironmentText(settingsBag, 'pi');
     const env = {
@@ -205,7 +205,7 @@ export class PiAuxQueryRunner implements AuxQueryRunner {
     }
 
     const projectedSettings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-      this.plugin.settings as unknown as Record<string, unknown>,
+      this.plugin.settings,
       'pi',
     );
     const selectedModel = typeof projectedSettings.model === 'string'

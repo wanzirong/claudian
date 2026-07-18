@@ -13,13 +13,19 @@ import {
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import type { ChatMessage, ImageAttachment, SubagentInfo, ToolCallInfo } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
-import type ClaudianPlugin from '../../../main';
 import { extractUserDisplayContent } from '../../../utils/context';
 import { formatDurationMmSs } from '../../../utils/date';
 import { processFileLinks, registerFileLinkHandler } from '../../../utils/fileLink';
 import { replaceImageEmbedsWithHtml } from '../../../utils/imageEmbed';
-import { escapeMathDelimitersForStreaming } from '../../../utils/markdownMath';
+import { stripLegacyInterruptIndicator } from '../../../utils/interrupt';
+import { escapeRawHtmlTags } from '../../../utils/markdownHtml';
+import {
+  escapeMathDelimitersForStreaming,
+  normalizeLatexMathDelimiters,
+} from '../../../utils/markdownMath';
+import type { FeatureHost } from '../../FeatureHost';
 import { findRewindContext } from '../rewind';
+import { formatConversationDirectoryTitle } from '../utils/conversationDirectoryTitle';
 import { resolveSubagentLifecycleAdapter } from './subagentLifecycleResolution';
 import {
   renderStoredAsyncSubagent,
@@ -47,7 +53,7 @@ function runRendererAction(action: () => Promise<void>): void {
 
 export class MessageRenderer {
   private app: App;
-  private plugin: ClaudianPlugin;
+  private plugin: FeatureHost;
   private component: Component;
   private messagesEl: HTMLElement;
   private rewindCallback?: (messageId: string, mode?: ChatRewindMode) => Promise<void>;
@@ -56,7 +62,7 @@ export class MessageRenderer {
   private liveMessageEls = new Map<string, HTMLElement>();
 
   constructor(
-    plugin: ClaudianPlugin,
+    plugin: FeatureHost,
     component: Component,
     messagesEl: HTMLElement,
     rewindCallback?: (messageId: string, mode?: ChatRewindMode) => Promise<void>,
@@ -105,6 +111,15 @@ export class MessageRenderer {
     return msg.displayContent ?? extractUserDisplayContent(msg.content) ?? msg.content;
   }
 
+  private applyTocTitle(msgEl: HTMLElement, text: string): void {
+    const tocTitle = formatConversationDirectoryTitle(text);
+    if (tocTitle) {
+      msgEl.setAttribute('data-toc-title', tocTitle);
+    } else {
+      msgEl.removeAttribute('data-toc-title');
+    }
+  }
+
   // ============================================
   // Streaming Message Rendering
   // ============================================
@@ -145,6 +160,7 @@ export class MessageRenderer {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
         void this.renderContent(textEl, textToShow);
         this.addUserCopyButton(msgEl, textToShow);
+        this.applyTocTitle(msgEl, textToShow);
       }
       if (this.rewindCallback || this.forkCallback) {
         this.liveMessageEls.set(msg.id, msgEl);
@@ -177,6 +193,9 @@ export class MessageRenderer {
     if (textToShow) {
       const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
       void this.renderContent(textEl, textToShow);
+      this.applyTocTitle(msgEl, textToShow);
+    } else {
+      msgEl.removeAttribute('data-toc-title');
     }
 
     const toolbar = msgEl.querySelector<HTMLElement>('.claudian-user-msg-actions');
@@ -276,18 +295,19 @@ export class MessageRenderer {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
         void this.renderContent(textEl, textToShow);
         this.addUserCopyButton(msgEl, textToShow);
+        this.applyTocTitle(msgEl, textToShow);
       }
-      if (msg.userMessageId && this.isRewindEligible(allMessages, index)) {
-        if (this.rewindCallback) {
+      if (msg.userMessageId) {
+        if (this.rewindCallback && this.isRewindEligible(allMessages, index)) {
           this.addRewindButton(msgEl, msg.id);
         }
-        if (this.forkCallback) {
+        if (this.forkCallback && this.isForkEligible(allMessages, index)) {
           this.addForkButton(msgEl, msg.id);
         }
       }
     } else if (msg.role === 'assistant') {
-      this.renderAssistantContent(msg, contentEl);
-      if (msg.isInterrupt) {
+      const hadLegacyInterruptIndicator = this.renderAssistantContent(msg, contentEl);
+      if (msg.isInterrupt || hadLegacyInterruptIndicator) {
         this.appendInterruptIndicator(contentEl);
       }
     }
@@ -314,6 +334,12 @@ export class MessageRenderer {
   private isRewindEligible(allMessages?: ChatMessage[], index?: number): boolean {
     if (!allMessages || index === undefined) return false;
     const ctx = findRewindContext(allMessages, index);
+    return ctx.hasResponse;
+  }
+
+  private isForkEligible(allMessages?: ChatMessage[], index?: number): boolean {
+    if (!allMessages || index === undefined) return false;
+    const ctx = findRewindContext(allMessages, index);
     return !!ctx.prevAssistantUuid && ctx.hasResponse;
   }
 
@@ -323,7 +349,7 @@ export class MessageRenderer {
     this.appendInterruptIndicator(contentEl);
   }
 
-  private appendInterruptIndicator(contentEl: HTMLElement): void {
+  appendInterruptIndicator(contentEl: HTMLElement): void {
     const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
     textEl.createSpan({ cls: 'claudian-interrupted', text: 'Interrupted' });
     textEl.appendText(' ');
@@ -336,7 +362,9 @@ export class MessageRenderer {
   /**
    * Renders assistant message content (content blocks or fallback).
    */
-  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): void {
+  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): boolean {
+    let hadLegacyInterruptIndicator = false;
+
     if (msg.contentBlocks && msg.contentBlocks.length > 0) {
       const renderedToolIds = new Set<string>();
       for (const block of msg.contentBlocks) {
@@ -348,13 +376,15 @@ export class MessageRenderer {
             (el, md) => this.renderContent(el, md)
           );
         } else if (block.type === 'text') {
+          const normalized = stripLegacyInterruptIndicator(block.content);
+          hadLegacyInterruptIndicator ||= normalized.interrupted;
           // Skip empty or whitespace-only text blocks to avoid extra gaps
-          if (!block.content || !block.content.trim()) {
+          if (!normalized.content.trim()) {
             continue;
           }
           const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-          void this.renderContent(textEl, block.content);
-          this.addTextCopyButton(textEl, block.content);
+          void this.renderContent(textEl, normalized.content);
+          this.addTextCopyButton(textEl, normalized.content);
         } else if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
           if (toolCall) {
@@ -386,9 +416,13 @@ export class MessageRenderer {
     } else {
       // Fallback for old conversations without contentBlocks
       if (msg.content) {
-        const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-        void this.renderContent(textEl, msg.content);
-        this.addTextCopyButton(textEl, msg.content);
+        const normalized = stripLegacyInterruptIndicator(msg.content);
+        hadLegacyInterruptIndicator ||= normalized.interrupted;
+        if (normalized.content.trim()) {
+          const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
+          void this.renderContent(textEl, normalized.content);
+          this.addTextCopyButton(textEl, normalized.content);
+        }
       }
       if (msg.toolCalls) {
         for (const toolCall of msg.toolCalls) {
@@ -407,6 +441,8 @@ export class MessageRenderer {
         cls: 'claudian-baked-duration',
       });
     }
+
+    return hadLegacyInterruptIndicator;
   }
 
   /**
@@ -644,12 +680,16 @@ export class MessageRenderer {
     el.empty();
 
     try {
+      const normalizedMarkdown = normalizeLatexMathDelimiters(markdown);
       const renderMarkdown = options?.deferMath
-        ? escapeMathDelimitersForStreaming(markdown)
-        : markdown;
-      // Normalize embeds before MarkdownRenderer consumes them.
+        ? escapeMathDelimitersForStreaming(normalizedMarkdown)
+        : normalizedMarkdown;
+      // Escape user-authored HTML first so placeholders like <meta-name> render
+      // as plain text. Trusted plugin markup (image embeds) is injected only
+      // after this step, otherwise it would be escaped too.
+      const safeMarkdown = escapeRawHtmlTags(renderMarkdown);
       const processedMarkdown = replaceImageEmbedsWithHtml(
-        renderMarkdown,
+        safeMarkdown,
         this.app,
         { mediaFolder: this.plugin.settings.mediaFolder }
       );
@@ -667,7 +707,7 @@ export class MessageRenderer {
         if (pre.parentElement?.classList.contains('claudian-code-wrapper')) return;
 
         // Create wrapper
-        const wrapper = createEl('div', { cls: 'claudian-code-wrapper' });
+        const wrapper = createDiv({ cls: 'claudian-code-wrapper' });
         pre.parentElement?.insertBefore(wrapper, pre);
         wrapper.appendChild(pre);
 
@@ -677,7 +717,7 @@ export class MessageRenderer {
           const match = code.className.match(/language-(\w+)/);
           if (match) {
             wrapper.classList.add('has-language');
-            const label = createEl('span', {
+            const label = createSpan({
               cls: 'claudian-code-lang-label',
               text: match[1],
             });
@@ -767,22 +807,32 @@ export class MessageRenderer {
 
   refreshActionButtons(msg: ChatMessage, allMessages?: ChatMessage[], index?: number): void {
     if (!msg.userMessageId) return;
-    if (!this.isRewindEligible(allMessages, index)) return;
+    const canRewind = this.isRewindEligible(allMessages, index);
+    const canFork = this.isForkEligible(allMessages, index);
+    if (!canRewind && !canFork) return;
     const msgEl = this.liveMessageEls.get(msg.id);
     if (!msgEl) return;
 
-    if (this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn')) {
+    if (canRewind && this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn')) {
       this.addRewindButton(msgEl, msg.id);
     }
-    if (this.forkCallback && !msgEl.querySelector('.claudian-message-fork-btn')) {
+    if (canFork && this.forkCallback && !msgEl.querySelector('.claudian-message-fork-btn')) {
       this.addForkButton(msgEl, msg.id);
     }
-    this.cleanupLiveMessageEl(msg.id, msgEl);
+    this.cleanupLiveMessageEl(msg.id, msgEl, { canRewind, canFork });
   }
 
-  private cleanupLiveMessageEl(msgId: string, msgEl: HTMLElement): void {
-    const needsRewind = this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn');
-    const needsFork = this.forkCallback && !msgEl.querySelector('.claudian-message-fork-btn');
+  private cleanupLiveMessageEl(
+    msgId: string,
+    msgEl: HTMLElement,
+    expectedActions: { canRewind: boolean; canFork: boolean },
+  ): void {
+    const needsRewind = expectedActions.canRewind
+      && this.rewindCallback
+      && !msgEl.querySelector('.claudian-message-rewind-btn');
+    const needsFork = expectedActions.canFork
+      && this.forkCallback
+      && !msgEl.querySelector('.claudian-message-fork-btn');
     if (!needsRewind && !needsFork) {
       this.liveMessageEls.delete(msgId);
     }

@@ -5,9 +5,9 @@ import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { ChatRewindMode } from '../../../core/runtime/types';
 import type { Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
-import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
 import { extractUserDisplayContent } from '../../../utils/context';
+import type { FeatureHost } from '../../FeatureHost';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
@@ -24,6 +24,8 @@ function runConversationAction(action: () => Promise<void>, failureMessage: stri
   });
 }
 
+const DEFAULT_HISTORY_PAGE_SIZE = 100;
+
 export interface ConversationCallbacks {
   onNewConversation?: () => void;
   onConversationLoaded?: () => void;
@@ -31,7 +33,7 @@ export interface ConversationCallbacks {
 }
 
 export interface ConversationControllerDeps {
-  plugin: ClaudianPlugin;
+  plugin: FeatureHost;
   state: ChatState;
   renderer: MessageRenderer;
   subagentManager: SubagentManager;
@@ -48,12 +50,17 @@ export interface ConversationControllerDeps {
   getTitleGenerationService: () => TitleGenerationService | null;
   getStatusPanel: () => StatusPanel | null;
   getAgentService?: () => ChatRuntime | null;
+  getSelectedModel?: () => string | null;
   ensureServiceForConversation?: (conversation: Conversation | null) => Promise<void>;
   dismissPendingInlinePrompts?: () => void;
+  awaitBackgroundWork?: () => Promise<void>;
+  /** True once the owning tab has begun teardown. */
+  isDisposed?: () => boolean;
 }
 
 type SaveOptions = {
   resumeAtMessageId?: string;
+  resetProviderSession?: boolean;
 };
 
 export type HistoryConversationOpenState = 'closed' | 'open' | 'current';
@@ -71,6 +78,9 @@ type HistoryRenderOptions = {
   getConversationOpenState?: (id: string) => HistoryConversationOpenState;
   getConversationStatus?: (id: string) => HistoryConversationStatus;
   onRerender: () => void;
+  signal?: AbortSignal;
+  pageSize?: number;
+  visibleCount?: number;
 };
 
 export class ConversationController {
@@ -115,12 +125,17 @@ export class ConversationController {
         this.getAgentService()?.cancel();
       }
 
-      // Save current conversation if it has messages
+      if (this.deps.awaitBackgroundWork) {
+        await this.deps.awaitBackgroundWork();
+      }
+
+      subagentManager.orphanAllActive();
+
+      // Persist terminalized background tasks before clearing their runtime state.
       if (state.currentConversationId && state.messages.length > 0) {
         await this.save();
       }
 
-      subagentManager.orphanAllActive();
       subagentManager.clear();
 
       // Clear streaming state and related DOM references
@@ -245,6 +260,7 @@ export class ConversationController {
   async switchTo(id: string): Promise<void> {
     const { plugin, state, subagentManager } = this.deps;
 
+    if (this.deps.isDisposed?.()) return;
     if (id === state.currentConversationId) return;
     if (state.isStreaming) return;
     if (state.isSwitchingConversation) return;
@@ -254,17 +270,23 @@ export class ConversationController {
 
     try {
       this.deps.dismissPendingInlinePrompts?.();
-      await this.save();
-
+      if (this.deps.awaitBackgroundWork) {
+        await this.deps.awaitBackgroundWork();
+      }
+      if (this.deps.isDisposed?.()) return;
       subagentManager.orphanAllActive();
+      await this.save();
+      if (this.deps.isDisposed?.()) return;
+
       subagentManager.clear();
 
       const conversation = await plugin.switchConversation(id);
-      if (!conversation) {
+      if (!conversation || this.deps.isDisposed?.()) {
         return;
       }
 
       await this.deps.ensureServiceForConversation?.(conversation);
+      if (this.deps.isDisposed?.()) return;
 
       this.deps.getInputEl().value = '';
       this.deps.clearQueuedMessage();
@@ -310,7 +332,7 @@ export class ConversationController {
     }
 
     const rewindCtx = findRewindContext(msgs, userIdx);
-    if (!rewindCtx.hasResponse || !rewindCtx.prevAssistantUuid) {
+    if (!rewindCtx.hasResponse) {
       new Notice(t('chat.rewind.unavailableNoUuid'));
       return;
     }
@@ -361,7 +383,10 @@ export class ConversationController {
     const filesChanged = result.filesChanged?.length ?? 0;
     let saveError: string | null = null;
     try {
-      await this.save(false, { resumeAtMessageId: prevAssistantUuid });
+      await this.save(false, {
+        resumeAtMessageId: prevAssistantUuid,
+        resetProviderSession: !prevAssistantUuid,
+      });
     } catch (e) {
       saveError = e instanceof Error ? e.message : 'Failed to save';
     }
@@ -406,9 +431,11 @@ export class ConversationController {
     // New conversations always use SDK-native storage.
     if (!state.currentConversationId && state.messages.length > 0) {
       const initialSessionId = agentService?.getSessionId() ?? undefined;
+      const selectedModel = this.deps.getSelectedModel?.() ?? undefined;
       const conversation = await plugin.createConversation({
         providerId: agentService?.providerId,
         sessionId: initialSessionId,
+        ...(selectedModel ? { selectedModel } : {}),
       });
       state.currentConversationId = conversation.id;
     }
@@ -422,7 +449,7 @@ export class ConversationController {
 
     const conversation = plugin.getConversationSync(state.currentConversationId!);
 
-    const { updates: sessionUpdates } = agentService
+    const { updates: sessionUpdates } = agentService && !options?.resetProviderSession
       ? agentService.buildSessionUpdates({ conversation, sessionInvalidated })
       : { updates: {} };
 
@@ -441,6 +468,10 @@ export class ConversationController {
 
     if (options) {
       updates.resumeAtMessageId = options.resumeAtMessageId;
+      if (options.resetProviderSession) {
+        updates.sessionId = null;
+        updates.providerState = undefined;
+      }
     }
 
     await plugin.updateConversation(state.currentConversationId!, updates);
@@ -563,6 +594,7 @@ export class ConversationController {
     options: HistoryRenderOptions
   ): void {
     const { plugin, state } = this.deps;
+    if (options.signal?.aborted) return;
 
     container.empty();
 
@@ -581,8 +613,12 @@ export class ConversationController {
     const conversations = [...allConversations].sort((a, b) => {
       return (b.lastResponseAt ?? b.createdAt) - (a.lastResponseAt ?? a.createdAt);
     });
+    const pageSize = Math.max(1, options.pageSize ?? DEFAULT_HISTORY_PAGE_SIZE);
+    const visibleCount = Math.max(pageSize, options.visibleCount ?? pageSize);
+    const visibleConversations = conversations.slice(0, visibleCount);
 
-    for (const conv of conversations) {
+    for (const conv of visibleConversations) {
+      if (options.signal?.aborted) return;
       const fallbackOpenState: HistoryConversationOpenState =
         conv.id === state.currentConversationId ? 'current' : 'closed';
       const conversationStatus = this.getHistoryConversationStatus(conv.id, fallbackOpenState, options);
@@ -665,7 +701,7 @@ export class ConversationController {
 
       // Show regenerate button if title generation failed, or loading indicator if pending
       if (conv.titleGenerationStatus === 'pending') {
-        const loadingEl = actions.createEl('span', { cls: 'claudian-action-btn claudian-action-loading' });
+        const loadingEl = actions.createSpan({ cls: 'claudian-action-btn claudian-action-loading' });
         setIcon(loadingEl, 'loader-2');
         loadingEl.setAttribute('aria-label', 'Generating title...');
       } else if (conv.titleGenerationStatus === 'failed') {
@@ -719,6 +755,20 @@ export class ConversationController {
           ),
           'Failed to delete conversation',
         );
+      });
+    }
+
+    if (visibleConversations.length < conversations.length && !options.signal?.aborted) {
+      const loadMoreButton = list.createEl('button', {
+        cls: 'claudian-history-load-more',
+        text: `Load more (${conversations.length - visibleConversations.length} remaining)`,
+      });
+      loadMoreButton.addEventListener('click', () => {
+        if (options.signal?.aborted) return;
+        this.renderHistoryItems(container, {
+          ...options,
+          visibleCount: visibleCount + pageSize,
+        });
       });
     }
   }
@@ -880,10 +930,10 @@ export class ConversationController {
     const titleEl = item.querySelector('.claudian-history-item-title') as HTMLElement;
     if (!titleEl) return;
 
-    const input = (item.ownerDocument ?? window.document).createElement('input');
-    input.type = 'text';
-    input.className = 'claudian-rename-input';
-    input.value = currentTitle;
+    const input = item.createEl('input', {
+      cls: 'claudian-rename-input',
+      attr: { type: 'text', value: currentTitle },
+    });
 
     titleEl.replaceWith(input);
     input.focus();

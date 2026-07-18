@@ -28,7 +28,7 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 
 ## Requirements
 
-- **Claude provider**: [Claude Code CLI](https://code.claude.com/docs/en/overview) installed (native install recommended). Claude subscription/API or compatible provider ([Openrouter](https://openrouter.ai/docs/guides/guides/claude-code-integration), [Kimi](https://platform.moonshot.ai/docs/guide/agent-support), etc.).
+- **Claude provider**: [Claude Code CLI](https://code.claude.com/docs/en/overview) installed (native install recommended). Claude subscription/API or compatible provider ([Openrouter](https://openrouter.ai/docs/guides/guides/claude-code-integration), [Kimi](https://platform.kimi.ai/docs/guide/claude-code-kimi), [GLM](https://docs.z.ai/devpack/tool/claude) etc.).
 - **Optional providers**: [Codex CLI](https://github.com/openai/codex), [Opencode](https://opencode.ai/), [Pi](https://github.com/earendil-works/pi).
 - Obsidian v1.7.2+
 - Desktop only (macOS, Linux, Windows)
@@ -175,9 +175,9 @@ improve through ongoing development and maintenance.
 
 <a href="https://www.star-history.com/?repos=YishenTu%2Fclaudian&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=YishenTu/claudian&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=YishenTu/claudian&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=YishenTu/claudian&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&theme=dark&legend=top-left&sealed_token=gXv_vWhYBwlA0DehVo1Lwkf2jquI2mMAgmTawJA0nVFNaSdTkokMxxdjqk3zfUqWZKVuPlPi9e5hzWb3265cHWdgwm8Y-n3D7X4pyPM6w0sKWGE_WlHHTO-Gf3zoeP3XG8p3cHVEg_7oq3rhjLXpNFrluGUDWtFP3bwenzBJhHvoLmJaHUPD6KGHLqyO" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&legend=top-left&sealed_token=gXv_vWhYBwlA0DehVo1Lwkf2jquI2mMAgmTawJA0nVFNaSdTkokMxxdjqk3zfUqWZKVuPlPi9e5hzWb3265cHWdgwm8Y-n3D7X4pyPM6w0sKWGE_WlHHTO-Gf3zoeP3XG8p3cHVEg_7oq3rhjLXpNFrluGUDWtFP3bwenzBJhHvoLmJaHUPD6KGHLqyO" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&legend=top-left&sealed_token=gXv_vWhYBwlA0DehVo1Lwkf2jquI2mMAgmTawJA0nVFNaSdTkokMxxdjqk3zfUqWZKVuPlPi9e5hzWb3265cHWdgwm8Y-n3D7X4pyPM6w0sKWGE_WlHHTO-Gf3zoeP3XG8p3cHVEg_7oq3rhjLXpNFrluGUDWtFP3bwenzBJhHvoLmJaHUPD6KGHLqyO" />
  </picture>
 </a>
 

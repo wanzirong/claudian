@@ -187,6 +187,34 @@ describe('MessageRenderer', () => {
     expect(interruptedEl.textContent).toBe('Interrupted');
   });
 
+  it('upgrades a persisted legacy interruption marker to the typed indicator', async () => {
+    const { MarkdownRenderer } = await import('obsidian');
+    const messagesEl = createMockEl();
+    const { renderer } = createRenderer(messagesEl);
+    const legacyMarker =
+      '<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>';
+    const interruptMsg: ChatMessage = {
+      id: 'interrupt-legacy-1',
+      role: 'assistant',
+      content: 'Partial response',
+      timestamp: Date.now(),
+      contentBlocks: [{ type: 'text', content: `Partial response\n\n${legacyMarker}` }],
+    };
+
+    renderer.renderStoredMessage(interruptMsg);
+
+    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
+      'Partial response',
+      expect.anything(),
+      '',
+      expect.anything()
+    );
+    const contentEl = messagesEl.children[0].children[0];
+    const indicatorEl = contentEl.children[contentEl.children.length - 1];
+    expect(indicatorEl.children[0].hasClass('claudian-interrupted')).toBe(true);
+    expect(indicatorEl.children[0].textContent).toBe('Interrupted');
+  });
+
   it('renders bare interrupt marker for empty interrupted assistant message', () => {
     const messagesEl = createMockEl();
     const mockComponent = createMockComponent();
@@ -346,6 +374,32 @@ describe('MessageRenderer', () => {
     expect(messagesEl.querySelector('.claudian-message-rewind-btn')).not.toBeNull();
   });
 
+  it('adds rewind but not fork for a completed first user message', () => {
+    const messagesEl = createMockEl();
+    const rewindCallback = jest.fn().mockResolvedValue(undefined);
+    const forkCallback = jest.fn().mockResolvedValue(undefined);
+    const renderer = new MessageRenderer(
+      { app: {}, settings: { mediaFolder: '' } } as any,
+      createMockComponent() as any,
+      messagesEl,
+      rewindCallback,
+      forkCallback,
+      mockCapabilities(),
+    );
+    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+    const allMessages: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: 'hello', timestamp: 1, userMessageId: 'user-u' },
+      { id: 'a1', role: 'assistant', content: 'response', timestamp: 2, assistantMessageId: 'resp-a' },
+    ];
+
+    renderer.renderStoredMessage(allMessages[0], allMessages, 0);
+
+    expect(messagesEl.querySelector('.claudian-message-rewind-btn')).not.toBeNull();
+    expect(messagesEl.querySelector('.claudian-message-fork-btn')).toBeNull();
+    expect((renderer as any).liveMessageEls.has('u1')).toBe(false);
+  });
+
   it('does not add a rewind button when stored render is called without context', () => {
     const messagesEl = createMockEl();
     const rewindCallback = jest.fn().mockResolvedValue(undefined);
@@ -402,6 +456,38 @@ describe('MessageRenderer', () => {
     await Promise.resolve();
 
     expect(rewindCallback).toHaveBeenCalledWith('u1', 'conversation');
+  });
+
+  it('refreshes rewind but not fork for a streamed first user message', () => {
+    const messagesEl = createMockEl();
+    const rewindCallback = jest.fn().mockResolvedValue(undefined);
+    const forkCallback = jest.fn().mockResolvedValue(undefined);
+    const renderer = new MessageRenderer(
+      { app: {}, settings: { mediaFolder: '' } } as any,
+      createMockComponent() as any,
+      messagesEl,
+      rewindCallback,
+      forkCallback,
+      mockCapabilities(),
+    );
+    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+    const userMsg: ChatMessage = {
+      id: 'u1',
+      role: 'user',
+      content: 'hello',
+      timestamp: 1,
+      userMessageId: 'user-u',
+    };
+    renderer.addMessage(userMsg);
+
+    renderer.refreshActionButtons(userMsg, [
+      userMsg,
+      { id: 'a1', role: 'assistant', content: 'response', timestamp: 2, assistantMessageId: 'resp-a' },
+    ], 0);
+
+    expect(messagesEl.querySelector('.claudian-message-rewind-btn')).not.toBeNull();
+    expect(messagesEl.querySelector('.claudian-message-fork-btn')).toBeNull();
   });
 
   // ============================================
@@ -1023,6 +1109,23 @@ describe('MessageRenderer', () => {
     expect(msgEl.hasClass('claudian-message-user')).toBe(true);
   });
 
+  it('addMessage stores a truncated first-line table-of-contents title for user messages', () => {
+    const messagesEl = createMockEl();
+    const { renderer } = createRenderer(messagesEl);
+    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+    const msg: ChatMessage = {
+      id: 'u1',
+      role: 'user',
+      content: `${'x'.repeat(90)}\nsecond line`,
+      timestamp: Date.now(),
+    };
+
+    const msgEl = renderer.addMessage(msg);
+
+    expect(msgEl.getAttribute('data-toc-title')).toBe(`${'x'.repeat(77)}...`);
+  });
+
   it('addMessage renders images for user messages', () => {
     const messagesEl = createMockEl();
     const { renderer } = createRenderer(messagesEl);
@@ -1282,6 +1385,46 @@ describe('MessageRenderer', () => {
     );
   });
 
+  it('renderContent normalizes LaTeX math delimiters before rendering', async () => {
+    const { MarkdownRenderer } = await import('obsidian');
+    const { renderer } = createRenderer();
+    const el = createMockEl();
+
+    await renderer.renderContent(el, 'Inline \\(x<y\\).\n\\[y^2\\]');
+
+    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
+      'Inline $x<y$.\n$$y^2$$',
+      el,
+      '',
+      expect.anything()
+    );
+  });
+
+  it('renderContent escapes placeholder-style HTML before rendering', async () => {
+    const { MarkdownRenderer } = await import('obsidian');
+    const { replaceImageEmbedsWithHtml } = await import('@/utils/imageEmbed');
+    const { renderer } = createRenderer();
+    const el = createMockEl();
+    const markdown =
+      'Use areas/<meta-name> and projects/<meta-name>/<name>.';
+    const escapedMarkdown =
+      'Use areas/&lt;meta-name&gt; and projects/&lt;meta-name&gt;/&lt;name&gt;.';
+
+    await renderer.renderContent(el, markdown);
+
+    expect(replaceImageEmbedsWithHtml).toHaveBeenCalledWith(
+      escapedMarkdown,
+      expect.anything(),
+      { mediaFolder: '' }
+    );
+    expect(MarkdownRenderer.renderMarkdown).toHaveBeenCalledWith(
+      escapedMarkdown,
+      el,
+      '',
+      expect.anything()
+    );
+  });
+
   // ============================================
   // addTextCopyButton - click behavior
   // ============================================
@@ -1373,6 +1516,27 @@ describe('MessageRenderer', () => {
 
     expect(welcomeEl).toBeDefined();
     expect(welcomeEl!.hasClass('claudian-welcome')).toBe(true);
+  });
+
+  it('renderMessages should store table-of-contents title from displayContent before content', () => {
+    const messagesEl = createMockEl();
+    const { renderer } = createRenderer(messagesEl);
+    jest.spyOn(renderer, 'renderContent').mockResolvedValue(undefined);
+
+    const messages: ChatMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: 'Expanded prompt that should not appear',
+        displayContent: 'Visible slash command\nwith details',
+        timestamp: Date.now(),
+      },
+    ];
+
+    renderer.renderMessages(messages, () => 'Hello');
+
+    const msgEl = messagesEl.querySelector('.claudian-message-user');
+    expect(msgEl?.getAttribute('data-toc-title')).toBe('Visible slash command');
   });
 
   it('renderMessages should hide welcome when messages exist', () => {

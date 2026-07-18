@@ -22,11 +22,11 @@ import {
 import type {
   ApprovalCallbackOptions,
   ApprovalDecisionOption,
+  ChatRuntimeQueryOptions,
   ChatTurnRequest,
 } from '../../../core/runtime/types';
 import { TOOL_EXIT_PLAN_MODE } from '../../../core/tools/toolNames';
 import type { ApprovalDecision, ChatMessage, ExitPlanModeDecision, StreamChunk } from '../../../core/types';
-import type ClaudianPlugin from '../../../main';
 import { ResumeSessionDropdown } from '../../../shared/components/ResumeSessionDropdown';
 import { InstructionModal } from '../../../shared/modals/InstructionConfirmModal';
 import type { BrowserSelectionContext } from '../../../utils/browser';
@@ -36,6 +36,7 @@ import { formatDurationMmSs } from '../../../utils/date';
 import type { EditorSelectionContext } from '../../../utils/editor';
 import { resolveLineRangeMentions } from '../../../utils/lineRangeMention';
 import { appendMarkdownSnippet } from '../../../utils/markdown';
+import type { FeatureHost } from '../../FeatureHost';
 import { COMPLETION_FLAVOR_WORDS } from '../constants';
 import { type InlineAskQuestionConfig, InlineAskUserQuestion } from '../rendering/InlineAskUserQuestion';
 import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
@@ -55,6 +56,8 @@ import type { CanvasSelectionController } from './CanvasSelectionController';
 import type { ConversationController } from './ConversationController';
 import type { SelectionController } from './SelectionController';
 import type { StreamController } from './StreamController';
+import type { ActiveTurnOwner } from './TurnCoordinator';
+import { TurnCoordinator } from './TurnCoordinator';
 
 const APPROVAL_OPTION_MAP: Record<string, ApprovalDecision> = {
   'Deny': 'deny',
@@ -74,7 +77,7 @@ function toError(error: unknown): Error {
 }
 
 export interface InputControllerDeps {
-  plugin: ClaudianPlugin;
+  plugin: FeatureHost;
   state: ChatState;
   renderer: MessageRenderer;
   streamController: StreamController;
@@ -108,7 +111,17 @@ export interface InputControllerDeps {
   ensureServiceInitialized?: () => Promise<boolean>;
   openConversation?: (conversationId: string) => Promise<void>;
   onForkAll?: () => Promise<void>;
-  restorePrePlanPermissionModeIfNeeded?: () => void;
+  restorePrePlanPermissionModeIfNeeded?: () => void | Promise<void>;
+  turnOwner?: ActiveTurnOwner;
+}
+
+export interface SendMessageOptions {
+  editorContextOverride?: EditorSelectionContext | null;
+  browserContextOverride?: BrowserSelectionContext | null;
+  canvasContextOverride?: CanvasSelectionContext | null;
+  content?: string;
+  images?: ChatMessage['images'];
+  turnRequestOverride?: ChatTurnRequest;
 }
 
 export class InputController {
@@ -131,9 +144,14 @@ export class InputController {
   }> = [];
   private sawInitialProviderUserMessage = false;
   private awaitingProviderAssistantStart = false;
+  private readonly turnCoordinator: TurnCoordinator<SendMessageOptions>;
 
   constructor(deps: InputControllerDeps) {
     this.deps = deps;
+    this.turnCoordinator = new TurnCoordinator(
+      (options) => this.executeSendMessage(options),
+      deps.turnOwner,
+    );
   }
 
   private getAgentService(): ChatRuntime | null {
@@ -190,14 +208,11 @@ export class InputController {
   // Message Sending
   // ============================================
 
-  async sendMessage(options?: {
-    editorContextOverride?: EditorSelectionContext | null;
-    browserContextOverride?: BrowserSelectionContext | null;
-    canvasContextOverride?: CanvasSelectionContext | null;
-    content?: string;
-    images?: ChatMessage['images'];
-    turnRequestOverride?: ChatTurnRequest;
-  }): Promise<void> {
+  async sendMessage(options?: SendMessageOptions): Promise<void> {
+    await this.turnCoordinator.run(options);
+  }
+
+  private async executeSendMessage(options?: SendMessageOptions): Promise<void> {
     const {
       plugin,
       state,
@@ -322,6 +337,9 @@ export class InputController {
       turnRequest = { ...turnRequest, text: resolvedText };
     }
 
+    const messagesBeforeTurn = state.messages;
+    const hadPendingConversationSave = state.hasPendingConversationSave;
+
     fileContextManager?.markCurrentNoteSent();
 
     const userMsg: ChatMessage = {
@@ -336,7 +354,13 @@ export class InputController {
     state.hasPendingConversationSave = true;
     renderer.addMessage(userMsg);
 
-    await this.triggerTitleGeneration();
+    try {
+      await this.triggerTitleGeneration();
+    } catch (error) {
+      this.restoreMessageToInput(this.createQueuedMessage(displayContent, turnRequest));
+      this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
+      throw error;
+    }
 
     const assistantMsg: ChatMessage = {
       id: this.deps.generateId(),
@@ -372,8 +396,8 @@ export class InputController {
       const ready = await this.deps.ensureServiceInitialized();
       if (!ready) {
         new Notice('Failed to initialize agent service. Please try again.');
-        streamController.hideThinkingIndicator();
-        state.isStreaming = false;
+        this.restoreMessageToInput(this.createQueuedMessage(displayContent, turnRequest));
+        this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
         this.activeStreamingAssistantMessage = null;
         this.resetProviderMessageBoundaryState();
         return;
@@ -383,6 +407,8 @@ export class InputController {
     const agentService = this.getAgentService();
     if (!agentService) {
       new Notice('Agent service not available. Please reload the plugin.');
+      this.restoreMessageToInput(this.createQueuedMessage(displayContent, turnRequest));
+      this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
       this.activeStreamingAssistantMessage = null;
       this.resetProviderMessageBoundaryState();
       return;
@@ -406,6 +432,7 @@ export class InputController {
     }
 
     try {
+      await agentService.prepareForTurn?.();
       const preparedTurn = agentService.prepareTurn(turnRequest);
       userMsg.content = preparedTurn.persistedContent;
       userMsg.currentNote = preparedTurn.isCompact
@@ -415,13 +442,55 @@ export class InputController {
       // Pass history WITHOUT current turn (userMsg + assistantMsg we just added)
       // This prevents duplication when rebuilding context for new sessions
       const previousMessages = state.messages.slice(0, -2);
-      for await (const chunk of agentService.query(preparedTurn, previousMessages)) {
+      const selectedModel = this.getAuxiliaryModel();
+      const queryOptions: ChatRuntimeQueryOptions | undefined = selectedModel
+        ? { model: selectedModel }
+        : undefined;
+      for await (const chunk of agentService.query(preparedTurn, previousMessages, queryOptions)) {
         if (state.streamGeneration !== streamGeneration) {
           wasInvalidated = true;
           break;
         }
         if (state.cancelRequested) {
           wasInterrupted = true;
+          break;
+        }
+
+        if (chunk.type === 'error' && chunk.code === 'provider_session_missing') {
+          const retryMessage = this.createQueuedMessage(displayContent, {
+            ...turnRequest,
+            images: imagesForMessage ?? turnRequest.images,
+          });
+          const pendingMessagesToRestore = this.mergePendingMessages(
+            this.pendingSteerMessage,
+            state.queuedMessage,
+          );
+          const composerDraftToRestore = this.captureComposerDraft();
+          const staleConversationId = state.currentConversationId;
+          const resolution = staleConversationId
+            ? await plugin.handleMissingProviderSession(
+                staleConversationId,
+                chunk.providerSessionId,
+              )
+            : 'not_found';
+          if (resolution === 'deleted') {
+            this.restoreMessageToInput(composerDraftToRestore, { mergeWithComposer: true });
+            this.restoreMessageToInput(pendingMessagesToRestore, { mergeWithComposer: true });
+            this.restoreMessageToInput(retryMessage, { mergeWithComposer: true });
+          } else {
+            this.restoreMessageToInput(retryMessage, { mergeWithComposer: true });
+            this.restorePendingSteerMessageToQueue();
+            this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
+          }
+          const notice = resolution === 'deleted'
+            ? 'The provider session no longer exists. Its Claudian record was removed; send again to start a new session.'
+            : resolution === 'reset'
+              ? 'The provider session no longer exists. Claudian preserved the recoverable history; send again to rebuild the session.'
+              : resolution === 'preserved'
+                ? 'The provider session no longer exists. Claudian preserved its record because the remaining history could not be verified.'
+                : 'The provider session no longer exists. Send again to start a new session.';
+          new Notice(notice);
+          wasInvalidated = true;
           break;
         }
 
@@ -452,7 +521,10 @@ export class InputController {
       if (!wasInvalidated && state.streamGeneration === streamGeneration) {
         const didCancelThisTurn = wasInterrupted || state.cancelRequested;
         if (didCancelThisTurn && !state.pendingNewSessionPlan) {
-          await streamController.appendText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>');
+          finalAssistantMsg.isInterrupt = true;
+          if (state.currentContentEl) {
+            renderer.appendInterruptIndicator(state.currentContentEl);
+          }
         }
         streamController.hideThinkingIndicator();
         state.isStreaming = false;
@@ -518,7 +590,7 @@ export class InputController {
           if (state.streamGeneration !== streamGeneration || invalidated) {
             planApprovalInvalidated = true;
           } else if (decision?.type === 'implement') {
-            this.deps.restorePrePlanPermissionModeIfNeeded?.();
+            await this.deps.restorePrePlanPermissionModeIfNeeded?.();
             planAutoSendContent = 'Implement the plan.';
           } else if (decision?.type === 'revise') {
             // Keep plan mode active, populate input with feedback text
@@ -526,7 +598,7 @@ export class InputController {
             shouldProcessQueuedMessage = false;
           } else {
             // cancel or null (dismissed)
-            this.deps.restorePrePlanPermissionModeIfNeeded?.();
+            await this.deps.restorePrePlanPermissionModeIfNeeded?.();
           }
         }
 
@@ -679,6 +751,20 @@ export class InputController {
     }
     this.deps.resetInputHeight();
     inputEl.focus();
+  }
+
+  private captureComposerDraft(): QueuedMessage | null {
+    const content = this.deps.getInputEl().value;
+    const attachedImages = this.deps.getImageContextManager()?.getAttachedImages() ?? [];
+    const images = attachedImages.length > 0 ? [...attachedImages] : undefined;
+    if (!content.trim() && !images) {
+      return null;
+    }
+
+    return this.createQueuedMessage(content, {
+      text: content,
+      images,
+    });
   }
 
   private restorePendingMessagesToInput(): void {
@@ -933,6 +1019,7 @@ export class InputController {
     try {
       const { displayContent, request } = this.toQueuedChatTurn(queuedMessage);
 
+      await agentService.prepareForTurn?.();
       const preparedTurn = agentService.prepareTurn(request);
       const accepted = await agentService.steer(preparedTurn);
       if (state.cancelRequested || !this.pendingSteerMessage) {
@@ -1120,6 +1207,35 @@ export class InputController {
     state.currentThinkingState = null;
   }
 
+  private rollbackFailedTurn(
+    messagesBeforeTurn: ChatMessage[],
+    hadPendingConversationSave: boolean,
+  ): void {
+    const { state, renderer, streamController } = this.deps;
+    const retainedMessageIds = new Set(messagesBeforeTurn.map(message => message.id));
+    for (const message of state.messages) {
+      if (!retainedMessageIds.has(message.id)) {
+        renderer.removeMessage(message.id);
+      }
+    }
+
+    state.messages = messagesBeforeTurn;
+    state.hasPendingConversationSave = hadPendingConversationSave;
+    streamController.hideThinkingIndicator();
+    state.isStreaming = false;
+    state.cancelRequested = false;
+    state.currentContentEl = null;
+    state.currentTextEl = null;
+    state.currentTextContent = '';
+    state.currentThinkingState = null;
+    state.responseStartTime = null;
+    this.deps.getSubagentManager().resetStreamingState();
+
+    if (messagesBeforeTurn.length === 0) {
+      this.deps.getWelcomeEl()?.removeClass('claudian-hidden');
+    }
+  }
+
   // ============================================
   // Title Generation
   // ============================================
@@ -1137,9 +1253,11 @@ export class InputController {
 
     if (!state.currentConversationId) {
       const sessionId = this.getAgentService()?.getSessionId() ?? undefined;
+      const selectedModel = this.getAuxiliaryModel() ?? undefined;
       const conversation = await plugin.createConversation({
         providerId: this.getActiveProviderId(),
         sessionId,
+        ...(selectedModel ? { selectedModel } : {}),
       });
       state.currentConversationId = conversation.id;
     }
@@ -1256,9 +1374,12 @@ export class InputController {
         {
           onAccept: (finalInstruction) => {
             void (async (): Promise<void> => {
-              const currentPrompt = plugin.settings.systemPrompt;
-              plugin.settings.systemPrompt = appendMarkdownSnippet(currentPrompt, finalInstruction);
-              await plugin.saveSettings();
+              await plugin.mutateSettings((settings) => {
+                settings.systemPrompt = appendMarkdownSnippet(
+                  settings.systemPrompt,
+                  finalInstruction,
+                );
+              });
 
               new Notice('Instruction added to custom system prompt');
               instructionModeManager?.clear();

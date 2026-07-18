@@ -1,18 +1,34 @@
+import * as fsp from 'node:fs/promises';
+
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import type { ChatMessage, ContentBlock, ToolCallInfo } from '../../../core/types';
+import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo } from '../../../core/types';
 import { extractUserDisplayContent } from '../../../utils/context';
 import {
+  buildImageAttachmentFromBase64,
+  parseImageDataUri,
+} from '../../../utils/imageAttachment';
+import {
+  extractCodexUserVisibleText,
+  joinCodexUserTextParts,
+} from '../codexUserText';
+import {
+  appendCodexCommandOutput,
+  decodeCodexExecEnvelope,
+  extractCodexExecCellId,
   isCodexToolOutputError,
   normalizeCodexMcpToolInput,
   normalizeCodexMcpToolName,
   normalizeCodexMcpToolState,
+  normalizeCodexToolCall,
   normalizeCodexToolInput,
   normalizeCodexToolName,
   normalizeCodexToolResult,
   parseCodexArguments,
+  readCodexExecCellIdArgument,
+  stringifyCodexToolOutput,
 } from '../normalization/codexToolNormalization';
 
 interface CodexEvent {
@@ -40,6 +56,7 @@ interface CodexItem {
 }
 
 interface PersistedMessagePart {
+  image_url?: string | { url?: string };
   type?: string;
   text?: string;
 }
@@ -107,11 +124,6 @@ interface PersistedCompactionPayload {
   encrypted_content?: string;
 }
 
-interface PersistedCompactedPayload {
-  message?: string;
-  replacement_history?: PersistedPayload[];
-}
-
 interface ParsedSessionRecord {
   timestamp: number;
   type?: string;
@@ -143,6 +155,7 @@ interface CodexTurnState {
   lastEventAt: number;
   userTimestamp?: number;
   userChunks: string[];
+  userImages: ImageAttachment[];
   assistantBubbles: CodexAssistantBubble[];
   activeBubbleIndex: number | null;
 }
@@ -181,6 +194,7 @@ function newTurnState(id: string, timestamp: number): CodexTurnState {
     startedAt: timestamp,
     lastEventAt: timestamp,
     userChunks: [],
+    userImages: [],
     assistantBubbles: [],
     activeBubbleIndex: null,
   };
@@ -195,6 +209,9 @@ function createPersistedParseContext(): PersistedParseContext {
     suppressedToolOutputIds: new Set(),
     terminalSessionToCommandId: new Map(),
     stdinCallToCommandId: new Map(),
+    execCellToCommandId: new Map(),
+    execEnvelopeToolCallIds: new Map(),
+    waitCallToCommand: new Map(),
     turnCounter: 0,
   };
 }
@@ -259,11 +276,45 @@ function appendUniqueChunk(chunks: string[], value: string): void {
   chunks.push(trimmed);
 }
 
-function replaceLatestChunk(chunks: string[], value: string): void {
+function appendOrderedTextChunk(
+  bubble: CodexAssistantBubble,
+  type: 'text' | 'thinking',
+  value: string,
+): void {
   const trimmed = value.trim();
   if (!trimmed) return;
-  chunks.length = 0;
+
+  const chunks = type === 'text' ? bubble.contentChunks : bubble.thinkingChunks;
+  const lastBlock = bubble.contentBlocks[bubble.contentBlocks.length - 1];
+  if (lastBlock?.type === type) {
+    if (chunks[chunks.length - 1] === trimmed) return;
+
+    chunks.push(trimmed);
+    lastBlock.content = `${lastBlock.content}\n\n${trimmed}`;
+    return;
+  }
+
   chunks.push(trimmed);
+  bubble.contentBlocks.push({ type, content: trimmed });
+}
+
+function replaceLatestOrderedTextChunk(
+  bubble: CodexAssistantBubble,
+  type: 'text' | 'thinking',
+  value: string,
+): void {
+  const trimmed = value.trim();
+  if (!trimmed) return;
+
+  const chunks = type === 'text' ? bubble.contentChunks : bubble.thinkingChunks;
+  const lastBlock = bubble.contentBlocks[bubble.contentBlocks.length - 1];
+  if (lastBlock?.type !== type || chunks.length === 0) {
+    appendOrderedTextChunk(bubble, type, trimmed);
+    return;
+  }
+
+  chunks[chunks.length - 1] = trimmed;
+  lastBlock.content = trimmed;
 }
 
 function appendUserChunk(turn: CodexTurnState, value: string, timestamp: number): void {
@@ -271,6 +322,22 @@ function appendUserChunk(turn: CodexTurnState, value: string, timestamp: number)
   appendUniqueChunk(turn.userChunks, value);
 
   if (turn.userChunks.length > chunkCountBefore && !turn.userTimestamp && timestamp > 0) {
+    turn.userTimestamp = timestamp;
+  }
+}
+
+function appendUserImages(
+  turn: CodexTurnState,
+  content: PersistedMessagePart[] | undefined,
+  timestamp: number,
+): void {
+  const images = extractMessageImages(content, `codex-img-${turn.id}`, turn.userImages.length);
+  if (images.length === 0) {
+    return;
+  }
+
+  turn.userImages.push(...images);
+  if (!turn.userTimestamp && timestamp > 0) {
     turn.userTimestamp = timestamp;
   }
 }
@@ -387,70 +454,6 @@ function parseSessionRecord(line: string): ParsedSessionRecord | null {
   };
 }
 
-const CODEX_SYSTEM_MESSAGE_PREFIXES = [
-  '# AGENTS.md instructions',
-];
-
-const CODEX_CONTROL_BLOCK_TAGS = [
-  'system_instruction',
-  'environment_context',
-  'turn_aborted',
-  'user-preferences',
-  'subagent_notification',
-  'skill',
-];
-
-function stripLeadingTaggedBlock(text: string, tagName: string): string | null {
-  const openTag = `<${tagName}>`;
-  if (!text.startsWith(openTag)) {
-    return null;
-  }
-
-  const closeTag = `</${tagName}>`;
-  const closeIndex = text.indexOf(closeTag, openTag.length);
-  if (closeIndex === -1) {
-    return '';
-  }
-
-  return text.slice(closeIndex + closeTag.length);
-}
-
-function stripLeadingCodexControlBlocks(text: string): string {
-  let remaining = text.trimStart();
-  let stripped = true;
-
-  while (stripped) {
-    stripped = false;
-
-    for (const tagName of CODEX_CONTROL_BLOCK_TAGS) {
-      const next = stripLeadingTaggedBlock(remaining, tagName);
-      if (next === null) {
-        continue;
-      }
-
-      remaining = next.trimStart();
-      stripped = true;
-      break;
-    }
-  }
-
-  return remaining;
-}
-
-function extractCodexUserVisibleText(text: string): string | null {
-  const trimmed = text.trimStart();
-  if (!trimmed) {
-    return null;
-  }
-
-  if (CODEX_SYSTEM_MESSAGE_PREFIXES.some(prefix => trimmed.startsWith(prefix))) {
-    return null;
-  }
-
-  const visible = stripLeadingCodexControlBlocks(trimmed).trim();
-  return visible ? visible : null;
-}
-
 function extractMessageText(content: PersistedMessagePart[] | undefined): string {
   if (!Array.isArray(content)) {
     return '';
@@ -459,6 +462,73 @@ function extractMessageText(content: PersistedMessagePart[] | undefined): string
   return content
     .map(part => (typeof part?.text === 'string' ? part.text : ''))
     .join('');
+}
+
+function extractUserMessageText(content: PersistedMessagePart[] | undefined): string {
+  if (!Array.isArray(content)) {
+    return '';
+  }
+
+  return joinCodexUserTextParts(
+    content.map(part => (typeof part?.text === 'string' ? part.text : '')),
+  );
+}
+
+function extractMessageImages(
+  content: PersistedMessagePart[] | undefined,
+  idPrefix: string,
+  startIndex = 0,
+): ImageAttachment[] {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  const images: ImageAttachment[] = [];
+  for (const part of content) {
+    if (part?.type !== 'input_image') {
+      continue;
+    }
+
+    const imageUrl = typeof part.image_url === 'string'
+      ? part.image_url
+      : typeof part.image_url?.url === 'string'
+        ? part.image_url.url
+        : null;
+    const parsed = parseImageDataUri(imageUrl);
+    if (!parsed) {
+      continue;
+    }
+
+    const image = buildImageAttachmentFromBase64({
+      data: parsed.data,
+      id: `${idPrefix}-${startIndex + images.length}`,
+      mediaType: parsed.mediaType,
+      name: `image-${startIndex + images.length + 1}.${parsed.mediaType.split('/')[1]}`,
+    });
+    if (image) {
+      images.push(image);
+    }
+  }
+
+  return images;
+}
+
+function hasMessageImages(content: PersistedMessagePart[] | undefined): boolean {
+  if (!Array.isArray(content)) {
+    return false;
+  }
+
+  return content.some((part) => {
+    if (part?.type !== 'input_image') {
+      return false;
+    }
+    const imageUrl = typeof part.image_url === 'string'
+      ? part.image_url
+      : typeof part.image_url?.url === 'string'
+        ? part.image_url.url
+        : null;
+    return parseImageDataUri(imageUrl) !== null;
+  });
 }
 
 function joinTextParts(parts: Array<{ text?: string } | string>): string {
@@ -607,6 +677,9 @@ interface PersistedParseContext {
   suppressedToolOutputIds: Set<string>;
   terminalSessionToCommandId: Map<string, string>;
   stdinCallToCommandId: Map<string, string>;
+  execCellToCommandId: Map<string, string>;
+  execEnvelopeToolCallIds: Map<string, string[]>;
+  waitCallToCommand: Map<string, { commandCallId: string; cellId: string }>;
   turnCounter: number;
 }
 
@@ -623,8 +696,33 @@ function processPersistedToolCall(
   const callId = payload.call_id;
   if (!callId) return;
 
-  if (payload.name === 'write_stdin') {
-    const parsedArgs = parseCodexArguments(payload.arguments ?? payload.input);
+  const rawArgs = payload.arguments ?? payload.input;
+  const parsedArgs = parseCodexArguments(rawArgs);
+  const execEnvelopeCalls = payload.name === 'exec'
+    ? decodeCodexExecEnvelope(parsedArgs)
+    : null;
+  if (execEnvelopeCalls && execEnvelopeCalls.length > 1) {
+    const toolCallIds = execEnvelopeCalls.map((call, index) => {
+      const nestedCallId = `${callId}:${index + 1}`;
+      pushPersistedNormalizedToolCall(nestedCallId, call, timestamp, ctx);
+      return nestedCallId;
+    });
+    ctx.execEnvelopeToolCallIds.set(callId, toolCallIds);
+    return;
+  }
+
+  const normalized = normalizeCodexToolCall(payload.name, parsedArgs);
+
+  if (normalized.name === 'wait') {
+    const cellId = readCodexExecCellIdArgument(normalized.input);
+    const commandCallId = cellId ? ctx.execCellToCommandId.get(cellId) : undefined;
+    if (cellId && commandCallId) {
+      ctx.waitCallToCommand.set(callId, { commandCallId, cellId });
+      return;
+    }
+  }
+
+  if (normalized.name === 'write_stdin') {
     if (isSilentWriteStdinInput(parsedArgs)) {
       const terminalSessionId = readTerminalSessionIdArgument(parsedArgs);
       const parentCallId = terminalSessionId
@@ -638,18 +736,28 @@ function processPersistedToolCall(
     }
   }
 
-  const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
-  const bubble = ensureAssistantBubble(turn, timestamp);
+  pushPersistedNormalizedToolCall(callId, normalized, timestamp, ctx);
+}
 
-  const rawArgs = payload.arguments ?? payload.input;
-  const parsedArgs = parseCodexArguments(rawArgs);
-  const normalizedName = normalizeCodexToolName(payload.name);
-  const normalizedInput = normalizeCodexToolInput(payload.name, parsedArgs);
+function pushPersistedNormalizedToolCall(
+  callId: string,
+  normalized: { name: string; input: Record<string, unknown> },
+  timestamp: number,
+  ctx: PersistedParseContext,
+): void {
+  const turn = ensureTurn(
+    ctx.turns,
+    ctx.turnOrder,
+    nextTurnId(ctx),
+    ctx.currentTurnId,
+    timestamp,
+  );
+  const bubble = ensureAssistantBubble(turn, timestamp);
 
   const toolCall: ToolCallInfo = {
     id: callId,
-    name: normalizedName,
-    input: normalizedInput,
+    name: normalized.name,
+    input: normalized.input,
     status: 'running',
   };
 
@@ -670,11 +778,30 @@ function processPersistedToolOutput(
   if (!callId) return;
 
   // output can be a string or an array (e.g. view_image returns image objects)
-  const rawOutput = typeof payload.output === 'string'
-    ? payload.output
-    : Array.isArray(payload.output)
-      ? JSON.stringify(payload.output)
-      : '';
+  const rawOutput = stringifyCodexToolOutput(payload.output);
+
+  const execEnvelopeToolCallIds = ctx.execEnvelopeToolCallIds.get(callId);
+  if (execEnvelopeToolCallIds) {
+    applyPersistedExecEnvelopeOutput(
+      execEnvelopeToolCallIds,
+      payload.output,
+      rawOutput,
+      ctx,
+    );
+    ctx.execEnvelopeToolCallIds.delete(callId);
+    return;
+  }
+
+  const waitCall = ctx.waitCallToCommand.get(callId);
+  if (waitCall) {
+    const parentToolCall = findPersistedToolCallById(ctx, waitCall.commandCallId);
+    ctx.execCellToCommandId.delete(waitCall.cellId);
+    if (parentToolCall) {
+      applyPersistedToolOutput(parentToolCall, payload.output, rawOutput, ctx);
+    }
+    ctx.waitCallToCommand.delete(callId);
+    return;
+  }
 
   const parentCommandId = ctx.stdinCallToCommandId.get(callId);
   if (parentCommandId) {
@@ -739,6 +866,74 @@ function findPersistedToolCallById(ctx: PersistedParseContext, callId: string): 
   return turn.assistantBubbles[origin.bubbleIndex].toolCalls.find(tool => tool.id === callId) ?? null;
 }
 
+function applyPersistedExecEnvelopeOutput(
+  toolCallIds: string[],
+  rawOutputValue: string | unknown[] | undefined,
+  rawOutputText: string,
+  ctx: PersistedParseContext,
+): void {
+  const toolCalls = toolCallIds
+    .map(toolCallId => findPersistedToolCallById(ctx, toolCallId))
+    .filter((toolCall): toolCall is ToolCallInfo => toolCall !== null);
+  if (toolCalls.length === 0) return;
+
+  const outputParts = splitPersistedExecEnvelopeOutput(rawOutputValue, toolCalls.length);
+  if (outputParts) {
+    for (const [index, toolCall] of toolCalls.entries()) {
+      const outputPart = outputParts[index] ?? '';
+      applyPersistedToolOutput(
+        toolCall,
+        outputPart,
+        stringifyCodexToolOutput(outputPart),
+        ctx,
+      );
+    }
+    return;
+  }
+
+  // Without one output item per nested call, preserve the aggregate result on
+  // the final card instead of inventing a per-command split.
+  const isError = isCodexToolOutputError(rawOutputText);
+  for (const toolCall of toolCalls) {
+    toolCall.status = isError ? 'error' : 'completed';
+  }
+
+  const lastToolCall = toolCalls[toolCalls.length - 1];
+  if (lastToolCall) {
+    lastToolCall.result = normalizeCodexToolResult(lastToolCall.name, rawOutputText);
+  }
+}
+
+function splitPersistedExecEnvelopeOutput(
+  rawOutputValue: string | unknown[] | undefined,
+  toolCallCount: number,
+): Array<string | unknown[]> | null {
+  if (!Array.isArray(rawOutputValue)) return null;
+
+  const outputParts: Array<string | unknown[]> = [];
+  for (const part of rawOutputValue) {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return null;
+    const text = (part as Record<string, unknown>).text;
+    outputParts.push(typeof text === 'string' ? text : [part]);
+  }
+
+  // The outer exec transport prepends its own completion header before values
+  // emitted by each text(...) call in the envelope.
+  if (
+    outputParts.length === toolCallCount + 1
+    && typeof outputParts[0] === 'string'
+    && isPersistedExecEnvelopeHeader(outputParts[0])
+  ) {
+    return outputParts.slice(1);
+  }
+
+  return outputParts.length === toolCallCount ? outputParts : null;
+}
+
+function isPersistedExecEnvelopeHeader(value: string): boolean {
+  return value.startsWith('Script ') && value.endsWith('Output:\n');
+}
+
 function readTerminalSessionIdArgument(input: Record<string, unknown>): string | undefined {
   const value = input.session_id ?? input.sessionId;
   if (typeof value === 'string' && value) return value;
@@ -750,28 +945,24 @@ function isSilentWriteStdinInput(input: Record<string, unknown>): boolean {
   return typeof input.chars !== 'string' || input.chars.length === 0;
 }
 
-function appendCommandOutput(previous: string | undefined, next: string): string {
-  if (!next) return previous ?? '';
-  if (!previous) return next;
-  if (previous.endsWith('\n') || next.startsWith('\n')) return previous + next;
-  return `${previous}\n${next}`;
-}
-
 function readPersistedCommandToolResult(rawOutputText: string): {
   output: string;
   status: 'running' | 'completed' | 'unknown';
   exitCode?: number;
   terminalSessionId?: string;
+  execCellId?: string;
 } {
   const output = normalizeCodexToolResult('Bash', rawOutputText);
   const exitCodeMatch = rawOutputText.match(/(?:Exit code:|Process exited with code)\s*(-?\d+)/i);
   const runningMatch = rawOutputText.match(/Process running with session ID\s*([^\n]+)/i);
+  const execCellId = extractCodexExecCellId(rawOutputText);
 
   return {
     output,
-    status: exitCodeMatch ? 'completed' : runningMatch ? 'running' : 'unknown',
+    status: exitCodeMatch ? 'completed' : runningMatch || execCellId ? 'running' : 'unknown',
     ...(exitCodeMatch ? { exitCode: Number(exitCodeMatch[1] ?? 0) } : {}),
     ...(runningMatch ? { terminalSessionId: (runningMatch[1] ?? '').trim() } : {}),
+    ...(execCellId ? { execCellId } : {}),
   };
 }
 
@@ -784,9 +975,12 @@ function applyPersistedToolOutput(
 ): void {
   if (toolCall.name === 'Bash') {
     const commandResult = readPersistedCommandToolResult(rawOutputText);
-    toolCall.result = appendCommandOutput(toolCall.result, commandResult.output);
+    toolCall.result = appendCodexCommandOutput(toolCall.result, commandResult.output);
     if (commandResult.terminalSessionId) {
       ctx.terminalSessionToCommandId.set(commandResult.terminalSessionId, toolCall.id);
+    }
+    if (commandResult.execCellId) {
+      ctx.execCellToCommandId.set(commandResult.execCellId, toolCall.id);
     }
     if (commandResult.status === 'running') {
       toolCall.status = 'running';
@@ -903,11 +1097,12 @@ function processPersistedPayload(
   switch (payload.type) {
     case 'message': {
       const messagePayload = payload as PersistedMessagePayload;
-      const text = extractMessageText(messagePayload.content);
 
       if (messagePayload.role === 'user') {
+        const text = extractUserMessageText(messagePayload.content);
         const visibleText = extractCodexUserVisibleText(text);
-        if (visibleText === null) break;
+        const hasImages = hasMessageImages(messagePayload.content);
+        if (visibleText === null && !hasImages) break;
 
         // Close any active bubble in the current turn before starting user content
         if (ctx.currentTurnId) {
@@ -919,12 +1114,16 @@ function processPersistedPayload(
         ctx.currentTurnId = null;
         const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), null, timestamp);
         ctx.currentTurnId = turn.id;
-        appendUserChunk(turn, visibleText, timestamp);
+        if (visibleText !== null) {
+          appendUserChunk(turn, visibleText, timestamp);
+        }
+        appendUserImages(turn, messagePayload.content, timestamp);
       } else if (messagePayload.role === 'assistant') {
+        const text = extractMessageText(messagePayload.content);
         const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
         const bubble = ensureAssistantBubble(turn, timestamp);
         if (text) {
-          appendUniqueChunk(bubble.contentChunks, text);
+          appendOrderedTextChunk(bubble, 'text', text);
         }
       }
       break;
@@ -937,7 +1136,7 @@ function processPersistedPayload(
 
       const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
       const bubble = ensureAssistantBubble(turn, timestamp);
-      appendUniqueChunk(bubble.thinkingChunks, text);
+      appendOrderedTextChunk(bubble, 'thinking', text);
       break;
     }
 
@@ -964,37 +1163,6 @@ function processPersistedPayload(
 
     default:
       break;
-  }
-}
-
-function applyCompactedReplacementHistory(
-  payload: PersistedCompactedPayload | undefined,
-  timestamp: number,
-  ctx: PersistedParseContext,
-): void {
-  ctx.turns.clear();
-  ctx.turnOrder.length = 0;
-  ctx.currentTurnId = null;
-  ctx.toolCallToTurn.clear();
-  ctx.suppressedToolOutputIds.clear();
-  ctx.terminalSessionToCommandId.clear();
-  ctx.stdinCallToCommandId.clear();
-  ctx.turnCounter = 0;
-
-  const replacementHistory = Array.isArray(payload?.replacement_history)
-    ? payload.replacement_history
-    : [];
-
-  for (const [index, item] of replacementHistory.entries()) {
-    processPersistedPayload(item, timestamp + index, index, ctx);
-  }
-
-  if (ctx.currentTurnId) {
-    const turn = ctx.turns.get(ctx.currentTurnId);
-    if (turn) {
-      closeAssistantBubble(turn);
-    }
-    ctx.currentTurnId = null;
   }
 }
 
@@ -1071,7 +1239,7 @@ function processEventMsg(
       const bubble = ensureAssistantBubble(turn, timestamp);
       const msg = payload.message;
       if (typeof msg === 'string') {
-        appendUniqueChunk(bubble.contentChunks, msg);
+        appendOrderedTextChunk(bubble, 'text', msg);
       }
       break;
     }
@@ -1082,24 +1250,29 @@ function processEventMsg(
 
       const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
       const bubble = ensureAssistantBubble(turn, timestamp);
-      appendUniqueChunk(bubble.thinkingChunks, text);
+      appendOrderedTextChunk(bubble, 'thinking', text);
       break;
     }
 
     case 'context_compacted': {
-      // Close any active bubble so the boundary stays standalone
-      if (ctx.currentTurnId) {
-        const prevTurn = ctx.turns.get(ctx.currentTurnId);
-        if (prevTurn) closeAssistantBubble(prevTurn);
+      const activeTurnId = ctx.currentTurnId;
+      if (activeTurnId) {
+        const activeTurn = ctx.turns.get(activeTurnId);
+        if (activeTurn) closeAssistantBubble(activeTurn);
       }
 
-      // Create a dedicated turn for the compact boundary
-      const id = nextTurnId(ctx);
-      const turn = ensureTurn(ctx.turns, ctx.turnOrder, id, null, timestamp);
+      // Auto-compaction can occur in the middle of a running turn. Keep the
+      // boundary in that turn so later records retain their turn ownership.
+      const turn = ensureTurn(
+        ctx.turns,
+        ctx.turnOrder,
+        nextTurnId(ctx),
+        activeTurnId,
+        timestamp,
+      );
       const bubble = ensureAssistantBubble(turn, timestamp);
       bubble.contentBlocks.push({ type: 'context_compacted' });
       closeAssistantBubble(turn);
-      ctx.currentTurnId = null;
       break;
     }
 
@@ -1119,13 +1292,15 @@ function flushBubbleTurnMessages(
   const messages: ChatMessage[] = [];
 
   const visibleUserText = extractCodexUserVisibleText(turn.userChunks.join('\n'));
-  if (visibleUserText) {
-    const displayContent = extractUserDisplayContent(visibleUserText);
+  const userImages = turn.userImages.length > 0 ? turn.userImages : undefined;
+  if (visibleUserText || userImages) {
+    const displayContent = visibleUserText ? extractUserDisplayContent(visibleUserText) : undefined;
     messages.push({
       id: `codex-msg-${msgIndex}`,
       role: 'user',
-      content: visibleUserText,
+      content: visibleUserText ?? '',
       ...(displayContent !== undefined ? { displayContent } : {}),
+      ...(userImages ? { images: userImages } : {}),
       ...(turn.serverTurnId ? { userMessageId: turn.serverTurnId } : {}),
       timestamp: turn.userTimestamp || turn.startedAt || Date.now(),
     });
@@ -1157,14 +1332,7 @@ function flushBubbleTurnMessages(
       continue;
     }
 
-    const contentBlocks: ContentBlock[] = [];
-    if (hasThinking) {
-      contentBlocks.push({ type: 'thinking', content: thinkingText.trim() });
-    }
-    contentBlocks.push(...bubble.contentBlocks);
-    if (hasContent) {
-      contentBlocks.push({ type: 'text', content: contentText.trim() });
-    }
+    const contentBlocks = bubble.contentBlocks;
 
     const msg: ChatMessage = {
       id: `codex-msg-${msgIndex}`,
@@ -1292,6 +1460,98 @@ export function findCodexSessionFile(
   return null;
 }
 
+export async function findCodexSessionFileAsync(
+  threadId: string,
+  root: string = path.join(os.homedir(), '.codex', 'sessions'),
+  timeoutMs = 10_000,
+  dependencies: CodexSessionFileLookupDependencies = {},
+): Promise<string | null> {
+  if (!threadId || !SAFE_SESSION_ID_PATTERN.test(threadId)) {
+    return null;
+  }
+
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  const pathExists = dependencies.pathExists ?? defaultPathExists;
+  const readDirectory = dependencies.readDirectory
+    ?? ((value: string) => fsp.readdir(value, { withFileTypes: true }));
+  try {
+    if (!(await runBeforeDeadline(() => pathExists(root), deadline))) {
+      return null;
+    }
+    const directPath = path.join(root, `${threadId}.jsonl`);
+    if (await runBeforeDeadline(() => pathExists(directPath), deadline)) {
+      return directPath;
+    }
+  } catch {
+    return null;
+  }
+
+  const stack = [root];
+  while (stack.length > 0 && Date.now() <= deadline) {
+    const current = stack.pop();
+    if (!current) continue;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await runBeforeDeadline(() => readDirectory(current), deadline);
+    } catch {
+      if (Date.now() >= deadline) {
+        return null;
+      }
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith(`-${threadId}.jsonl`)) {
+        return fullPath;
+      }
+    }
+  }
+  return null;
+}
+
+export interface CodexSessionFileLookupDependencies {
+  pathExists?: (value: string) => Promise<boolean>;
+  readDirectory?: (value: string) => Promise<fs.Dirent[]>;
+}
+
+async function runBeforeDeadline<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    throw new Error('Codex history lookup deadline exceeded.');
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error('Codex history lookup deadline exceeded.'));
+    }, remainingMs);
+    operation().then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
+async function defaultPathExists(value: string): Promise<boolean> {
+  try {
+    await fsp.access(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function parseCodexSessionFile(filePath: string): ChatMessage[] {
   let content: string;
   try {
@@ -1301,6 +1561,22 @@ export function parseCodexSessionFile(filePath: string): ChatMessage[] {
   }
 
   return parseCodexSessionContent(content);
+}
+
+export async function parseCodexSessionFileAsync(
+  filePath: string,
+  timeoutMs = 10_000,
+): Promise<ChatMessage[]> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const content = await fsp.readFile(filePath, { encoding: 'utf-8', signal: controller.signal });
+    return parseCodexSessionContent(content);
+  } catch {
+    return [];
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 export interface CodexParsedTurn {
@@ -1411,7 +1687,8 @@ function parseModernSessionTurns(records: ParsedSessionRecord[]): CodexParsedTur
     }
 
     if (parsed.type === 'compacted') {
-      applyCompactedReplacementHistory(parsed.payload as PersistedCompactedPayload | undefined, timestamp, ctx);
+      // Codex replacement_history is compacted provider context, not a role-complete
+      // UI transcript. The durable visible marker is event_msg:context_compacted.
       continue;
     }
 
@@ -1504,7 +1781,7 @@ function processLegacyItemInModernContext(
       if ((eventType === 'item.updated' || eventType === 'item.completed') && item.text) {
         const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
         const bubble = ensureAssistantBubble(turn, timestamp);
-        replaceLatestChunk(bubble.contentChunks, item.text);
+        replaceLatestOrderedTextChunk(bubble, 'text', item.text);
       }
       break;
     }
@@ -1513,7 +1790,7 @@ function processLegacyItemInModernContext(
       if ((eventType === 'item.updated' || eventType === 'item.completed') && item.text) {
         const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
         const bubble = ensureAssistantBubble(turn, timestamp);
-        replaceLatestChunk(bubble.thinkingChunks, item.text);
+        replaceLatestOrderedTextChunk(bubble, 'thinking', item.text);
       }
       break;
     }

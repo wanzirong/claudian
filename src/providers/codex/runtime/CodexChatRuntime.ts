@@ -7,6 +7,8 @@ import {
   computeSystemPromptKey,
   type SystemPromptSettings,
 } from '../../../core/prompt/mainAgent';
+import { getProviderSettingsSnapshotWithModel } from '../../../core/providers/conversationModel';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type { ProviderCapabilities, ProviderId } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
@@ -24,10 +26,8 @@ import type {
   ExitPlanModeCallback,
   PreparedChatTurn,
   SessionUpdateResult,
-  SubagentRuntimeState,
 } from '../../../core/runtime/types';
 import type { ChatMessage, Conversation, ForkSource, SlashCommand, StreamChunk } from '../../../core/types';
-import type ClaudianPlugin from '../../../main';
 import { getVaultPath } from '../../../utils/path';
 import { buildContextFromHistory } from '../../../utils/session';
 import { CODEX_PROVIDER_CAPABILITIES } from '../capabilities';
@@ -36,6 +36,7 @@ import {
   deriveCodexSessionsRootFromSessionPath,
   findCodexSessionFile,
 } from '../history/CodexHistoryStore';
+import { findCodexModel, getDefaultCodexModel } from '../models';
 import { toCodexRuntimeModelId } from '../modelSelection';
 import { encodeCodexTurn } from '../prompt/encodeCodexTurn';
 import {
@@ -48,7 +49,6 @@ import {
   findPreferredCodexSkillByName,
 } from '../skills/CodexSkillListingService';
 import { type CodexProviderState, getCodexState } from '../types';
-import { DEFAULT_CODEX_PRIMARY_MODEL, FAST_TIER_CODEX_MODEL } from '../types/models';
 import { CodexAppServerProcess } from './CodexAppServerProcess';
 import {
   initializeCodexAppServerTransport,
@@ -69,12 +69,19 @@ import type {
   TurnSteerResult,
   UserInput,
 } from './codexAppServerTypes';
+import { CodexDynamicToolRegistry } from './CodexDynamicToolRegistry';
 import type { CodexLaunchSpec } from './codexLaunchTypes';
 import { CodexNotificationRouter } from './CodexNotificationRouter';
 import { CodexRpcTransport } from './CodexRpcTransport';
 import { type CodexRuntimeContext, createCodexRuntimeContext } from './CodexRuntimeContext';
 import { CodexServerRequestRouter } from './CodexServerRequestRouter';
 import { CodexSessionManager } from './CodexSessionManager';
+import {
+  CODEX_WORKSPACE_DEPENDENCY_TOOL_NAME,
+  CODEX_WORKSPACE_DEPENDENCY_TOOL_NAMESPACE,
+  CODEX_WORKSPACE_DEPENDENCY_TOOL_VERSION,
+  createCodexWorkspaceDependencyTool,
+} from './CodexWorkspaceDependencyTool';
 
 function resolveCodexSandboxConfig(
   permissionMode: string,
@@ -90,24 +97,38 @@ function resolveCodexSandboxConfig(
   return { approvalPolicy: 'on-request', sandbox: codexSafeMode };
 }
 
-function resolveCodexServiceTier(serviceTier: unknown, model: string | undefined): string | null {
-  if (model !== FAST_TIER_CODEX_MODEL) {
+function resolveCodexServiceTier(
+  serviceTier: unknown,
+  modelId: string | undefined,
+  settings: Record<string, unknown>,
+): string | null {
+  const model = findCodexModel(getCodexProviderSettings(settings).discoveredModels, modelId);
+  if (!model) {
     return null;
   }
-  return serviceTier === 'fast' ? 'fast' : null;
+
+  if (typeof serviceTier === 'string') {
+    if (model.serviceTiers.some(tier => tier.id === serviceTier)) {
+      return serviceTier;
+    }
+    if (serviceTier === 'fast') {
+      return model.serviceTiers.find(tier => tier.name.toLowerCase() === 'fast')?.id ?? null;
+    }
+  }
+
+  return model.defaultServiceTier;
 }
 
-const EFFORT_MAP: Record<string, string> = {
-  low: 'low',
-  medium: 'medium',
-  high: 'high',
-  xhigh: 'xhigh',
-};
+const LEGACY_WORKSPACE_DEPENDENCY_NOTICE =
+  'This conversation was created before Claudian added Codex workspace dependency tools. It can continue for other tasks, but skills that require load_workspace_dependencies are unavailable in this thread. Start a new conversation to use them.';
+
+const LEGACY_WORKSPACE_DEPENDENCY_INSTRUCTIONS =
+  'This thread predates Claudian client-hosted workspace dependency tools. If the user requests a skill that requires load_workspace_dependencies, explain that they must start a new conversation in Claudian. Do not emulate the tool, search for dependency paths, or install replacement dependencies.';
 
 export class CodexChatRuntime implements ChatRuntime {
   readonly providerId: ProviderId = 'codex';
 
-  private plugin: ClaudianPlugin;
+  private plugin: ProviderHost;
   private session = new CodexSessionManager();
   private process: CodexAppServerProcess | null = null;
   private transport: CodexRpcTransport | null = null;
@@ -115,13 +136,19 @@ export class CodexChatRuntime implements ChatRuntime {
   private runtimeContext: CodexRuntimeContext | null = null;
   private notificationRouter: CodexNotificationRouter | null = null;
   private serverRequestRouter = new CodexServerRequestRouter();
+  private dynamicToolRegistry = new CodexDynamicToolRegistry();
   private ready = false;
+  private readinessFlight: { key: string; promise: Promise<boolean> } | null = null;
+  private disposed = false;
+  private lifecycleGeneration = 0;
   private readyListeners = new Set<(ready: boolean) => void>();
   private clientConfigKey: string | null = null;
   private currentTurnId: string | null = null;
   private currentQueryThreadId: string | null = null;
   private loadedThreadId: string | null = null;
   private currentThreadPath: string | null = null;
+  private workspaceDependencyToolVersion: number | null = null;
+  private legacyWorkspaceDependencyNoticeKeys = new Set<string>();
   private pendingTurnNotifications: Array<{ method: string; params: unknown }> = [];
 
   // Chunk buffer: notifications push here, query() drains
@@ -133,10 +160,10 @@ export class CodexChatRuntime implements ChatRuntime {
   private askUserCallback: AskUserQuestionCallback | null = null;
   private exitPlanModeCallback: ExitPlanModeCallback | null = null;
   private permissionModeSyncCallback: ((sdkMode: string) => void) | null = null;
-  private subagentHookProvider: (() => SubagentRuntimeState) | null = null;
   private autoTurnCallback: AutoTurnCallback | null = null;
   private resumeCheckpoint: string | undefined;
   private activeInputBundles = new Set<CodexInputBundle>();
+  private currentConversationModel: string | null = null;
 
   // Fork state
   private pendingFork: ForkSource | null = null;
@@ -145,7 +172,7 @@ export class CodexChatRuntime implements ChatRuntime {
   private canceled = false;
   private turnMetadata: ChatTurnMetadata = {};
 
-  constructor(plugin: ClaudianPlugin) {
+  constructor(plugin: ProviderHost) {
     this.plugin = plugin;
   }
 
@@ -179,14 +206,18 @@ export class CodexChatRuntime implements ChatRuntime {
     _externalContextPaths?: string[],
   ): void {
     if (!conversation) {
+      this.currentConversationModel = null;
       this.session.reset();
       this.loadedThreadId = null;
       this.currentThreadPath = null;
+      this.workspaceDependencyToolVersion = null;
       this.pendingFork = null;
       return;
     }
 
+    this.setCurrentConversationModel(conversation.selectedModel);
     const state = getCodexState(conversation.providerState);
+    this.workspaceDependencyToolVersion = state.workspaceDependencyToolVersion ?? null;
 
     // Pending fork: store fork metadata, don't set the source thread as our session
     if (state.forkSource && !state.threadId && !conversation.sessionId) {
@@ -215,9 +246,36 @@ export class CodexChatRuntime implements ChatRuntime {
   }
 
   async ensureReady(options?: ChatRuntimeEnsureReadyOptions): Promise<boolean> {
+    if (this.disposed) {
+      throw new Error('Codex runtime has been disposed.');
+    }
+    const key = JSON.stringify(options ?? {});
+    if (this.readinessFlight) {
+      if (this.readinessFlight.key === key) {
+        return this.readinessFlight.promise;
+      }
+      await this.readinessFlight.promise.catch(() => undefined);
+      return this.ensureReady(options);
+    }
+
+    const generation = this.lifecycleGeneration;
+    const promise = this.ensureReadyInternal(options, generation);
+    this.readinessFlight = { key, promise };
+    return promise.finally(() => {
+      if (this.readinessFlight?.promise === promise) {
+        this.readinessFlight = null;
+      }
+    });
+  }
+
+  private async ensureReadyInternal(
+    options: ChatRuntimeEnsureReadyOptions | undefined,
+    generation: number,
+  ): Promise<boolean> {
+    this.assertLifecycleCurrent(generation);
     const promptSettings = this.getSystemPromptSettings();
     const promptKey = computeSystemPromptKey(promptSettings);
-    const launchSpec = resolveCodexAppServerLaunchSpec(this.plugin, this.providerId);
+    const launchSpec = await resolveCodexAppServerLaunchSpec(this.plugin, this.providerId);
     const clientConfigKey = [promptKey, JSON.stringify({
       command: launchSpec.command,
       args: launchSpec.args,
@@ -233,9 +291,15 @@ export class CodexChatRuntime implements ChatRuntime {
 
     if (shouldRebuild) {
       await this.shutdownProcess();
+      this.assertLifecycleCurrent(generation);
       await this.startAppServer(launchSpec, clientConfigKey);
+      if (!this.isLifecycleCurrent(generation)) {
+        await this.shutdownProcess();
+        this.assertLifecycleCurrent(generation);
+      }
     }
 
+    this.assertLifecycleCurrent(generation);
     this.setReady(true);
     return shouldRebuild;
   }
@@ -245,6 +309,9 @@ export class CodexChatRuntime implements ChatRuntime {
     _conversationHistory?: ChatMessage[],
     queryOptions?: ChatRuntimeQueryOptions,
   ): AsyncGenerator<StreamChunk> {
+    if (queryOptions?.model) {
+      this.setCurrentConversationModel(queryOptions.model);
+    }
     this.resetTurnMetadata();
     let turn = originalTurn;
     await this.ensureReady();
@@ -256,7 +323,8 @@ export class CodexChatRuntime implements ChatRuntime {
     this.currentQueryThreadId = null;
     this.pendingTurnNotifications = [];
 
-    const model = this.resolveModel(queryOptions);
+    const providerSettings = this.getProviderSettings();
+    const model = this.resolveModel(queryOptions, providerSettings);
     const promptSettings = this.getSystemPromptSettings();
     const promptText = buildSystemPrompt(promptSettings);
 
@@ -290,6 +358,30 @@ export class CodexChatRuntime implements ChatRuntime {
       let threadPath: string | null = null;
       let threadTargetPath: string | null = null;
       let completedPendingFork = false;
+      const isLegacyWorkspaceDependencyThread = (
+        this.pendingFork !== null || existingThreadId !== null
+      ) && (
+        this.workspaceDependencyToolVersion === null
+        || this.workspaceDependencyToolVersion < CODEX_WORKSPACE_DEPENDENCY_TOOL_VERSION
+      );
+      const baseInstructions = isLegacyWorkspaceDependencyThread
+        ? `${promptText}\n\n${LEGACY_WORKSPACE_DEPENDENCY_INSTRUCTIONS}`
+        : promptText;
+      const legacyNoticeKey = this.pendingFork
+        ? `fork:${this.pendingFork.sessionId}:${this.pendingFork.resumeAt}`
+        : existingThreadId
+          ? `thread:${existingThreadId}`
+          : null;
+
+      if (
+        !turn.isCompact
+        && isLegacyWorkspaceDependencyThread
+        && legacyNoticeKey
+        && !this.legacyWorkspaceDependencyNoticeKeys.has(legacyNoticeKey)
+      ) {
+        this.legacyWorkspaceDependencyNoticeKeys.add(legacyNoticeKey);
+        yield { type: 'notice', level: 'warning', content: LEGACY_WORKSPACE_DEPENDENCY_NOTICE };
+      }
 
       if (this.pendingFork) {
         // Pending fork: fork the source thread, optionally roll back, then start a turn
@@ -314,11 +406,11 @@ export class CodexChatRuntime implements ChatRuntime {
         const permissionMode = this.resolveSandboxConfig();
         await this.transport!.request<ThreadResumeResult>('thread/resume', {
           threadId,
-          model: model ?? DEFAULT_CODEX_PRIMARY_MODEL,
+          ...(model ? { model } : {}),
           approvalPolicy: permissionMode.approvalPolicy,
           sandbox: permissionMode.sandbox,
-          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, model ?? DEFAULT_CODEX_PRIMARY_MODEL),
-          baseInstructions: promptText,
+          serviceTier: resolveCodexServiceTier(providerSettings.serviceTier, model, providerSettings),
+          baseInstructions,
           experimentalRawEvents: true,
           persistExtendedHistory: true,
         });
@@ -332,6 +424,9 @@ export class CodexChatRuntime implements ChatRuntime {
 
         this.loadedThreadId = threadId;
         completedPendingFork = true;
+        if (isLegacyWorkspaceDependencyThread) {
+          this.legacyWorkspaceDependencyNoticeKeys.add(`thread:${threadId}`);
+        }
 
         // Build replay suffix from conversation history after the checkpoint
         if (_conversationHistory && _conversationHistory.length > 0) {
@@ -354,11 +449,11 @@ export class CodexChatRuntime implements ChatRuntime {
         const permissionMode = this.resolveSandboxConfig();
         const resumeResult = await this.transport!.request<ThreadResumeResult>('thread/resume', {
           threadId: existingThreadId,
-          model: model ?? DEFAULT_CODEX_PRIMARY_MODEL,
+          ...(model ? { model } : {}),
           approvalPolicy: permissionMode.approvalPolicy,
           sandbox: permissionMode.sandbox,
-          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, model ?? DEFAULT_CODEX_PRIMARY_MODEL),
-          baseInstructions: promptText,
+          serviceTier: resolveCodexServiceTier(providerSettings.serviceTier, model, providerSettings),
+          baseInstructions,
           experimentalRawEvents: true,
           persistExtendedHistory: true,
         });
@@ -371,17 +466,7 @@ export class CodexChatRuntime implements ChatRuntime {
         threadId = existingThreadId;
       } else {
         // New thread
-        const permissionMode = this.resolveSandboxConfig();
-        const startResult = await this.transport!.request<ThreadStartResult>('thread/start', {
-          model: model ?? DEFAULT_CODEX_PRIMARY_MODEL,
-          cwd: this.launchSpec?.targetCwd ?? getVaultPath(this.plugin.app) ?? undefined,
-          approvalPolicy: permissionMode.approvalPolicy,
-          sandbox: permissionMode.sandbox,
-          serviceTier: resolveCodexServiceTier(this.getProviderSettings().serviceTier, model ?? DEFAULT_CODEX_PRIMARY_MODEL),
-          baseInstructions: promptText,
-          experimentalRawEvents: true,
-          persistExtendedHistory: true,
-        });
+        const startResult = await this.startThread(model, providerSettings, promptText);
         threadId = startResult.thread.id;
         threadTargetPath = startResult.thread.path ?? null;
         threadPath = this.toHostSessionPath(threadTargetPath);
@@ -416,9 +501,11 @@ export class CodexChatRuntime implements ChatRuntime {
         this.registerActiveInputBundle(turnInputBundle);
 
         // Start turn
-        const providerSettings = this.getProviderSettings();
-        const effort = EFFORT_MAP[providerSettings.effortLevel as string] ?? 'medium';
-        const resolvedModel = model ?? DEFAULT_CODEX_PRIMARY_MODEL;
+        const selectedEffort = typeof providerSettings.effortLevel === 'string'
+          ? providerSettings.effortLevel.trim()
+          : '';
+        const effort = selectedEffort || 'medium';
+        const resolvedModel = model;
         const isPlanMode = providerSettings.permissionMode === 'plan';
         const externalContextPaths = this.resolveExternalContextPaths(turn, queryOptions);
         const permissionMode = this.resolveSandboxConfig();
@@ -432,17 +519,17 @@ export class CodexChatRuntime implements ChatRuntime {
           sessionFilePathHint,
         );
 
-        const collaborationMode = {
+        const collaborationMode = resolvedModel ? {
           mode: isPlanMode ? 'plan' as const : 'default' as const,
           settings: {
             model: resolvedModel,
             reasoning_effort: effort,
             developer_instructions: null,
           },
-        };
+        } : undefined;
 
         const summary = getEffectiveCodexReasoningSummary(providerSettings, resolvedModel);
-        const serviceTier = resolveCodexServiceTier(providerSettings.serviceTier, resolvedModel);
+        const serviceTier = resolveCodexServiceTier(providerSettings.serviceTier, resolvedModel, providerSettings);
 
         // Configure router plan state before turn/start so buffered notifications
         // that arrive before currentTurnId is set already see the correct state.
@@ -452,7 +539,7 @@ export class CodexChatRuntime implements ChatRuntime {
           threadId,
           input: turnInputBundle.input,
           approvalPolicy: permissionMode.approvalPolicy,
-          model: resolvedModel,
+          ...(resolvedModel ? { model: resolvedModel } : {}),
           serviceTier,
           effort,
           summary,
@@ -619,6 +706,11 @@ export class CodexChatRuntime implements ChatRuntime {
   }
 
   cleanup(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.lifecycleGeneration += 1;
     this.cancel();
     this.teardownState();
     this.readyListeners.clear();
@@ -626,7 +718,7 @@ export class CodexChatRuntime implements ChatRuntime {
 
   async rewind(
     _userMessageId: string,
-    _assistantMessageId: string,
+    _assistantMessageId: string | undefined,
     _mode?: ChatRewindMode,
   ): Promise<ChatRewindResult> {
     return { canRewind: false, error: 'Codex does not support rewind' };
@@ -652,10 +744,6 @@ export class CodexChatRuntime implements ChatRuntime {
 
   setPermissionModeSyncCallback(callback: ((sdkMode: string) => void) | null): void {
     this.permissionModeSyncCallback = callback;
-  }
-
-  setSubagentHookProvider(getState: () => SubagentRuntimeState): void {
-    this.subagentHookProvider = getState;
   }
 
   setAutoTurnCallback(callback: AutoTurnCallback | null): void {
@@ -684,6 +772,11 @@ export class CodexChatRuntime implements ChatRuntime {
           : {}
       ),
       ...(existingState?.forkSource ? { forkSource: existingState.forkSource } : {}),
+      ...(
+        this.workspaceDependencyToolVersion !== null
+          ? { workspaceDependencyToolVersion: this.workspaceDependencyToolVersion }
+          : {}
+      ),
       ...(
         existingState?.forkSourceSessionFilePath
           ? { forkSourceSessionFilePath: existingState.forkSourceSessionFilePath }
@@ -729,6 +822,8 @@ export class CodexChatRuntime implements ChatRuntime {
     this.runtimeContext = null;
     this.loadedThreadId = null;
     this.currentThreadPath = null;
+    this.workspaceDependencyToolVersion = null;
+    this.legacyWorkspaceDependencyNoticeKeys.clear();
     this.currentTurnId = null;
     this.currentQueryThreadId = null;
     this.pendingTurnNotifications = [];
@@ -776,6 +871,16 @@ export class CodexChatRuntime implements ChatRuntime {
     }
   }
 
+  private isLifecycleCurrent(generation: number): boolean {
+    return !this.disposed && generation === this.lifecycleGeneration;
+  }
+
+  private assertLifecycleCurrent(generation: number): void {
+    if (!this.isLifecycleCurrent(generation)) {
+      throw new Error('Codex runtime has been disposed.');
+    }
+  }
+
   private getSystemPromptSettings(): SystemPromptSettings {
     const settings = this.plugin.settings;
     return {
@@ -787,20 +892,37 @@ export class CodexChatRuntime implements ChatRuntime {
   }
 
   private getProviderSettings(): Record<string, unknown> {
-    return ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-      this.plugin.settings,
-      this.providerId,
-    );
+    return this.currentConversationModel
+      ? getProviderSettingsSnapshotWithModel(
+          this.plugin.settings,
+          this.providerId,
+          this.currentConversationModel,
+        )
+      : ProviderSettingsCoordinator.getProviderSettingsSnapshot(
+          this.plugin.settings,
+          this.providerId,
+        );
   }
 
   getAuxiliaryModel(): string | null {
-    return this.resolveModel() ?? null;
+    return this.currentConversationModel ?? this.resolveModel() ?? null;
   }
 
-  private resolveModel(queryOptions?: ChatRuntimeQueryOptions): string | undefined {
-    const providerSettings = this.getProviderSettings();
+  private setCurrentConversationModel(model: unknown): void {
+    const selectedModel = typeof model === 'string' ? model.trim() : '';
+    this.currentConversationModel = selectedModel || null;
+  }
+
+  private resolveModel(
+    queryOptions?: ChatRuntimeQueryOptions,
+    providerSettings: Record<string, unknown> = this.getProviderSettings(),
+  ): string | undefined {
     const model = queryOptions?.model ?? providerSettings.model as string | undefined;
-    return model ? toCodexRuntimeModelId(model) : undefined;
+    if (model) {
+      return toCodexRuntimeModelId(model);
+    }
+
+    return getDefaultCodexModel(getCodexProviderSettings(providerSettings).discoveredModels)?.model;
   }
 
   private resolveSandboxConfig(): { approvalPolicy: string; sandbox: string } {
@@ -821,7 +943,38 @@ export class CodexChatRuntime implements ChatRuntime {
 
     const initializeResult = await initializeCodexAppServerTransport(this.transport);
     this.runtimeContext = createCodexRuntimeContext(launchSpec, initializeResult);
+    this.dynamicToolRegistry = new CodexDynamicToolRegistry();
+    const workspaceDependencyTool = createCodexWorkspaceDependencyTool(this.runtimeContext);
+    this.dynamicToolRegistry.register(workspaceDependencyTool);
+    this.serverRequestRouter.setDynamicToolRegistry(this.dynamicToolRegistry);
     this.clientConfigKey = clientConfigKey;
+  }
+
+  private async startThread(
+    model: string | undefined,
+    providerSettings: Record<string, unknown>,
+    baseInstructions: string,
+  ): Promise<ThreadStartResult> {
+    const permissionMode = this.resolveSandboxConfig();
+    const dynamicTools = this.dynamicToolRegistry.getThreadStartSpecs();
+    const startResult = await this.transport!.request<ThreadStartResult>('thread/start', {
+      ...(model ? { model } : {}),
+      cwd: this.launchSpec?.targetCwd ?? getVaultPath(this.plugin.app) ?? undefined,
+      approvalPolicy: permissionMode.approvalPolicy,
+      sandbox: permissionMode.sandbox,
+      serviceTier: resolveCodexServiceTier(providerSettings.serviceTier, model, providerSettings),
+      baseInstructions,
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      ...(dynamicTools.length > 0 ? { dynamicTools } : {}),
+    });
+    this.workspaceDependencyToolVersion = this.dynamicToolRegistry.isIncludedInThreadStart(
+      CODEX_WORKSPACE_DEPENDENCY_TOOL_NAMESPACE,
+      CODEX_WORKSPACE_DEPENDENCY_TOOL_NAME,
+    )
+      ? CODEX_WORKSPACE_DEPENDENCY_TOOL_VERSION
+      : null;
+    return startResult;
   }
 
   private wireTransportHandlers(): void {
@@ -864,12 +1017,13 @@ export class CodexChatRuntime implements ChatRuntime {
       });
     }
 
-    // Server requests (approvals, ask-user)
+    // Server requests (approvals, ask-user, client-hosted dynamic tools)
     const requestMethods = [
       'item/commandExecution/requestApproval',
       'item/fileChange/requestApproval',
       'item/permissions/requestApproval',
       'item/tool/requestUserInput',
+      'item/tool/call',
     ];
 
     for (const method of requestMethods) {
@@ -890,6 +1044,8 @@ export class CodexChatRuntime implements ChatRuntime {
     }
     this.launchSpec = null;
     this.runtimeContext = null;
+    this.dynamicToolRegistry = new CodexDynamicToolRegistry();
+    this.serverRequestRouter.setDynamicToolRegistry(null);
     this.notificationRouter = null;
     this.currentTurnId = null;
     this.currentQueryThreadId = null;

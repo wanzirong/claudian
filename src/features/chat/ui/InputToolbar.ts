@@ -126,12 +126,12 @@ export class ModelSelector {
 
       const icon = model.providerIcon ?? this.callbacks.getUIConfig().getProviderIcon?.();
       if (icon) {
-        option.appendChild(createProviderIconSvg(icon, {
+        createProviderIconSvg(icon, {
           className: 'claudian-model-provider-icon',
           height: 12,
-          ownerDocument: option.ownerDocument,
+          parent: option,
           width: 12,
-        }));
+        });
       }
       option.createSpan({ text: model.label });
       if (model.description) {
@@ -291,6 +291,9 @@ export class ThinkingBudgetSelector {
     for (const effort of [...options].reverse()) {
       const gearEl = optionsEl.createDiv({ cls: 'claudian-thinking-gear' });
       gearEl.setText(effort.label);
+      if (effort.description) {
+        gearEl.setAttribute('title', effort.description);
+      }
 
       if (effort.value === currentEffort) {
         gearEl.addClass('selected');
@@ -911,6 +914,7 @@ export class McpServerSelector {
     this.pruneEnabledServers();
     this.updateDisplay();
     this.renderDropdown();
+    this.ensureManagerLoaded(manager);
   }
 
   setOnChange(callback: (enabled: Set<string>) => void): void {
@@ -950,6 +954,7 @@ export class McpServerSelector {
 
   private pruneEnabledServers(): void {
     if (!this.mcpManager) return;
+    if (this.mcpManager.isLoaded?.() === false) return;
     const activeNames = new Set(this.mcpManager.getServers().filter((s) => s.enabled).map((s) => s.name));
     let changed = false;
     for (const name of this.enabledServers) {
@@ -961,6 +966,21 @@ export class McpServerSelector {
     if (changed) {
       this.onChangeCallback?.(this.enabledServers);
     }
+  }
+
+  private ensureManagerLoaded(manager: McpServerManager | null): void {
+    if (!manager || manager.isLoaded?.() !== false) return;
+
+    const load = manager.ensureLoaded?.();
+    if (load === undefined) return;
+
+    void load.then(() => {
+      if (this.mcpManager !== manager) return;
+      this.updateDisplay();
+      this.renderDropdown();
+    }).catch(() => {
+      // Keep the selector hidden when its configuration cannot be loaded.
+    });
   }
 
   private render() {
@@ -980,7 +1000,17 @@ export class McpServerSelector {
 
     // Re-render dropdown content on hover (CSS handles visibility)
     this.container.addEventListener('mouseenter', () => {
-      this.renderDropdown();
+      const load = this.mcpManager?.ensureLoaded?.();
+      if (load) {
+        void load.then(() => {
+          this.updateDisplay();
+          this.renderDropdown();
+        }).catch(() => {
+          // Keep the selector usable with its last known state when config loading fails.
+        });
+      } else {
+        this.renderDropdown();
+      }
     });
   }
 
@@ -1141,20 +1171,20 @@ export class ContextUsageMeter {
     const y2 = cy + radius * Math.sin(endRad);
 
     const gaugeEl = this.container.createDiv({ cls: 'claudian-context-meter-gauge' });
-    const svg = gaugeEl.ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const svg = gaugeEl.createSvg('svg');
     svg.setAttribute('width', String(size));
     svg.setAttribute('height', String(size));
     svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
 
     const pathData = `M ${x1} ${y1} A ${radius} ${radius} 0 1 1 ${x2} ${y2}`;
-    const backgroundPath = gaugeEl.ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const backgroundPath = svg.createSvg('path');
     backgroundPath.classList.add('claudian-meter-bg');
     backgroundPath.setAttribute('d', pathData);
     backgroundPath.setAttribute('fill', 'none');
     backgroundPath.setAttribute('stroke-width', String(strokeWidth));
     backgroundPath.setAttribute('stroke-linecap', 'round');
 
-    const fillPath = gaugeEl.ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const fillPath = svg.createSvg('path');
     fillPath.classList.add('claudian-meter-fill');
     fillPath.setAttribute('d', pathData);
     fillPath.setAttribute('fill', 'none');

@@ -14,6 +14,7 @@ import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { BangBashModeManager } from '../ui/BangBashModeManager';
+import type { ComposerContextTray } from '../ui/ComposerContextTray';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
 import type {
@@ -30,6 +31,8 @@ import type {
 import type { InstructionModeManager } from '../ui/InstructionModeManager';
 import type { NavigationSidebar } from '../ui/NavigationSidebar';
 import type { StatusPanel } from '../ui/StatusPanel';
+import type { RuntimeSupervisor } from './RuntimeSupervisor';
+import type { TabSession } from './TabSession';
 
 /**
  * Default number of tabs allowed.
@@ -115,6 +118,7 @@ export interface TabServices {
  * UI components managed per-tab.
  */
 export interface TabUIComponents {
+  contextTray: ComposerContextTray | null;
   fileContextManager: FileContextManager | null;
   imageContextManager: ImageContextManager | null;
   modelSelector: ModelSelector | null;
@@ -154,12 +158,8 @@ export interface TabDOMElements {
   /** Nav row for tab badges and header icons (above input wrapper). */
   navRowEl: HTMLElement;
 
-  /** Context row for file chips and selection indicator (inside input wrapper). */
+  /** Composer-owned context tray container inside the input wrapper. */
   contextRowEl: HTMLElement;
-
-  selectionIndicatorEl: HTMLElement | null;
-  browserIndicatorEl: HTMLElement | null;
-  canvasIndicatorEl: HTMLElement | null;
 
   /** Cleanup functions for event listeners (prevents memory leaks). */
   eventCleanups: Array<() => void>;
@@ -174,16 +174,24 @@ export interface TabDOMElements {
  */
 export type TabLifecycleState = 'blank' | 'bound_cold' | 'bound_active' | 'closing';
 
+/** Conversation hydration state, independent from runtime activation. */
+export type TabHydrationState = 'idle' | 'loading' | 'ready' | 'failed';
+
 /**
  * Represents a single tab in the multi-tab system.
  * Each tab is an independent chat session with its own runtime instance.
  */
 export interface TabData {
+  /** Authoritative identity and runtime owner for the tab. */
+  session: TabSession;
   /** Unique tab identifier. */
   id: TabId;
 
   /** Explicit lifecycle state. */
   lifecycleState: TabLifecycleState;
+
+  /** State of loading the provider-owned conversation into the tab UI. */
+  hydrationState: TabHydrationState;
 
   /**
    * Draft model selected in a blank tab (before first send).
@@ -199,6 +207,9 @@ export interface TabData {
 
   /** Per-tab chat runtime instance for independent streaming. */
   service: ChatRuntime | null;
+
+  /** Named owner of the per-tab runtime reference. */
+  runtimeSupervisor: RuntimeSupervisor;
 
   /** Whether the service has been initialized (lazy start). */
   serviceInitialized: boolean;
@@ -239,6 +250,7 @@ export interface PersistedTabState {
 export interface PersistedTabManagerState {
   openTabs: PersistedTabState[];
   activeTabId: TabId | null;
+  expandedTitleTabIds?: TabId[];
 }
 
 /**

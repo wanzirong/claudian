@@ -1,3 +1,4 @@
+import { TEST_CODEX_MODEL } from '@test/helpers/codexModels';
 import { createMockEl } from '@test/helpers/mockElement';
 
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
@@ -7,7 +8,6 @@ import {
   type PersistedTabManagerState,
   type TabManagerCallbacks,
 } from '@/features/chat/tabs/types';
-import { DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
 
 // Mock Tab module functions
 const mockCreateTab = jest.fn();
@@ -17,7 +17,16 @@ const mockDeactivateTab = jest.fn();
 const mockInitializeTabUI = jest.fn();
 const mockInitializeTabControllers = jest.fn();
 const mockInitializeTabService = jest.fn().mockResolvedValue(undefined);
+const mockRefreshTabWorkspaceServices = jest.fn();
 const mockSetupServiceCallbacks = jest.fn();
+const mockRecycleTabRuntime = jest.fn(async (tab: any) => {
+  tab.runtimeSupervisor.cleanup();
+  tab.service = null;
+  tab.serviceInitialized = false;
+  if (tab.lifecycleState === 'bound_active') {
+    tab.lifecycleState = tab.conversationId ? 'bound_cold' : 'blank';
+  }
+});
 const mockWireTabInputEvents = jest.fn();
 const mockGetTabTitle = jest.fn().mockReturnValue('Test Tab');
 const mockCreateChatRuntime = jest.fn();
@@ -32,7 +41,9 @@ jest.mock('@/features/chat/tabs/Tab', () => ({
   initializeTabUI: (...args: any[]) => mockInitializeTabUI(...args),
   initializeTabControllers: (...args: any[]) => mockInitializeTabControllers(...args),
   initializeTabService: (...args: any[]) => mockInitializeTabService(...args),
+  refreshTabWorkspaceServices: (...args: any[]) => mockRefreshTabWorkspaceServices(...args),
   setupServiceCallbacks: (...args: any[]) => mockSetupServiceCallbacks(...args),
+  recycleTabRuntime: (tab: any) => mockRecycleTabRuntime(tab),
   wireTabInputEvents: (...args: any[]) => mockWireTabInputEvents(...args),
   getTabTitle: (...args: any[]) => mockGetTabTitle(...args),
 }));
@@ -79,6 +90,13 @@ jest.mock('@/core/providers/ProviderRegistry', () => ({
 
 jest.mock('@/core/providers/ProviderWorkspaceRegistry', () => ({
   ProviderWorkspaceRegistry: {
+    ensureInitialized: jest.fn().mockResolvedValue(undefined),
+    getIfInitialized: (providerId: string) => (
+      mockCommandCatalogs[providerId]
+      || mockRuntimeCommandLoaders[providerId]
+      || mockTabWarmupPolicies[providerId]
+      || null
+    ),
     getCommandCatalog: (providerId: string) => mockCommandCatalogs[providerId] ?? null,
     getRuntimeCommandLoader: (providerId: string) => mockRuntimeCommandLoaders[providerId] ?? null,
     getTabWarmupPolicy: (providerId: string) => mockTabWarmupPolicies[providerId] ?? null,
@@ -121,6 +139,7 @@ function createMockPlugin(overrides: Record<string, any> = {}): any {
       ...(overrides.settings || {}),
     },
     getConversationById: jest.fn().mockResolvedValue(null),
+    getCachedConversation: jest.fn().mockReturnValue(null),
     getConversationSync: jest.fn().mockReturnValue(null),
     getConversationList: jest.fn().mockReturnValue([]),
     findConversationAcrossViews: jest.fn().mockReturnValue(null),
@@ -170,6 +189,8 @@ function createMockTabData(overrides: Record<string, any> = {}): any {
 
   return {
     id: `tab-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+    lifecycleState: 'blank',
+    hydrationState: 'ready',
     providerId: 'claude',
     conversationId: null,
     service: null,
@@ -184,6 +205,7 @@ function createMockTabData(overrides: Record<string, any> = {}): any {
     },
     dom: {
       contentEl: createMockEl(),
+      messagesEl: createMockEl(),
     },
     ui: {
       externalContextSelector: null,
@@ -285,6 +307,27 @@ describe('TabManager - Tab Lifecycle', () => {
       expect(manager.getTabCount()).toBe(DEFAULT_MAX_TABS);
     });
 
+    it('reserves capacity before awaited conversation loading', async () => {
+      let releaseConversation!: () => void;
+      const conversationGate = new Promise<any>(resolve => {
+        releaseConversation = () => resolve(null);
+      });
+      const plugin = createMockPlugin({
+        getConversationById: jest.fn().mockReturnValue(conversationGate),
+      });
+      const manager = createManager({ plugin });
+      await manager.createTab();
+      await manager.createTab();
+
+      const third = manager.createTab('conversation-3');
+      const fourth = manager.createTab('conversation-4');
+
+      await expect(fourth).resolves.toBeNull();
+      releaseConversation();
+      await expect(third).resolves.toBeTruthy();
+      expect(manager.getTabCount()).toBe(DEFAULT_MAX_TABS);
+    });
+
     it('should use provided tab ID for restoration', async () => {
       const manager = createManager({ callbacks });
       mockCreateTab.mockImplementationOnce(() =>
@@ -351,6 +394,7 @@ describe('TabManager - Tab Lifecycle', () => {
       });
 
       tab1!.conversationId = 'conv-1';
+      tab1!.hydrationState = 'idle';
       tab1!.state.messages = [];
       tab1!.controllers.conversationController!.switchTo = jest.fn().mockReturnValue(pendingSwitch);
       jest.clearAllMocks();
@@ -364,6 +408,117 @@ describe('TabManager - Tab Lifecycle', () => {
       await switchPromise;
 
       expect(callbacks.onTabSwitched).toHaveBeenCalledWith(tab2!.id, tab1!.id);
+    });
+
+    it('paints a loading shell before hydrating a cold conversation', async () => {
+      const manager = createManager();
+      const tab1 = await manager.createTab();
+      await manager.createTab();
+      tab1!.conversationId = 'conv-1';
+      tab1!.hydrationState = 'idle';
+      tab1!.state.messages = [];
+
+      const switchPromise = manager.switchToTab(tab1!.id);
+
+      expect(tab1!.hydrationState).toBe('loading');
+      expect(tab1!.dom.messagesEl.querySelector('.claudian-tab-hydration')).not.toBeNull();
+      expect(tab1!.controllers.conversationController!.switchTo).not.toHaveBeenCalled();
+
+      await switchPromise;
+
+      expect(tab1!.hydrationState).toBe('ready');
+      expect(tab1!.controllers.conversationController!.switchTo).toHaveBeenCalledWith('conv-1');
+    });
+
+    it('does not rehydrate an already-ready conversation with an empty transcript', async () => {
+      const manager = createManager();
+      const tab1 = await manager.createTab();
+      const tab2 = await manager.createTab();
+      tab1!.conversationId = 'conv-empty';
+      tab1!.lifecycleState = 'bound_cold';
+      tab1!.hydrationState = 'idle';
+      tab1!.state.messages = [];
+
+      await manager.switchToTab(tab1!.id);
+      await manager.switchToTab(tab2!.id);
+      tab1!.dom.messagesEl.empty();
+      const readyMarker = tab1!.dom.messagesEl.createDiv({ cls: 'empty-conversation-ready' });
+      (tab1!.controllers.conversationController!.switchTo as jest.Mock).mockClear();
+
+      await manager.switchToTab(tab1!.id);
+
+      expect(tab1!.controllers.conversationController!.switchTo).not.toHaveBeenCalled();
+      expect(tab1!.dom.messagesEl.querySelector('.claudian-tab-hydration')).toBeNull();
+      expect(tab1!.dom.messagesEl.contains(readyMarker)).toBe(true);
+    });
+
+    it('keeps hydration failures local and retries from the tab error state', async () => {
+      const manager = createManager();
+      const tab1 = await manager.createTab();
+      await manager.createTab();
+      tab1!.conversationId = 'conv-1';
+      tab1!.hydrationState = 'idle';
+      tab1!.state.messages = [];
+      (tab1!.controllers.conversationController!.switchTo as jest.Mock)
+        .mockRejectedValueOnce(new Error('Hydration failed'))
+        .mockResolvedValueOnce(undefined);
+
+      await manager.switchToTab(tab1!.id);
+
+      expect(tab1!.hydrationState).toBe('failed');
+      const retryButton = tab1!.dom.messagesEl.querySelector('.claudian-tab-hydration-retry');
+      expect(retryButton).not.toBeNull();
+
+      (retryButton as HTMLElement).click();
+      await new Promise(resolve => window.setTimeout(resolve, 20));
+
+      expect(tab1!.controllers.conversationController!.switchTo).toHaveBeenCalledTimes(2);
+      expect(tab1!.hydrationState).toBe('ready');
+    });
+
+    it('keeps provider initialization failures local and retryable for blank tabs', async () => {
+      const manager = createManager();
+      (ProviderWorkspaceRegistry.ensureInitialized as jest.Mock)
+        .mockRejectedValueOnce(new Error('Provider initialization failed'));
+
+      const tab = await manager.createTab();
+
+      expect(tab).not.toBeNull();
+      expect(tab!.hydrationState).toBe('failed');
+      expect(tab!.controllers.conversationController!.initializeWelcome).not.toHaveBeenCalled();
+      const retryButton = tab!.dom.messagesEl.querySelector('.claudian-tab-hydration-retry');
+      expect(retryButton).not.toBeNull();
+
+      (retryButton as HTMLElement).click();
+      await new Promise(resolve => window.setTimeout(resolve, 20));
+
+      expect(tab!.hydrationState).toBe('ready');
+      expect(tab!.controllers.conversationController!.initializeWelcome).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not refresh or hydrate a tab closed during provider initialization', async () => {
+      const manager = createManager();
+      const tab1 = await manager.createTab();
+      await manager.createTab();
+      tab1!.conversationId = 'conv-1';
+      tab1!.hydrationState = 'idle';
+      tab1!.state.messages = [];
+      let finishInitialization!: () => void;
+      const initialization = new Promise<void>((resolve) => {
+        finishInitialization = resolve;
+      });
+      (ProviderWorkspaceRegistry.ensureInitialized as jest.Mock)
+        .mockReturnValueOnce(initialization);
+      jest.clearAllMocks();
+
+      const switchPromise = manager.switchToTab(tab1!.id);
+      await flushMicrotasks();
+      await manager.closeTab(tab1!.id);
+      finishInitialization();
+      await switchPromise;
+
+      expect(mockRefreshTabWorkspaceServices).not.toHaveBeenCalledWith(tab1, expect.anything());
+      expect(tab1!.controllers.conversationController!.switchTo).not.toHaveBeenCalled();
     });
   });
 
@@ -483,6 +638,20 @@ describe('TabManager - Tab Lifecycle', () => {
       await manager.closeTab('tab-with-save', true);
 
       expect(mockSave).toHaveBeenCalled();
+    });
+
+    it('destroys and removes the tab even when save-on-close fails', async () => {
+      const saveError = new Error('save failed');
+      const tab = createMockTabData({ id: 'tab-save-failure' });
+      tab.controllers.conversationController.save = jest.fn().mockRejectedValue(saveError);
+      mockCreateTab.mockReturnValueOnce(tab);
+      const manager = createManager({ callbacks });
+      await manager.createTab();
+      await manager.createTab();
+
+      await expect(manager.closeTab(tab.id, true)).rejects.toBe(saveError);
+      expect(mockDestroyTab).toHaveBeenCalledWith(tab);
+      expect(manager.getTab(tab.id)).toBeNull();
     });
 
     it('should switch to next tab when closing first tab', async () => {
@@ -712,6 +881,7 @@ describe('TabManager - Conversation Management', () => {
 
     it('should create new tab when preferNewTab is true', async () => {
       plugin.getConversationById.mockResolvedValue({ id: 'conv-new' });
+      plugin.getCachedConversation.mockReturnValue({ id: 'conv-new' });
 
       await manager.openConversation('conv-new', true);
 
@@ -724,6 +894,7 @@ describe('TabManager - Conversation Management', () => {
 
     it('should create a background tab without switching focus', async () => {
       plugin.getConversationById.mockResolvedValue({ id: 'conv-background' });
+      plugin.getCachedConversation.mockReturnValue({ id: 'conv-background' });
       const initialActiveTabId = manager.getActiveTabId();
 
       await manager.openConversation('conv-background', {
@@ -826,6 +997,47 @@ describe('TabManager - Persistence', () => {
       await manager.restoreState(persistedState);
 
       expect(mockCreateTab).toHaveBeenCalledTimes(2);
+    });
+
+    it('hydrates only the active conversation when restoring three tab shells', async () => {
+      const switchToByTab = [jest.fn(), jest.fn(), jest.fn()];
+      const plugin = createMockPlugin({
+        getCachedConversation: jest.fn((id: string) => ({
+          id,
+          providerId: 'claude',
+          messages: [],
+        })),
+      });
+      const restoreManager = createManager({
+        plugin,
+        tabFactory: (index) => createMockTabData({
+          id: `restored-${index}`,
+          conversationId: `conversation-${index}`,
+          hydrationState: 'idle',
+          lifecycleState: 'bound_cold',
+          controllers: {
+            conversationController: {
+              save: jest.fn().mockResolvedValue(undefined),
+              switchTo: switchToByTab[index - 1].mockResolvedValue(undefined),
+            },
+          },
+        }),
+      });
+
+      await restoreManager.restoreState({
+        openTabs: [
+          { tabId: 'restored-1', conversationId: 'conversation-1' },
+          { tabId: 'restored-2', conversationId: 'conversation-2' },
+          { tabId: 'restored-3', conversationId: 'conversation-3' },
+        ],
+        activeTabId: 'restored-2',
+      });
+
+      expect(switchToByTab[0]).not.toHaveBeenCalled();
+      expect(switchToByTab[1]).toHaveBeenCalledTimes(1);
+      expect(switchToByTab[1]).toHaveBeenCalledWith('conversation-2');
+      expect(switchToByTab[2]).not.toHaveBeenCalled();
+      expect(plugin.getConversationById).not.toHaveBeenCalled();
     });
 
     it('should restore draftModel for blank tabs', async () => {
@@ -1046,6 +1258,39 @@ describe('TabManager - Broadcast', () => {
       expect(broadcastFn).toHaveBeenCalledWith(expect.objectContaining({ providerId: 'opencode' }));
     });
   });
+
+  describe('recycleProviderRuntimes', () => {
+    it('disposes and detaches matching runtimes so the next turn creates a fresh instance', async () => {
+      const opencodeCleanup = jest.fn();
+      const claudeCleanup = jest.fn();
+      manager = createManager({
+        tabFactory: (n) => createMockTabData({
+          id: `tab-${n}`,
+          conversationId: `conversation-${n}`,
+          lifecycleState: 'bound_active',
+          providerId: n === 1 ? 'claude' : 'opencode',
+          runtimeSupervisor: {
+            cleanup: n === 1 ? claudeCleanup : opencodeCleanup,
+          },
+          service: {
+            providerId: n === 1 ? 'claude' : 'opencode',
+          },
+          serviceInitialized: true,
+        }),
+      });
+      await manager.createTab();
+      const opencodeTab = (await manager.createTab())!;
+
+      await manager.recycleProviderRuntimes('opencode');
+
+      expect(mockRecycleTabRuntime).toHaveBeenCalledWith(opencodeTab);
+      expect(opencodeCleanup).toHaveBeenCalledTimes(1);
+      expect(opencodeTab.service).toBeNull();
+      expect(opencodeTab.serviceInitialized).toBe(false);
+      expect(opencodeTab.lifecycleState).toBe('bound_cold');
+      expect(claudeCleanup).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('TabManager - SDK Commands', () => {
@@ -1149,7 +1394,7 @@ describe('TabManager - SDK Commands', () => {
       tabFactory: (n) => createMockTabData({
         id: `tab-${n}`,
         lifecycleState: n === 2 ? 'blank' : 'bound_cold',
-        draftModel: n === 2 ? DEFAULT_CODEX_PRIMARY_MODEL : null,
+        draftModel: n === 2 ? TEST_CODEX_MODEL : null,
         providerId: 'claude',
         service: n === 1 ? readyClaudeService : null,
       }),
@@ -1277,18 +1522,6 @@ describe('TabManager - SDK Commands', () => {
           id: 'conv-opencode',
           messages: [{ id: 'm1' }],
           providerState: { databasePath: '/persisted/opencode.db' },
-          sessionId: 'session-1',
-        })
-        .mockResolvedValueOnce({
-          id: 'conv-opencode',
-          messages: [{ id: 'm1' }],
-          providerState: { databasePath: '/persisted/opencode.db' },
-          sessionId: 'session-1',
-        })
-        .mockResolvedValueOnce({
-          id: 'conv-opencode',
-          messages: [{ id: 'm1' }],
-          providerState: { databasePath: '/persisted/opencode.db' },
           sessionId: 'session-2',
         }),
     });
@@ -1328,7 +1561,7 @@ describe('TabManager - SDK Commands', () => {
     expect(resetSdkSkillsCache).not.toHaveBeenCalled();
   });
 
-  it('should prime active blank OpenCode tabs automatically', async () => {
+  it('should load commands on demand for an active blank OpenCode tab', async () => {
     const supportedCommands = [{ id: 'acp:review', name: 'review', content: '' }];
     const mockCatalog = {
       setRuntimeCommands: jest.fn(),
@@ -1371,13 +1604,17 @@ describe('TabManager - SDK Commands', () => {
     const tab = await manager.createTab();
     await flushMicrotasks();
 
+    expect(runtimeCommandLoader.loadCommands).not.toHaveBeenCalled();
+
+    await expect(manager.getSdkCommands(tab!.id)).resolves.toEqual(supportedCommands);
+
     expect(runtimeCommandLoader.loadCommands).toHaveBeenCalledTimes(1);
     expect(mockCatalog.setRuntimeCommands).toHaveBeenLastCalledWith(supportedCommands);
     expect(tab!.lifecycleState).toBe('blank');
     expect(tab!.serviceInitialized).toBe(false);
   });
 
-  it('should prime the active restored OpenCode conversation tab automatically', async () => {
+  it('should load commands on demand for an active restored OpenCode conversation tab', async () => {
     const supportedCommands = [{ id: 'acp:review', name: 'review', content: '' }];
     const mockCatalog = {
       setRuntimeCommands: jest.fn(),
@@ -1425,14 +1662,18 @@ describe('TabManager - SDK Commands', () => {
       }),
     });
 
-    await manager.createTab('conv-opencode', 'tab-opencode-restored', { activate: false });
+    const tab = await manager.createTab('conv-opencode', 'tab-opencode-restored', { activate: false });
     await flushMicrotasks();
+
+    expect(runtimeCommandLoader.loadCommands).not.toHaveBeenCalled();
+
+    await expect(manager.getSdkCommands(tab!.id)).resolves.toEqual(supportedCommands);
 
     expect(runtimeCommandLoader.loadCommands).toHaveBeenCalledTimes(1);
     expect(mockCatalog.setRuntimeCommands).toHaveBeenLastCalledWith(supportedCommands);
   });
 
-  it('should prime the active restored pre-session OpenCode conversation tab automatically', async () => {
+  it('should load commands on demand for an active pre-session OpenCode conversation tab', async () => {
     const supportedCommands = [{ id: 'acp:review', name: 'review', content: '' }];
     const mockCatalog = {
       setRuntimeCommands: jest.fn(),
@@ -1480,8 +1721,12 @@ describe('TabManager - SDK Commands', () => {
       }),
     });
 
-    await manager.createTab('conv-opencode', 'tab-opencode-pre-session', { activate: false });
+    const tab = await manager.createTab('conv-opencode', 'tab-opencode-pre-session', { activate: false });
     await flushMicrotasks();
+
+    expect(runtimeCommandLoader.loadCommands).not.toHaveBeenCalled();
+
+    await expect(manager.getSdkCommands(tab!.id)).resolves.toEqual(supportedCommands);
 
     expect(runtimeCommandLoader.loadCommands).toHaveBeenCalledTimes(1);
     expect(mockCatalog.setRuntimeCommands).toHaveBeenLastCalledWith(supportedCommands);
@@ -1753,7 +1998,7 @@ describe('TabManager - Provider Command Catalog', () => {
       tabFactory: () => createMockTabData({
         id: 'tab-1',
         lifecycleState: 'blank',
-        draftModel: DEFAULT_CODEX_PRIMARY_MODEL,
+        draftModel: TEST_CODEX_MODEL,
         providerId: 'claude',
       }),
     });
@@ -1850,30 +2095,22 @@ describe('TabManager - Provider Command Catalog', () => {
     expect(claudeCatalog.setRuntimeCommands).toHaveBeenCalledWith([]);
   });
 
-  it('starts blank-tab provider warmup in the background from the provider-change callback', async () => {
+  it('initializes provider services without starting command warmup on provider change', async () => {
     const manager = createManager();
-    const tab = await manager.createTab();
+    await manager.createTab();
     const options = mockInitializeTabUI.mock.calls[0][2];
+    const prewarmSpy = jest.spyOn(manager as any, 'prewarmProviderTab');
 
-    let releaseWarmup!: () => void;
-    const prewarmSpy = jest.spyOn(manager as any, 'prewarmProviderTab').mockImplementation(
-      () => new Promise<void>((resolve) => {
-        releaseWarmup = resolve;
-      }),
+    options.onProviderChanged('opencode');
+
+    await flushMicrotasks();
+
+    expect(ProviderWorkspaceRegistry.ensureInitialized).toHaveBeenCalledWith(
+      undefined,
+      'opencode',
+      'provider-selection',
     );
-
-    let settled = false;
-    const callbackPromise = Promise.resolve(options.onProviderChanged('opencode')).then(() => {
-      settled = true;
-    });
-
-    await Promise.resolve();
-
-    expect(prewarmSpy).toHaveBeenCalledWith(tab);
-    await callbackPromise;
-    expect(settled).toBe(true);
-
-    releaseWarmup();
+    expect(prewarmSpy).not.toHaveBeenCalled();
   });
 
   it('should return null catalog config when provider has no catalog', async () => {
@@ -1909,15 +2146,16 @@ describe('TabManager - Cleanup', () => {
       expect(manager.getTabCount()).toBe(0);
     });
 
-    it('should save all conversations before destroying', async () => {
+    it('delegates final persistence to tab teardown', async () => {
       const tabs = manager.getAllTabs();
       const saveFns = tabs.map(tab => tab.controllers.conversationController?.save);
 
       await manager.destroy();
 
       saveFns.forEach(save => {
-        expect(save).toHaveBeenCalled();
+        expect(save).not.toHaveBeenCalled();
       });
+      expect(mockDestroyTab).toHaveBeenCalledTimes(2);
     });
 
     it('should clear active tab ID', async () => {
@@ -2108,7 +2346,7 @@ describe('TabManager - Service Initialization Errors', () => {
 });
 
 describe('TabManager - Concurrent Switch Guard', () => {
-  it('should prevent concurrent tab switches', async () => {
+  it('should execute the latest switch requested while another switch is pending', async () => {
     const callbacks: TabManagerCallbacks = {
       onTabSwitched: jest.fn(),
     };
@@ -2124,6 +2362,7 @@ describe('TabManager - Concurrent Switch Guard', () => {
       resolveSwitchTo = resolve;
     });
     tab1!.conversationId = 'conv-1';
+    tab1!.hydrationState = 'idle';
     tab1!.state.messages = [];
     tab1!.controllers.conversationController!.switchTo = jest.fn().mockReturnValue(hangingPromise);
 
@@ -2132,8 +2371,7 @@ describe('TabManager - Concurrent Switch Guard', () => {
     // Start first switch to tab-1 (will hang on conversationController.switchTo)
     const firstSwitch = manager.switchToTab(tab1!.id);
 
-    // While first switch is in progress, try a second switch.
-    // isSwitchingTab is true, so this should return immediately (lines 143-144)
+    // While the first switch is in progress, retain the newer target.
     await manager.switchToTab(tab2!.id);
 
     expect(mockDeactivateTab).toHaveBeenCalledTimes(1);
@@ -2143,12 +2381,8 @@ describe('TabManager - Concurrent Switch Guard', () => {
     resolveSwitchTo();
     await firstSwitch;
 
-    expect(callbacks.onTabSwitched).toHaveBeenCalledTimes(1);
-
-    // After first switch completes, isSwitchingTab is false
-    // and subsequent switches should work normally
-    await manager.switchToTab(tab2!.id);
     expect(callbacks.onTabSwitched).toHaveBeenCalledTimes(2);
+    expect(manager.getActiveTabId()).toBe(tab2!.id);
   });
 });
 

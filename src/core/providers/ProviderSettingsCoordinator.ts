@@ -5,6 +5,7 @@ import type { ProviderChatUIConfig, ProviderId } from './types';
 
 export interface SettingsReconciliationResult {
   changed: boolean;
+  environmentChangedProviderIds: ProviderId[];
   invalidatedConversations: Conversation[];
 }
 
@@ -99,7 +100,82 @@ function normalizeProviderModel(
   return uiConfig.normalizeModelVariant(model, settings);
 }
 
+function normalizeModelDependentSettings(
+  uiConfig: ProviderChatUIConfig,
+  settings: Record<string, unknown>,
+  model: string,
+): void {
+  if (uiConfig.isAdaptiveReasoningModel(model, settings)) {
+    settings.effortLevel = normalizeReasoningValue(
+      uiConfig,
+      settings,
+      model,
+      settings.effortLevel,
+    );
+  } else {
+    settings.thinkingBudget = normalizeReasoningValue(
+      uiConfig,
+      settings,
+      model,
+      settings.thinkingBudget,
+    );
+  }
+
+  const serviceTierToggle = uiConfig.getServiceTierToggle?.(settings) ?? null;
+  if (!serviceTierToggle) {
+    settings.serviceTier = 'default';
+    return;
+  }
+
+  const currentServiceTier = typeof settings.serviceTier === 'string'
+    ? settings.serviceTier
+    : undefined;
+  if (currentServiceTier === 'fast') {
+    settings.serviceTier = serviceTierToggle.activeValue;
+    return;
+  }
+  if (
+    currentServiceTier !== serviceTierToggle.inactiveValue
+    && currentServiceTier !== serviceTierToggle.activeValue
+  ) {
+    settings.serviceTier = serviceTierToggle.inactiveValue;
+  }
+}
+
 export class ProviderSettingsCoordinator {
+  static applyModelSelection(
+    settings: Record<string, unknown>,
+    providerId: ProviderId,
+    model: string,
+  ): void {
+    const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
+    settings.model = model;
+    uiConfig.applyModelDefaults(model, settings);
+    normalizeModelDependentSettings(uiConfig, settings, model);
+  }
+
+  static applyTitleGenerationModelSelection(
+    settings: Record<string, unknown>,
+    model: string,
+  ): void {
+    settings.titleGenerationModel = model;
+    for (const providerId of ProviderRegistry.getRegisteredProviderIds()) {
+      ProviderRegistry.getChatUIConfig(providerId)
+        .applyTitleGenerationModelSelection?.(model, settings);
+    }
+  }
+
+  static projectModelSelection(
+    settings: Record<string, unknown>,
+    providerId: ProviderId,
+    model: string,
+  ): void {
+    const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
+    settings.model = model;
+    uiConfig.applyModelProjectionDefaults?.(model, settings);
+    normalizeModelDependentSettings(uiConfig, settings, model);
+  }
+
   static handleEnvironmentChange(
     settings: Record<string, unknown>,
     providerIds: ProviderId[],
@@ -123,6 +199,10 @@ export class ProviderSettingsCoordinator {
     }
 
     for (const providerId of ProviderRegistry.getRegisteredProviderIds()) {
+      if (!ProviderRegistry.isEnabled(providerId, settings)) {
+        continue;
+      }
+
       const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
       if (!uiConfig.ownsModel(currentModel, settings)) {
         continue;
@@ -159,6 +239,16 @@ export class ProviderSettingsCoordinator {
 
     settings.settingsProvider = next;
     return true;
+  }
+
+  static applyProviderEnablement(
+    settings: Record<string, unknown>,
+    providerId: ProviderId,
+    enabled: boolean,
+  ): void {
+    ProviderRegistry.setEnabled(providerId, settings, enabled);
+    this.normalizeProviderSelection(settings);
+    this.reconcileTitleGenerationModelSelection(settings);
   }
 
   static getProviderSettingsSnapshot<T extends Record<string, unknown>>(
@@ -256,9 +346,14 @@ export class ProviderSettingsCoordinator {
         shouldPreferCurrentProjection
         || modelOptions.some(option => option.value === currentModel)
       );
+    const providerDefaultModel = uiConfig.getDefaultModel?.(settings) ?? null;
+    const validProviderDefaultModel = providerDefaultModel
+      && modelOptions.some(option => option.value === providerDefaultModel)
+      ? providerDefaultModel
+      : null;
     const fallbackModel = canReuseCurrentModel
       ? currentModel
-      : (modelOptions[0]?.value ?? currentModel);
+      : (validProviderDefaultModel ?? modelOptions[0]?.value ?? currentModel);
     const savedModelValue = normalizeProviderModel(uiConfig, settings, savedModel?.[providerId]);
     const isSavedModelValid = savedModelValue !== undefined
       && modelOptions.some(option => option.value === savedModelValue);
@@ -267,7 +362,11 @@ export class ProviderSettingsCoordinator {
 
     if (model) {
       settings.model = model;
-      uiConfig.applyModelDefaults(model, settings);
+      if (uiConfig.applyModelProjectionDefaults) {
+        uiConfig.applyModelProjectionDefaults(model, settings);
+      } else {
+        uiConfig.applyModelDefaults(model, settings);
+      }
     }
 
     const serviceTierToggle = uiConfig.getServiceTierToggle?.({
@@ -359,6 +458,7 @@ export class ProviderSettingsCoordinator {
   ): SettingsReconciliationResult {
     let anyChanged = false;
     const allInvalidated: Conversation[] = [];
+    const environmentChangedProviderIds: ProviderId[] = [];
     const settingsProvider = getSettingsProviderId(settings);
 
     for (const providerId of providerIds) {
@@ -379,6 +479,7 @@ export class ProviderSettingsCoordinator {
 
       if (changed) {
         anyChanged = true;
+        environmentChangedProviderIds.push(providerId);
         this.persistProjectedProviderState(targetSettings, providerId);
         if (providerId !== settingsProvider) {
           mergeProviderSettings(settings, targetSettings);
@@ -391,7 +492,26 @@ export class ProviderSettingsCoordinator {
       anyChanged = true;
     }
 
-    return { changed: anyChanged, invalidatedConversations: allInvalidated };
+    return {
+      changed: anyChanged,
+      environmentChangedProviderIds,
+      invalidatedConversations: allInvalidated,
+    };
+  }
+
+  static invalidateConversationSessions(
+    conversations: Conversation[],
+    providerIds: ProviderId[],
+  ): Conversation[] {
+    const invalidatedConversations: Conversation[] = [];
+    for (const providerId of new Set(providerIds)) {
+      const providerConversations = conversations.filter(c => c.providerId === providerId);
+      invalidatedConversations.push(
+        ...ProviderRegistry.getSettingsReconciler(providerId)
+          .invalidateConversationSessions(providerConversations),
+      );
+    }
+    return invalidatedConversations;
   }
 
   static normalizeAllModelVariants(settings: Record<string, unknown>): boolean {

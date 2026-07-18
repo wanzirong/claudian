@@ -197,18 +197,53 @@ class MockElement {
   }
 
   // Obsidian-style helper methods
-  createDiv(options?: { cls?: string; text?: string }): MockElement {
+  createDiv(options?: { cls?: string; text?: string; attr?: Record<string, string> }): MockElement {
     const el = new MockElement('div');
     if (options?.cls) el.className = options.cls;
     if (options?.text) el.textContent = options.text;
+    if (options?.attr) {
+      for (const [key, value] of Object.entries(options.attr)) {
+        el.setAttribute(key, value);
+      }
+    }
     this.appendChild(el);
     return el;
   }
 
-  createSpan(options?: { cls?: string; text?: string }): MockElement {
+  createSpan(options?: { cls?: string; text?: string; attr?: Record<string, string> }): MockElement {
     const el = new MockElement('span');
     if (options?.cls) el.className = options.cls;
     if (options?.text) el.textContent = options.text;
+    if (options?.attr) {
+      for (const [key, value] of Object.entries(options.attr)) {
+        el.setAttribute(key, value);
+      }
+    }
+    this.appendChild(el);
+    return el;
+  }
+
+  createEl(tag: string, options?: { cls?: string; text?: string; attr?: Record<string, string> }): MockElement {
+    const el = new MockElement(tag);
+    if (options?.cls) el.className = options.cls;
+    if (options?.text) el.textContent = options.text;
+    if (options?.attr) {
+      for (const [key, value] of Object.entries(options.attr)) {
+        el.setAttribute(key, value);
+      }
+    }
+    this.appendChild(el);
+    return el;
+  }
+
+  createSvg(tag: string, options?: { cls?: string; attr?: Record<string, string> }): MockElement {
+    const el = new MockElement(tag);
+    if (options?.cls) el.className = options.cls;
+    if (options?.attr) {
+      for (const [key, value] of Object.entries(options.attr)) {
+        el.setAttribute(key, value);
+      }
+    }
     this.appendChild(el);
     return el;
   }
@@ -306,6 +341,13 @@ describe('StatusPanel', () => {
       expect(todoContainer).not.toBeNull();
       expect(todoContainer!.style.display).toBe('none');
     });
+
+    it('should not reserve panel spacing before content is shown', () => {
+      panel.mount(containerEl as unknown as HTMLElement);
+
+      const panelEl = containerEl.querySelector('.claudian-status-panel');
+      expect(panelEl?.hasClass('claudian-status-panel--visible')).toBe(false);
+    });
   });
 
   describe('updateTodos', () => {
@@ -322,6 +364,8 @@ describe('StatusPanel', () => {
 
       const todoContainer = containerEl.querySelector('.claudian-status-panel-todos');
       expect(todoContainer!.style.display).toBe('block');
+      expect(containerEl.querySelector('.claudian-status-panel')
+        ?.hasClass('claudian-status-panel--visible')).toBe(true);
     });
 
     it('should hide panel when todos is null', () => {
@@ -334,6 +378,8 @@ describe('StatusPanel', () => {
 
       const todoContainer = containerEl.querySelector('.claudian-status-panel-todos');
       expect(todoContainer!.style.display).toBe('none');
+      expect(containerEl.querySelector('.claudian-status-panel')
+        ?.hasClass('claudian-status-panel--visible')).toBe(false);
     });
 
     it('should hide panel when todos is empty array', () => {

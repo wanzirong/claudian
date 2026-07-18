@@ -136,6 +136,21 @@ describe('ConversationController', () => {
         expect(deps.plugin.updateConversation).toHaveBeenCalledWith('old-conv', expect.any(Object));
       });
 
+      it('drains async completions and terminalizes tasks before saving', async () => {
+        const awaitCompletion = jest.fn().mockResolvedValue(undefined);
+        deps = createMockDeps({ awaitBackgroundWork: awaitCompletion });
+        deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
+        deps.state.currentConversationId = 'old-conv';
+        controller = new ConversationController(deps);
+
+        await controller.createNew();
+
+        expect(awaitCompletion.mock.invocationCallOrder[0])
+          .toBeLessThan((deps.subagentManager.orphanAllActive as jest.Mock).mock.invocationCallOrder[0]);
+        expect((deps.subagentManager.orphanAllActive as jest.Mock).mock.invocationCallOrder[0])
+          .toBeLessThan((deps.plugin.updateConversation as jest.Mock).mock.invocationCallOrder[0]);
+      });
+
       it('should reset file context for new conversation', async () => {
         const fileContextManager = deps.getFileContextManager()!;
 
@@ -161,7 +176,8 @@ describe('ConversationController', () => {
         // Conversation is created lazily on first message send
         await controller.createNew();
 
-        expect(deps.plugin.findEmptyConversation).not.toHaveBeenCalled();
+        expect((deps.plugin as unknown as { findEmptyConversation: jest.Mock }).findEmptyConversation)
+          .not.toHaveBeenCalled();
         expect(deps.plugin.createConversation).not.toHaveBeenCalled();
         expect(deps.plugin.switchConversation).not.toHaveBeenCalled();
         expect(deps.state.currentConversationId).toBeNull();
@@ -761,6 +777,46 @@ describe('ConversationController', () => {
         expect(container.children.length).toBe(2); // header + list
       });
 
+      it('paginates large history lists and loads the next bounded page on demand', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue(
+          Array.from({ length: 125 }, (_, index) => ({
+            id: `conv-${index}`,
+            title: `Conversation ${index}`,
+            createdAt: 125 - index,
+          })),
+        );
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          pageSize: 25,
+        });
+
+        let list = container.children[1];
+        expect(list.querySelectorAll('.claudian-history-item')).toHaveLength(25);
+        const loadMore = list.querySelector('.claudian-history-load-more');
+        expect(loadMore).not.toBeNull();
+
+        loadMore!.click();
+        list = container.children[1];
+        expect(list.querySelectorAll('.claudian-history-item')).toHaveLength(50);
+        expect(list.querySelector('.claudian-history-load-more')).not.toBeNull();
+      });
+
+      it('does not render when the history render signal is already aborted', () => {
+        const container = createMockEl();
+        container.createDiv({ cls: 'sentinel' });
+        const abortController = new AbortController();
+        abortController.abort();
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          signal: abortController.signal,
+        });
+
+        expect(container.querySelector('.sentinel')).not.toBeNull();
+      });
+
       it('should highlight conversations already open in a tab', () => {
         const container = createMockEl();
 
@@ -1237,17 +1293,19 @@ describe('ConversationController', () => {
         (titleEl as any).replaceWith = jest.fn();
       }
 
-      const origDocument = global.document;
-      global.document = { createElement: jest.fn().mockReturnValue(mockInput) } as any;
+      const origCreateEl = item.createEl;
+      item.createEl = jest.fn().mockReturnValue(mockInput) as any;
 
       try {
         clickHandlers![0]({ stopPropagation: jest.fn() });
 
-        expect(global.document.createElement).toHaveBeenCalledWith('input');
-        expect((mockInput as any).value).toBe('Test Title');
+        expect(item.createEl).toHaveBeenCalledWith('input', {
+          cls: 'claudian-rename-input',
+          attr: { type: 'text', value: 'Test Title' },
+        });
         expect(titleEl!.replaceWith).toHaveBeenCalledWith(mockInput);
       } finally {
-        global.document = origDocument;
+        item.createEl = origCreateEl;
       }
     });
 
@@ -2574,7 +2632,7 @@ describe('ConversationController - Rewind', () => {
     expect(mockAgentService.rewind).not.toHaveBeenCalled();
   });
 
-  it('should show Notice when no previous assistant with uuid exists', async () => {
+  it('should allow rewind when no previous assistant with uuid exists', async () => {
     deps.state.messages = [
       { id: 'm1', role: 'user', content: 'test', timestamp: 1, userMessageId: 'u1' },
       { id: 'm2', role: 'assistant', content: '', timestamp: 2, assistantMessageId: 'a1' },
@@ -2582,8 +2640,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m1');
 
-    expect(mockNotice).toHaveBeenCalled();
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('u1', undefined, 'code-and-conversation');
   });
 
   it('should show Notice when no response assistant with uuid exists', async () => {
@@ -2663,6 +2720,37 @@ describe('ConversationController - Rewind', () => {
     expect(noticeMsg).toContain('1');
 
     truncateSpy.mockRestore();
+  });
+
+  it('should rewind to before the first user message and clear provider session state', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'user', content: 'first prompt', timestamp: 1, userMessageId: 'user-uuid' },
+      { id: 'm2', role: 'assistant', content: 'resp', timestamp: 2, assistantMessageId: 'resp-a' },
+    ];
+    (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
+      id: 'conv-1',
+      providerId: 'claude',
+      sessionId: 'old-session',
+      providerState: { providerSessionId: 'old-session' },
+      messages: deps.state.messages,
+    });
+
+    await controller.rewind('m1');
+
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', undefined, 'code-and-conversation');
+    expect(mockAgentService.buildSessionUpdates).not.toHaveBeenCalled();
+    expect(deps.state.messages).toEqual([]);
+    expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
+      'conv-1',
+      expect.objectContaining({
+        messages: [],
+        sessionId: null,
+        providerState: undefined,
+        resumeAtMessageId: undefined,
+      })
+    );
+    expect(deps.getInputEl().value).toBe('first prompt');
   });
 
   it('should pass conversation-only mode and keep file changes', async () => {

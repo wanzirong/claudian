@@ -1,4 +1,5 @@
 import type { ProviderCommandCatalog } from '../../../core/providers/commands/ProviderCommandCatalog';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
   ProviderCliResolver,
@@ -7,11 +8,13 @@ import type {
 } from '../../../core/providers/types';
 import type { HomeFileAdapter } from '../../../core/storage/HomeFileAdapter';
 import type { VaultFileAdapter } from '../../../core/storage/VaultFileAdapter';
-import type ClaudianPlugin from '../../../main';
 import { getVaultPath } from '../../../utils/path';
 import { CodexAgentMentionProvider } from '../agents/CodexAgentMentionProvider';
 import { CodexSkillCatalog } from '../commands/CodexSkillCatalog';
 import { CodexCliResolver } from '../runtime/CodexCliResolver';
+import { CodexModelCatalogCoordinator } from '../runtime/CodexModelCatalogCoordinator';
+import { CodexModelDiscoveryService } from '../runtime/CodexModelDiscoveryService';
+import { getCodexProviderSettings } from '../settings';
 import { CodexSkillListingService } from '../skills/CodexSkillListingService';
 import { CodexSkillStorage } from '../storage/CodexSkillStorage';
 import { CodexSubagentStorage } from '../storage/CodexSubagentStorage';
@@ -22,6 +25,7 @@ export interface CodexWorkspaceServices extends ProviderWorkspaceServices {
   commandCatalog: ProviderCommandCatalog;
   agentMentionProvider: CodexAgentMentionProvider;
   cliResolver: ProviderCliResolver;
+  modelCatalogCoordinator: CodexModelCatalogCoordinator;
 }
 
 function createCodexCliResolver(): ProviderCliResolver {
@@ -29,15 +33,16 @@ function createCodexCliResolver(): ProviderCliResolver {
 }
 
 export async function createCodexWorkspaceServices(
-  plugin: ClaudianPlugin,
+  plugin: ProviderHost,
   vaultAdapter: VaultFileAdapter,
   homeAdapter: HomeFileAdapter,
 ): Promise<CodexWorkspaceServices> {
   const subagentStorage = new CodexSubagentStorage(vaultAdapter);
   const agentMentionProvider = new CodexAgentMentionProvider(subagentStorage);
-  await agentMentionProvider.loadAgents();
 
   const skillListProvider = new CodexSkillListingService(plugin);
+  const modelDiscovery = new CodexModelDiscoveryService(plugin);
+  const modelCatalogCoordinator = new CodexModelCatalogCoordinator(plugin, modelDiscovery);
   const commandCatalog = new CodexSkillCatalog(
     new CodexSkillStorage(
       vaultAdapter,
@@ -47,15 +52,25 @@ export async function createCodexWorkspaceServices(
     getVaultPath(plugin.app),
   );
 
+  if (getCodexProviderSettings(plugin.settings).enabled) {
+    plugin.app.workspace.onLayoutReady(() => {
+      void modelCatalogCoordinator.ensureFresh('layout-ready');
+    });
+  }
+
   return {
     subagentStorage,
     commandCatalog,
     agentMentionProvider,
     cliResolver: createCodexCliResolver(),
+    modelCatalogCoordinator,
     settingsTabRenderer: codexSettingsTabRenderer,
     refreshAgentMentions: async () => {
       await agentMentionProvider.loadAgents();
     },
+    refreshModelCatalog: async () => modelCatalogCoordinator.refreshModelCatalog(),
+    prepareSettings: async () => agentMentionProvider.loadAgents(),
+    dispose: () => modelCatalogCoordinator.dispose(),
   };
 }
 

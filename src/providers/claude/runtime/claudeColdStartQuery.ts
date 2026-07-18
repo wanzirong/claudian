@@ -1,11 +1,11 @@
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
-import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
-import type ClaudianPlugin from '../../../main';
 import { getEnhancedPath, getMissingNodeError, parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
 import { extractAssistantText } from '../auxiliary/extractAssistantText';
+import { loadClaudeAgentQuery } from '../loadClaudeAgentSdk';
 import { toClaudeRuntimeModelId } from '../modelSelection';
 import {
   getClaudeProviderSettings,
@@ -17,7 +17,7 @@ import {
 import { createCustomSpawnFunction } from './customSpawn';
 
 export interface ColdStartQueryConfig {
-  plugin: ClaudianPlugin;
+  plugin: ProviderHost;
   systemPrompt: string;
   /** Tools available to the model. Omit for SDK default (all tools). */
   tools?: string[];
@@ -54,7 +54,7 @@ export async function runColdStartQuery(
     throw new Error('Could not determine vault path');
   }
 
-  const resolvedClaudePath = config.plugin.getResolvedProviderCliPath('claude');
+  const resolvedClaudePath = await config.plugin.getResolvedProviderCliPath('claude');
   if (!resolvedClaudePath) {
     throw new Error('Claude CLI not found');
   }
@@ -118,11 +118,15 @@ export async function runColdStartQuery(
   if (!config.thinking?.disabled) {
     const effortLevel = resolveEffortLevel(selectedModel, settings.effortLevel);
     options.thinking = { type: 'adaptive' };
-    // SDK runtime accepts `xhigh` on Opus 4.7+ and silently falls back to
-    // `high` elsewhere, but its type definition lags our local EffortLevel.
+    // SDK runtime accepts `xhigh` on Opus 4.7+, Sonnet 5+, and Fable, and silently
+    // falls back to `high` elsewhere, but its type definition lags our local EffortLevel.
     options.effort = effortLevel;
   }
 
+  const agentQuery = await loadClaudeAgentQuery();
+  if (config.abortController?.signal.aborted) {
+    throw new Error('Cancelled');
+  }
   const response = agentQuery({ prompt, options });
   let responseText = '';
   let sessionId: string | null = null;

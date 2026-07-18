@@ -101,7 +101,17 @@ export default defineConfig([
     plugins: {
       obsidianmd,
     },
-    rules: stagedObsidianRules,
+    rules: {
+      ...stagedObsidianRules,
+      'obsidianmd/prefer-create-el': 'error',
+      '@typescript-eslint/no-duplicate-type-constituents': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
+      '@typescript-eslint/only-throw-error': 'error',
+      '@typescript-eslint/no-unsafe-argument': 'error',
+      '@typescript-eslint/no-unsafe-assignment': 'error',
+      '@typescript-eslint/no-unnecessary-type-assertion': 'error',
+      '@typescript-eslint/unbound-method': 'error',
+    },
   },
   {
     files: [

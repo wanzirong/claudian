@@ -2,7 +2,7 @@
  * Claudian - Claude Agent SDK wrapper
  *
  * Handles communication with Claude via the Agent SDK. Manages streaming,
- * session persistence, permission modes, and security hooks.
+ * session persistence and permission modes.
  *
  * Architecture:
  * - Persistent query for active chat conversation (eliminates cold-start latency)
@@ -21,19 +21,22 @@ import type {
   SDKUserMessage,
   SlashCommand as SDKSlashCommand,
 } from '@anthropic-ai/claude-agent-sdk';
-import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 import { Notice } from 'obsidian';
 
 import type { McpServerManager } from '../../../core/mcp/McpServerManager';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type {
   AppAgentManager,
   AppPluginManager,
+  ProviderHistoryPathContext,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type {
   ApprovalCallback,
   AskUserQuestionCallback,
+  AsyncSubagentCompletion,
+  AsyncSubagentCompletionCallback,
   AutoTurnCallback,
   ChatRewindMode,
   ChatRewindResult,
@@ -56,7 +59,6 @@ import type {
   ToolCallInfo,
 } from '../../../core/types';
 import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
-import type ClaudianPlugin from '../../../main';
 import { stripCurrentNoteContext } from '../../../utils/context';
 import { getEnhancedPath, getMissingNodeError, parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
@@ -64,14 +66,21 @@ import {
   buildContextFromHistory,
   buildPromptWithHistoryContext,
   getLastUserMessage,
+  getMissingSessionId,
   isSessionExpiredError,
+  isSessionMissingError,
 } from '../../../utils/session';
 import { CLAUDE_PROVIDER_CAPABILITIES } from '../capabilities';
 import { loadSubagentFinalResult, loadSubagentToolCalls } from '../history/ClaudeHistoryStore';
-import { createStopSubagentHook, type SubagentHookState } from '../hooks/SubagentHooks';
+import { loadClaudeAgentQuery } from '../loadClaudeAgentSdk';
 import { toClaudeRuntimeModelId } from '../modelSelection';
 import { encodeClaudeTurn } from '../prompt/ClaudeTurnEncoder';
-import { isContextWindowEvent, isSessionInitEvent, isStreamChunk } from '../sdk/typeGuards';
+import {
+  isAsyncSubagentCompletion,
+  isContextWindowEvent,
+  isSessionInitEvent,
+  isStreamChunk,
+} from '../sdk/typeGuards';
 import type { TransformEvent } from '../sdk/types';
 import { getClaudeProviderSettings } from '../settings';
 import {
@@ -79,6 +88,7 @@ import {
   createTransformUsageState,
   transformSDKMessage,
 } from '../stream/transformClaudeMessage';
+import { resolveContextWindowSize } from '../types/models';
 import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
 import { createClaudeApprovalCallback } from './ClaudeApprovalHandler';
 import { applyClaudeDynamicUpdates } from './ClaudeDynamicUpdates';
@@ -131,7 +141,7 @@ function isImageAttachmentArray(value: unknown): value is ImageAttachment[] {
 
 export class ClaudianService implements ChatRuntime {
   readonly providerId = CLAUDE_PROVIDER_CAPABILITIES.providerId;
-  private plugin: ClaudianPlugin;
+  private plugin: ProviderHost;
   private agentManager: Pick<AppAgentManager, 'setBuiltinAgentNames'> | null;
   private pluginManager: AppPluginManager | null;
   private abortController: AbortController | null = null;
@@ -142,6 +152,8 @@ export class ClaudianService implements ChatRuntime {
   private permissionModeSyncCallback: ((sdkMode: string) => void) | null = null;
   private vaultPath: string | null = null;
   private currentExternalContextPaths: string[] = [];
+  private currentConversationModel: string | null = null;
+  private currentConversationId: string | null = null;
   private readyStateListeners = new Set<(ready: boolean) => void>();
 
   // Modular components
@@ -155,9 +167,20 @@ export class ClaudianService implements ChatRuntime {
   private responseConsumerRunning = false;
   private responseConsumerPromise: Promise<void> | null = null;
   private shuttingDown = false;
+  private persistentQueryGeneration = 0;
 
   // Tracked configuration for detecting changes that require restart
   private currentConfig: PersistentQueryConfig | null = null;
+  private authoritativeContextWindow: {
+    query: Query;
+    model: string;
+    contextWindow: number;
+  } | null = null;
+  private contextWindowDiscovery: {
+    query: Query;
+    model: string;
+    promise: Promise<void>;
+  } | null = null;
 
   // Current allowed tools for canUseTool enforcement (null = no restriction)
   private currentAllowedTools: string[] | null = null;
@@ -174,8 +197,7 @@ export class ClaudianService implements ChatRuntime {
   // SDK command cache — populated on system/init, cleared on persistent query close
   private cachedSdkCommands: SlashCommand[] = [];
 
-  // Subagent hook state provider (set from feature layer to avoid core→feature dependency)
-  private _subagentStateProvider: (() => SubagentHookState) | null = null;
+  private _asyncSubagentCompletionCallback: AsyncSubagentCompletionCallback | null = null;
 
   // Auto-triggered turn handling (e.g., task-notification delivery by the SDK)
   private _autoTurnBuffer: StreamChunk[] = [];
@@ -187,14 +209,28 @@ export class ClaudianService implements ChatRuntime {
   private streamTransformState = createTransformStreamState();
   private usageTransformState = createTransformUsageState();
 
-  private getLegacyPluginDeps(): ClaudianPlugin & {
+  private toProviderSessionMissingChunk(error: unknown): (StreamChunk & { type: 'error' }) | null {
+    if (!isSessionMissingError(error, this.sessionManager.getSessionId() ?? undefined)) {
+      return null;
+    }
+
+    this.sessionManager.invalidateSession();
+    return {
+      type: 'error',
+      content: error instanceof Error ? error.message : 'Provider session not found',
+      code: 'provider_session_missing',
+      providerSessionId: getMissingSessionId(error) ?? undefined,
+    };
+  }
+
+  private getLegacyPluginDeps(): ProviderHost & {
     agentManager?: Pick<AppAgentManager, 'setBuiltinAgentNames'>;
     pluginManager?: AppPluginManager;
   } {
     return this.plugin;
   }
 
-  constructor(plugin: ClaudianPlugin, services: ClaudeRuntimeServices | McpServerManager) {
+  constructor(plugin: ProviderHost, services: ClaudeRuntimeServices | McpServerManager) {
     this.plugin = plugin;
     const legacyPlugin = this.getLegacyPluginDeps();
 
@@ -214,6 +250,10 @@ export class ClaudianService implements ChatRuntime {
     return CLAUDE_PROVIDER_CAPABILITIES;
   }
 
+  async prepareForTurn(): Promise<void> {
+    await this.mcpManager.ensureLoaded();
+  }
+
   prepareTurn(request: ChatTurnRequest): PreparedChatTurn {
     return encodeClaudeTurn(request, this.mcpManager);
   }
@@ -223,6 +263,10 @@ export class ClaudianService implements ChatRuntime {
     this.turnMetadata = {};
     this.bufferedUsageChunk = null;
     return metadata;
+  }
+
+  getAuxiliaryModel(): string | null {
+    return this.currentConversationModel;
   }
 
   onReadyStateChange(listener: (ready: boolean) => void): () => void {
@@ -276,21 +320,101 @@ export class ClaudianService implements ChatRuntime {
     }
 
     const usage = this.bufferedUsageChunk.usage;
+    const settings = this.getScopedSettings();
+    const contextWindowResolution = resolveContextWindowSize(
+      usage.model ?? settings.model,
+      settings.customContextLimits,
+      contextWindow,
+    );
+    const effectiveContextWindow = contextWindowResolution.contextWindow;
     const percentage = Math.min(
       100,
-      Math.max(0, Math.round((usage.contextTokens / contextWindow) * 100)),
+      Math.max(0, Math.round((usage.contextTokens / effectiveContextWindow) * 100)),
     );
+    const nextUsage = {
+      ...usage,
+      contextWindow: effectiveContextWindow,
+      percentage,
+    };
+    if (contextWindowResolution.source === 'runtime') {
+      nextUsage.contextWindowIsAuthoritative = true;
+    } else {
+      delete nextUsage.contextWindowIsAuthoritative;
+    }
     const nextChunk: Extract<StreamChunk, { type: 'usage' }> = {
       ...this.bufferedUsageChunk,
-      usage: {
-        ...usage,
-        contextWindow,
-        contextWindowIsAuthoritative: true,
-        percentage,
-      },
+      usage: nextUsage,
     };
     this.bufferedUsageChunk = nextChunk;
     return nextChunk;
+  }
+
+  private refreshAuthoritativeContextWindow(): Promise<void> {
+    const query = this.persistentQuery;
+    const model = this.currentConfig?.model;
+    if (!query || !model || typeof query.getContextUsage !== 'function') {
+      return Promise.resolve();
+    }
+
+    if (
+      this.authoritativeContextWindow?.query === query
+      && this.authoritativeContextWindow.model === model
+    ) {
+      return Promise.resolve();
+    }
+
+    if (
+      this.contextWindowDiscovery?.query === query
+      && this.contextWindowDiscovery.model === model
+    ) {
+      return this.contextWindowDiscovery.promise;
+    }
+
+    let request: ReturnType<Query['getContextUsage']>;
+    try {
+      request = query.getContextUsage();
+    } catch {
+      return Promise.resolve();
+    }
+
+    const promise = request
+      .then((contextUsage) => {
+        if (this.persistentQuery !== query || this.currentConfig?.model !== model) {
+          return;
+        }
+
+        const contextWindow = contextUsage.rawMaxTokens;
+        if (typeof contextWindow !== 'number' || contextWindow <= 0 || !Number.isFinite(contextWindow)) {
+          return;
+        }
+
+        this.authoritativeContextWindow = { query, model, contextWindow };
+      })
+      .catch(() => {
+        // Runtime context discovery is an optimization; stream/result data remains the fallback.
+      })
+      .finally(() => {
+        if (this.contextWindowDiscovery?.promise === promise) {
+          this.contextWindowDiscovery = null;
+        }
+      });
+
+    this.contextWindowDiscovery = { query, model, promise };
+    return promise;
+  }
+
+  private rememberResultContextWindow(contextWindow: number): void {
+    const query = this.persistentQuery;
+    const model = this.currentConfig?.model;
+    if (!query || !model || contextWindow <= 0 || !Number.isFinite(contextWindow)) {
+      return;
+    }
+    this.authoritativeContextWindow = { query, model, contextWindow };
+  }
+
+  private setCurrentConversationModel(model: unknown): void {
+    const selectedModel = typeof model === 'string' ? model.trim() : '';
+    this.currentConversationModel = selectedModel || null;
   }
 
   setPendingResumeAt(uuid: string | undefined): void {
@@ -318,13 +442,21 @@ export class ClaudianService implements ChatRuntime {
     conversation: ChatRuntimeConversationState | null,
     externalContextPaths?: string[],
   ): void {
+    const nextConversationId = conversation?.id ?? null;
+    if (this.currentConversationId !== nextConversationId) {
+      this.currentConversationId = nextConversationId;
+      this.closePersistentQuery('conversation switch');
+    }
+
     if (!conversation) {
+      this.currentConversationModel = null;
       this.pendingForkSession = false;
       this.pendingResumeAt = undefined;
       this.setSessionId(null, externalContextPaths);
       return;
     }
 
+    this.setCurrentConversationModel(conversation.selectedModel);
     const resolvedSessionId = this.applyForkState(conversation);
     this.setSessionId(resolvedSessionId, externalContextPaths);
   }
@@ -385,14 +517,26 @@ export class ClaudianService implements ChatRuntime {
     const sessionId = this.getSessionId();
     const vaultPath = getVaultPath(this.plugin.app);
     if (!sessionId || !vaultPath) return [];
-    return loadSubagentToolCalls(vaultPath, sessionId, agentId);
+    return loadSubagentToolCalls(
+      vaultPath,
+      sessionId,
+      agentId,
+      undefined,
+      this.buildHistoryPathContext(vaultPath),
+    );
   }
 
   async loadSubagentFinalResult(agentId: string): Promise<string | null> {
     const sessionId = this.getSessionId();
     const vaultPath = getVaultPath(this.plugin.app);
     if (!sessionId || !vaultPath) return null;
-    return loadSubagentFinalResult(vaultPath, sessionId, agentId);
+    return loadSubagentFinalResult(
+      vaultPath,
+      sessionId,
+      agentId,
+      undefined,
+      this.buildHistoryPathContext(vaultPath),
+    );
   }
 
   async reloadMcpServers(): Promise<void> {
@@ -429,7 +573,7 @@ export class ClaudianService implements ChatRuntime {
     // Case 1: Not running → try to start
     if (!this.persistentQuery) {
       if (!vaultPath) return false;
-      const cliPath = this.plugin.getResolvedProviderCliPath('claude');
+      const cliPath = await this.plugin.getResolvedProviderCliPath('claude');
       if (!cliPath) return false;
       await this.startPersistentQuery(vaultPath, cliPath, effectiveSessionId, externalContextPaths);
       return true;
@@ -440,7 +584,7 @@ export class ClaudianService implements ChatRuntime {
     if (options?.force) {
       this.closePersistentQuery('forced restart', { preserveHandlers: options.preserveHandlers });
       if (!vaultPath) return false;
-      const cliPath = this.plugin.getResolvedProviderCliPath('claude');
+      const cliPath = await this.plugin.getResolvedProviderCliPath('claude');
       if (!cliPath) return false;
       await this.startPersistentQuery(vaultPath, cliPath, effectiveSessionId, externalContextPaths);
       return true;
@@ -449,7 +593,7 @@ export class ClaudianService implements ChatRuntime {
     // Case 3: Check if config changed → restart if needed
     // We need vaultPath and cliPath to build config for comparison
     if (!vaultPath) return false;
-    const cliPath = this.plugin.getResolvedProviderCliPath('claude');
+    const cliPath = await this.plugin.getResolvedProviderCliPath('claude');
     if (!cliPath) return false;
 
     const newConfig = this.buildPersistentQueryConfig(vaultPath, cliPath, externalContextPaths);
@@ -457,7 +601,7 @@ export class ClaudianService implements ChatRuntime {
       // Close FIRST, then try to start new one (allows fallback if CLI unavailable)
       this.closePersistentQuery('config changed', { preserveHandlers: options?.preserveHandlers });
       // Re-check CLI path as it might have changed during close
-      const cliPathAfterClose = this.plugin.getResolvedProviderCliPath('claude');
+      const cliPathAfterClose = await this.plugin.getResolvedProviderCliPath('claude');
       if (cliPathAfterClose) {
         await this.startPersistentQuery(vaultPath, cliPathAfterClose, effectiveSessionId, externalContextPaths);
         return true;
@@ -480,6 +624,15 @@ export class ClaudianService implements ChatRuntime {
     externalContextPaths?: string[]
   ): Promise<void> {
     if (this.persistentQuery) {
+      return;
+    }
+
+    const startGeneration = ++this.persistentQueryGeneration;
+    const agentQuery = await loadClaudeAgentQuery();
+    if (
+      startGeneration !== this.persistentQueryGeneration
+      || this.persistentQuery
+    ) {
       return;
     }
 
@@ -550,6 +703,7 @@ export class ClaudianService implements ChatRuntime {
    * Closes the persistent query and cleans up resources.
    */
   closePersistentQuery(_reason?: string, options?: ClosePersistentQueryOptions): void {
+    this.persistentQueryGeneration += 1;
     if (!this.persistentQuery) {
       return;
     }
@@ -591,6 +745,8 @@ export class ClaudianService implements ChatRuntime {
     this.responseConsumerRunning = false;
     this.responseConsumerPromise = null;
     this.currentConfig = null;
+    this.authoritativeContextWindow = null;
+    this.contextWindowDiscovery = null;
     this.cachedSdkCommands = [];
     this.streamTransformState.clearAll();
     this.usageTransformState.clear();
@@ -633,10 +789,14 @@ export class ClaudianService implements ChatRuntime {
    * Builds the base query options context from current state.
    */
   private getScopedSettings(): ClaudianSettings {
-    return ProviderSettingsCoordinator.getProviderSettingsSnapshot(
+    const settings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
       this.plugin.settings,
       this.providerId,
     );
+    if (this.currentConversationModel) {
+      settings.model = this.currentConversationModel;
+    }
+    return settings;
   }
 
   private buildQueryOptionsContext(vaultPath: string, cliPath: string): QueryOptionsContext {
@@ -651,6 +811,18 @@ export class ClaudianService implements ChatRuntime {
       enhancedPath,
       mcpManager: this.mcpManager,
       pluginManager: this.requirePluginManager(),
+    };
+  }
+
+  private buildHistoryPathContext(vaultPath: string): ProviderHistoryPathContext {
+    const customEnv = parseEnvironmentVariables(
+      this.plugin.getActiveEnvironmentVariables(this.providerId),
+    );
+    return {
+      environment: { ...process.env, ...customEnv },
+      hostPlatform: process.platform,
+      settings: this.getScopedSettings(),
+      vaultPath,
     };
   }
 
@@ -677,7 +849,6 @@ export class ClaudianService implements ChatRuntime {
     externalContextPaths?: string[]
   ): Options {
     const baseContext = this.buildQueryOptionsContext(vaultPath, cliPath);
-    const hooks = this.buildHooks();
 
     const ctx: PersistentQueryContext = {
       ...baseContext,
@@ -686,27 +857,10 @@ export class ClaudianService implements ChatRuntime {
         ? { sessionId: resumeSessionId, sessionAt: resumeAtMessageId, fork: this.pendingForkSession || undefined }
         : undefined,
       canUseTool: this.createApprovalCallback(),
-      hooks,
       externalContextPaths,
     };
 
     return QueryOptionsBuilder.buildPersistentQueryOptions(ctx);
-  }
-
-  /**
-   * Builds the hooks for SDK options.
-   * Hooks need access to `this` for dynamic settings, so they're built here.
-   */
-  private buildHooks() {
-    const hooks: Options['hooks'] = {};
-
-    // Always register subagent hooks — closures resolve provider at execution time
-    // so hooks work even when provider is set after the persistent query starts.
-    hooks.Stop = [createStopSubagentHook(
-      () => this._subagentStateProvider?.() ?? { hasRunning: false }
-    )];
-
-    return hooks;
   }
 
   /**
@@ -723,13 +877,13 @@ export class ClaudianService implements ChatRuntime {
     const queryForThisConsumer = this.persistentQuery;
 
     this.responseConsumerPromise = (async () => {
-      if (!this.persistentQuery) return;
+      if (!queryForThisConsumer) return;
 
       try {
-        for await (const message of this.persistentQuery) {
-          if (this.shuttingDown) break;
+        for await (const message of queryForThisConsumer) {
+          if (this.shuttingDown || this.persistentQuery !== queryForThisConsumer) break;
 
-          await this.routeMessage(message);
+          await this.routeMessage(message, queryForThisConsumer);
         }
       } catch (error) {
         // Skip error handling if this consumer was replaced by a new one.
@@ -744,6 +898,13 @@ export class ClaudianService implements ChatRuntime {
           const handler = this.responseHandlers[this.responseHandlers.length - 1];
           const errorInstance = error instanceof Error ? error : new Error(String(error));
           const messageToReplay = this.lastSentMessage;
+
+          const missingSessionChunk = this.toProviderSessionMissingChunk(errorInstance);
+          if (missingSessionChunk) {
+            handler?.onError(errorInstance);
+            this.closePersistentQuery('provider session missing', { preserveHandlers: true });
+            return;
+          }
 
           if (!this.crashRecoveryAttempted && messageToReplay && handler && !handler.sawAnyChunk) {
             this.crashRecoveryAttempted = true;
@@ -806,9 +967,15 @@ export class ClaudianService implements ChatRuntime {
     usageState = this.usageTransformState,
   ) {
     const settings = this.getScopedSettings();
+    const intendedModel = toClaudeRuntimeModelId(modelOverride ?? settings.model);
+    const authoritativeContextWindow = this.authoritativeContextWindow?.query === this.persistentQuery
+      && this.authoritativeContextWindow.model === intendedModel
+      ? this.authoritativeContextWindow.contextWindow
+      : undefined;
     return {
-      intendedModel: toClaudeRuntimeModelId(modelOverride ?? settings.model),
+      intendedModel,
       customContextLimits: settings.customContextLimits,
+      authoritativeContextWindow,
       streamState,
       usageState,
     };
@@ -822,16 +989,16 @@ export class ClaudianService implements ChatRuntime {
    * The next message only dequeues after onTurnComplete(), which calls onDone()
    * on the current handler. A new handler is registered only when the next query starts.
    */
-  private async routeMessage(message: SDKMessage): Promise<void> {
+  private async routeMessage(message: SDKMessage, sourceQuery?: Query): Promise<void> {
     // Note: Session expiration errors are handled in catch blocks (queryViaSDK, handleAbort)
     // The SDK throws errors as exceptions, not as message types
 
     // Safe to use last handler - design guarantees single handler at a time
     const handler = this.responseHandlers[this.responseHandlers.length - 1];
-    const autoTurnBufferStartLength = this._autoTurnBuffer.length;
-
     // Transform SDK message to StreamChunks
     for (const event of transformSDKMessage(message, this.getTransformOptions())) {
+      if (sourceQuery && this.persistentQuery !== sourceQuery) return;
+
       this.noteVisibleStreamContent(message, event, {
         onText: () => {
           if (handler) {
@@ -868,7 +1035,10 @@ export class ClaudianService implements ChatRuntime {
         // Pass the current query instance so late completions from a dead query
         // cannot overwrite the active cache after a restart or shutdown.
         void this.fetchAndCacheCommands(this.persistentQuery);
+      } else if (isAsyncSubagentCompletion(event)) {
+        await this.deliverAsyncSubagentCompletion(event);
       } else if (isContextWindowEvent(event)) {
+        this.rememberResultContextWindow(event.contextWindow);
         const usageChunk = this.updateBufferedUsageContextWindow(event.contextWindow);
         if (!usageChunk) {
           continue;
@@ -912,20 +1082,13 @@ export class ClaudianService implements ChatRuntime {
         if (handler) {
           handler.onChunk(normalizedChunk);
         } else {
-          // No handler — buffer for auto-triggered turn (e.g., task-notification delivery)
+          // No handler — buffer for a provider-triggered follow-up turn.
           this._autoTurnBuffer.push(normalizedChunk);
         }
       }
     }
 
-    if (
-      !handler
-      && message.type === 'system'
-      && message.subtype === 'task_notification'
-      && this._autoTurnBuffer.length > autoTurnBufferStartLength
-    ) {
-      await this.flushAutoTurnBuffer();
-    }
+    if (sourceQuery && this.persistentQuery !== sourceQuery) return;
 
     if (message.type === 'assistant' && message.uuid) {
       this.recordTurnMetadata({ assistantMessageId: message.uuid });
@@ -962,6 +1125,17 @@ export class ClaudianService implements ChatRuntime {
       await this._autoTurnCallback?.({ chunks, metadata });
     } catch {
       new Notice('Background task completed, but the result could not be rendered.');
+    }
+  }
+
+  private async deliverAsyncSubagentCompletion(
+    completion: AsyncSubagentCompletion,
+  ): Promise<void> {
+    if (!this._asyncSubagentCompletionCallback) return;
+    try {
+      await this._asyncSubagentCompletionCallback(completion);
+    } catch {
+      new Notice('Background task completed, but its state could not be saved.');
     }
   }
 
@@ -1104,6 +1278,9 @@ export class ClaudianService implements ChatRuntime {
     const images = normalized.request.images;
     const conversationHistory = normalized.conversationHistory;
     const queryOptions = normalized.queryOptions;
+    if (queryOptions?.model) {
+      this.setCurrentConversationModel(queryOptions.model);
+    }
 
     const vaultPath = getVaultPath(this.plugin.app);
     if (!vaultPath) {
@@ -1111,7 +1288,7 @@ export class ClaudianService implements ChatRuntime {
       return;
     }
 
-    const resolvedClaudePath = this.plugin.getResolvedProviderCliPath('claude');
+    const resolvedClaudePath = await this.plugin.getResolvedProviderCliPath('claude');
     if (!resolvedClaudePath) {
       yield { type: 'error', content: 'Claude CLI not found. Please install Claude Code CLI.' };
       return;
@@ -1204,12 +1381,21 @@ export class ClaudianService implements ChatRuntime {
                 effectiveQueryOptions
               );
             } catch (retryError) {
-              const msg = retryError instanceof Error ? retryError.message : 'Unknown error';
-              yield { type: 'error', content: msg };
+              const missingSessionChunk = this.toProviderSessionMissingChunk(retryError);
+              yield missingSessionChunk ?? {
+                type: 'error',
+                content: retryError instanceof Error ? retryError.message : 'Unknown error',
+              };
             } finally {
               this.coldStartInProgress = false;
               this.abortController = null;
             }
+            return;
+          }
+
+          const missingSessionChunk = this.toProviderSessionMissingChunk(error);
+          if (missingSessionChunk) {
+            yield missingSessionChunk;
             return;
           }
 
@@ -1240,9 +1426,18 @@ export class ClaudianService implements ChatRuntime {
             effectiveQueryOptions
           );
         } catch (retryError) {
-          const msg = retryError instanceof Error ? retryError.message : 'Unknown error';
-          yield { type: 'error', content: msg };
+          const missingSessionChunk = this.toProviderSessionMissingChunk(retryError);
+          yield missingSessionChunk ?? {
+            type: 'error',
+            content: retryError instanceof Error ? retryError.message : 'Unknown error',
+          };
         }
+        return;
+      }
+
+      const missingSessionChunk = this.toProviderSessionMissingChunk(error);
+      if (missingSessionChunk) {
+        yield missingSessionChunk;
         return;
       }
 
@@ -1317,6 +1512,8 @@ export class ClaudianService implements ChatRuntime {
       yield* this.queryViaSDK(prompt, vaultPath, cliPath, images, queryOptions);
       return;
     }
+
+    void this.refreshAuthoritativeContextWindow();
 
     const message = this.buildSDKUserMessage(prompt, images);
 
@@ -1508,7 +1705,6 @@ export class ClaudianService implements ChatRuntime {
     const queryPrompt = this.buildPromptWithImages(prompt, images);
     const baseContext = this.buildQueryOptionsContext(cwd, cliPath);
     const externalContextPaths = queryOptions?.externalContextPaths || [];
-    const hooks = this.buildHooks();
     const hasEditorContext = prompt.includes('<editor_selection');
 
     let allowedTools: string[] | undefined;
@@ -1523,7 +1719,6 @@ export class ClaudianService implements ChatRuntime {
       sessionId: this.sessionManager.getSessionId() ?? undefined,
       modelOverride: queryOptions?.model,
       canUseTool: this.createApprovalCallback(),
-      hooks,
       mcpMentions: queryOptions?.mcpMentions,
       enabledMcpServers: queryOptions?.enabledMcpServers,
       allowedTools,
@@ -1538,6 +1733,10 @@ export class ClaudianService implements ChatRuntime {
     const streamState = createTransformStreamState();
     const usageState = createTransformUsageState();
     try {
+      const agentQuery = await loadClaudeAgentQuery();
+      if (ctx.abortController?.signal.aborted) {
+        return;
+      }
       const response = agentQuery({ prompt: queryPrompt, options });
       this.recordTurnMetadata({ wasSent: true });
       let streamSessionId: string | null = this.sessionManager.getSessionId();
@@ -1561,6 +1760,8 @@ export class ClaudianService implements ChatRuntime {
           if (isSessionInitEvent(event)) {
             this.sessionManager.captureSession(event.sessionId);
             streamSessionId = event.sessionId;
+          } else if (isAsyncSubagentCompletion(event)) {
+            await this.deliverAsyncSubagentCompletion(event);
           } else if (isContextWindowEvent(event)) {
             const usageChunk = this.updateBufferedUsageContextWindow(event.contextWindow);
             if (usageChunk) {
@@ -1743,7 +1944,7 @@ export class ClaudianService implements ChatRuntime {
 
   async rewind(
     userMessageId: string,
-    assistantMessageId: string,
+    assistantMessageId: string | undefined,
     mode: ChatRewindMode = 'code-and-conversation',
   ): Promise<ChatRewindResult> {
     return executeClaudeRewind(userMessageId, {
@@ -1754,6 +1955,7 @@ export class ClaudianService implements ChatRuntime {
       setPendingResumeAt: (resumeAt) => {
         this.pendingResumeAt = resumeAt;
       },
+      resetSession: () => this.resetSession(),
       vaultPath: this.vaultPath,
     });
   }
@@ -1778,8 +1980,8 @@ export class ClaudianService implements ChatRuntime {
     this.permissionModeSyncCallback = callback;
   }
 
-  setSubagentHookProvider(getState: () => SubagentHookState): void {
-    this._subagentStateProvider = getState;
+  setAsyncSubagentCompletionCallback(callback: AsyncSubagentCompletionCallback | null): void {
+    this._asyncSubagentCompletionCallback = callback;
   }
 
   setAutoTurnCallback(callback: AutoTurnCallback | null): void {
@@ -1799,6 +2001,9 @@ export class ClaudianService implements ChatRuntime {
           this.currentConfig.permissionMode = mode;
           this.currentConfig.sdkPermissionMode = sdkMode;
         }
+      },
+      notifyAlwaysAppliedOnce: () => {
+        new Notice('Always approval could only be applied once because no permission scope was available.');
       },
     });
   }

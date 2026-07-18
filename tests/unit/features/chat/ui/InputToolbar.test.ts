@@ -1,3 +1,7 @@
+import {
+  TEST_CODEX_MODEL,
+  TEST_CODEX_MODEL_LABEL,
+} from '@test/helpers/codexModels';
 import { createMockEl } from '@test/helpers/mockElement';
 
 import type { UsageInfo } from '@/core/types';
@@ -12,10 +16,6 @@ import {
   ServiceTierToggle,
   ThinkingBudgetSelector,
 } from '@/features/chat/ui/InputToolbar';
-import {
-  DEFAULT_CODEX_PRIMARY_MODEL,
-  DEFAULT_CODEX_PRIMARY_MODEL_LABEL,
-} from '@/providers/codex/types/models';
 
 jest.mock('obsidian', () => ({
   Notice: jest.fn(),
@@ -125,7 +125,7 @@ function createMockUIConfig() {
       planLabel: 'PLAN',
     }),
     getServiceTierToggle: jest.fn().mockImplementation((settings: Record<string, unknown>) =>
-      settings.model === DEFAULT_CODEX_PRIMARY_MODEL
+      settings.model === TEST_CODEX_MODEL
         ? {
           inactiveValue: 'default',
           inactiveLabel: 'Standard',
@@ -299,7 +299,7 @@ describe('ModelSelector', () => {
     const groupedModels = [
       { value: 'opus', label: 'Opus', group: 'Claude' },
       { value: 'sonnet', label: 'Sonnet', group: 'Claude' },
-      { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL, group: 'Codex' },
+      { value: TEST_CODEX_MODEL, label: TEST_CODEX_MODEL_LABEL, group: 'Codex' },
     ];
     const uiConfig = createMockUIConfig();
     uiConfig.getModelOptions.mockReturnValue(groupedModels);
@@ -701,7 +701,7 @@ describe('ServiceTierToggle', () => {
     callbacks = createMockCallbacks({
       getUIConfig: jest.fn().mockReturnValue(uiConfig),
       getSettings: jest.fn().mockReturnValue({
-        model: DEFAULT_CODEX_PRIMARY_MODEL,
+        model: TEST_CODEX_MODEL,
         thinkingBudget: 'off',
         effortLevel: 'medium',
         serviceTier: 'default',
@@ -728,7 +728,7 @@ describe('ServiceTierToggle', () => {
 
   it('renders the icon button in the active state when fast mode is on', () => {
     callbacks.getSettings.mockReturnValue({
-      model: DEFAULT_CODEX_PRIMARY_MODEL,
+      model: TEST_CODEX_MODEL,
       thinkingBudget: 'off',
       effortLevel: 'medium',
       serviceTier: 'fast',
@@ -751,7 +751,7 @@ describe('ServiceTierToggle', () => {
 
   it('toggles from Fast to Standard on click', async () => {
     callbacks.getSettings.mockReturnValue({
-      model: DEFAULT_CODEX_PRIMARY_MODEL,
+      model: TEST_CODEX_MODEL,
       thinkingBudget: 'off',
       effortLevel: 'medium',
       serviceTier: 'fast',
@@ -821,6 +821,51 @@ describe('McpServerSelector', () => {
     expect(container?.hasClass('claudian-hidden')).toBe(false);
   });
 
+  it('keeps a lazy selector hidden until configured servers finish loading', async () => {
+    let loaded = false;
+    const manager = {
+      ensureLoaded: jest.fn(async () => {
+        loaded = true;
+      }),
+      getServers: jest.fn(() => loaded
+        ? [{ name: 'lazy-server', enabled: true, contextSaving: false }]
+        : []),
+      isLoaded: jest.fn(() => loaded),
+    } as any;
+
+    selector.setMcpManager(manager);
+    const container = parentEl.querySelector('.claudian-mcp-selector');
+
+    expect(container?.hasClass('claudian-hidden')).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(manager.ensureLoaded).toHaveBeenCalledTimes(1);
+    expect(container?.hasClass('claudian-hidden')).toBe(false);
+    expect(parentEl.querySelector('.claudian-mcp-selector-item')).not.toBeNull();
+  });
+
+  it('stays hidden when lazy loading finds no configured servers', async () => {
+    let loaded = false;
+    const manager = {
+      ensureLoaded: jest.fn(async () => {
+        loaded = true;
+      }),
+      getServers: jest.fn().mockReturnValue([]),
+      isLoaded: jest.fn(() => loaded),
+    } as any;
+
+    selector.setMcpManager(manager);
+    const container = parentEl.querySelector('.claudian-mcp-selector');
+
+    expect(container?.hasClass('claudian-hidden')).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(manager.ensureLoaded).toHaveBeenCalledTimes(1);
+    expect(container?.hasClass('claudian-hidden')).toBe(true);
+  });
+
   it('should show empty message when all servers are disabled', () => {
     selector.setMcpManager(createMockMcpManager([{ name: 'test', enabled: false }]));
     const empty = parentEl.querySelector('.claudian-mcp-selector-empty');
@@ -867,6 +912,18 @@ describe('McpServerSelector', () => {
     ]));
     selector.setEnabledServers(['server1', 'server2']);
     expect(selector.getEnabledServers().size).toBe(2);
+  });
+
+  it('preserves persisted selections until a lazy manager finishes loading', () => {
+    const manager = {
+      getServers: jest.fn().mockReturnValue([]),
+      isLoaded: jest.fn().mockReturnValue(false),
+    } as any;
+
+    selector.setMcpManager(manager);
+    selector.setEnabledServers(['server1']);
+
+    expect(selector.getEnabledServers()).toEqual(new Set(['server1']));
   });
 
   it('should prune enabled servers that no longer exist in manager', () => {

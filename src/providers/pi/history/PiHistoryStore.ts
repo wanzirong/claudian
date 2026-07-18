@@ -5,8 +5,9 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { isWriteEditTool } from '../../../core/tools/toolNames';
-import type { ChatMessage, ContentBlock, ToolCallInfo } from '../../../core/types';
+import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo } from '../../../core/types';
 import { extractDiffData } from '../../../utils/diff';
+import { buildImageAttachmentFromBase64 } from '../../../utils/imageAttachment';
 import {
   extractPiToolTextContent,
   normalizePiToolInput,
@@ -310,6 +311,23 @@ export function findPiSessionFile(
   return null;
 }
 
+/** Searches exactly one caller-owned root without adding implicit fallback roots. */
+export function findPiSessionFileInRoot(
+  sessionId: string,
+  root: string,
+): string | null {
+  const trimmed = sessionId.trim();
+  if (!trimmed || path.isAbsolute(trimmed) || /[\\/]/.test(trimmed)) {
+    return null;
+  }
+
+  const direct = path.join(root, trimmed.endsWith('.jsonl') ? trimmed : `${trimmed}.jsonl`);
+  if (fileExists(direct)) {
+    return direct;
+  }
+  return findSessionFileInRoot(root, trimmed);
+}
+
 export function derivePiSessionsRootFromSessionPath(sessionPath: string): string | null {
   const normalized = sessionPath.trim();
   if (!normalized) {
@@ -388,9 +406,11 @@ function mapPiSessionEntry(
   const timestamp = getTimestamp(message.timestamp ?? entry.raw.timestamp);
 
   if (role === 'user') {
+    const images = extractUserImages(message.content ?? message.parts ?? message.blocks, entry.id ?? `pi-user-${messages.length}`);
     return {
       content: extractTextContent(message.content ?? message.text ?? message.message),
       id: entry.id ?? `pi-user-${messages.length}`,
+      ...(images.length > 0 ? { images } : {}),
       role: 'user',
       timestamp,
       userMessageId: entry.id,
@@ -484,6 +504,40 @@ function extractAssistantContentBlocks(value: unknown): ContentBlock[] {
   }
 
   return blocks;
+}
+
+function extractUserImages(value: unknown, messageId: string): ImageAttachment[] {
+  const parts = Array.isArray(value) ? value : [];
+  const images: ImageAttachment[] = [];
+
+  for (const part of parts) {
+    if (!isPlainObject(part)) {
+      continue;
+    }
+
+    const type = getString(part.type);
+    if (type !== 'image') {
+      continue;
+    }
+
+    const data = getString(part.data);
+    const mediaType = getString(part.mimeType) ?? getString(part.mime_type) ?? getString(part.mediaType);
+    if (!data || !mediaType) {
+      continue;
+    }
+
+    const image = buildImageAttachmentFromBase64({
+      data,
+      id: `pi-img-${messageId}-${images.length}`,
+      mediaType,
+      name: getString(part.name) ?? getString(part.filename) ?? `image-${images.length + 1}.${mediaType.split('/')[1] ?? 'img'}`,
+    });
+    if (image) {
+      images.push(image);
+    }
+  }
+
+  return images;
 }
 
 function extractAssistantToolCalls(value: unknown): ToolCallInfo[] {

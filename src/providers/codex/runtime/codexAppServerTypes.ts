@@ -1,6 +1,6 @@
 // Local protocol subset for Codex app-server stdio JSON-RPC.
 // Field names match the wire format (camelCase).
-// Probed against codex-cli 0.118.0 on 2026-04-01.
+// Validated against the generated codex-cli 0.144.5 schema on 2026-07-16.
 
 // ---------------------------------------------------------------------------
 // JSON-RPC base
@@ -110,6 +110,7 @@ export type ThreadItem =
   | WebSearchItem
   | CollabAgentToolCallItem
   | McpToolCallItem
+  | DynamicToolCallItem
   | ContextCompactionItem;
 
 export interface UserMessageItem {
@@ -223,6 +224,18 @@ export interface McpToolCallItem {
   durationMs?: number | null;
 }
 
+export interface DynamicToolCallItem {
+  type: 'dynamicToolCall';
+  id: string;
+  namespace?: string | null;
+  tool: string;
+  arguments: unknown;
+  status: 'inProgress' | 'completed' | 'failed';
+  contentItems?: DynamicToolCallOutputContentItem[] | null;
+  success?: boolean | null;
+  durationMs?: number | null;
+}
+
 export interface ContextCompactionItem {
   type: 'contextCompaction';
   id: string;
@@ -303,19 +316,93 @@ export interface SkillsListResult {
 }
 
 // ---------------------------------------------------------------------------
+// model/list
+// ---------------------------------------------------------------------------
+
+export interface ModelReasoningEffortOption {
+  reasoningEffort: string;
+  description: string;
+}
+
+export interface ModelServiceTier {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface AppServerModel {
+  id: string;
+  model: string;
+  displayName: string;
+  description: string;
+  hidden: boolean;
+  supportedReasoningEfforts: ModelReasoningEffortOption[];
+  defaultReasoningEffort: string;
+  inputModalities?: Array<'text' | 'image'>;
+  supportsPersonality?: boolean;
+  serviceTiers?: ModelServiceTier[];
+  defaultServiceTier?: string | null;
+  isDefault: boolean;
+}
+
+export interface ModelListResult {
+  data: AppServerModel[];
+  nextCursor?: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // thread/start
 // ---------------------------------------------------------------------------
 
 export interface ThreadStartParams {
-  model: string;
-  cwd: string;
-  approvalPolicy: string;
-  sandbox: string;
+  model?: string;
+  cwd?: string;
+  approvalPolicy?: string;
+  sandbox?: string;
   serviceTier?: string | null;
   baseInstructions?: string;
   experimentalRawEvents?: boolean;
   persistExtendedHistory?: boolean;
   sandboxPolicy?: SandboxPolicy;
+  dynamicTools?: LegacyDynamicToolSpec[];
+}
+
+export interface DynamicToolFunctionSpec {
+  type: 'function';
+  name: string;
+  description: string;
+  inputSchema: unknown;
+  deferLoading?: boolean;
+}
+
+/**
+ * Flat dynamic-tool request shape accepted by Codex before explicit namespace
+ * specs and retained as a backwards-compatible input by current app servers.
+ */
+export interface LegacyDynamicToolSpec {
+  namespace?: string | null;
+  name: string;
+  description: string;
+  inputSchema: unknown;
+  deferLoading?: boolean;
+}
+
+export interface DynamicToolCallParams {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  namespace?: string | null;
+  tool: string;
+  arguments: unknown;
+}
+
+export type DynamicToolCallOutputContentItem =
+  | { type: 'inputText'; text: string }
+  | { type: 'inputImage'; imageUrl: string };
+
+export interface DynamicToolCallResponse {
+  success: boolean;
+  contentItems: DynamicToolCallOutputContentItem[];
 }
 
 export interface ThreadStartResult {
