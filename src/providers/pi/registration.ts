@@ -1,13 +1,15 @@
+import { NOOP_TASK_RESULT_INTERPRETER } from '../../core/providers/NoopTaskResultInterpreter';
+import { getProviderConfig } from '../../core/providers/providerConfig';
+import { hasStoredConfigNormalization } from '../../core/providers/settings/storedSettings';
 import type { ProviderModule } from '../../core/providers/types';
-import { piWorkspaceRegistration } from './app/PiWorkspaceServices';
-import { PiInlineEditService } from './auxiliary/PiInlineEditService';
-import { PiInstructionRefineService } from './auxiliary/PiInstructionRefineService';
-import { PiTaskResultInterpreter } from './auxiliary/PiTaskResultInterpreter';
-import { PiTitleGenerationService } from './auxiliary/PiTitleGenerationService';
+import {
+  getPiWorkspaceServices,
+  piWorkspaceRegistration,
+} from './app/PiWorkspaceServices';
 import { PI_PROVIDER_CAPABILITIES } from './capabilities';
 import { piSettingsReconciler } from './env/PiSettingsReconciler';
+import { PiExecutionBackend } from './execution/PiExecutionBackend';
 import { PiConversationHistoryService } from './history/PiConversationHistoryService';
-import { PiChatRuntime } from './runtime/PiChatRuntime';
 import { getPiProviderSettings, updatePiProviderSettings } from './settings';
 import { ObsidianPiExtensionUiRenderer } from './ui/ObsidianPiExtensionUiRenderer';
 import { piChatUIConfig } from './ui/PiChatUIConfig';
@@ -17,12 +19,18 @@ export const piProviderRegistration: ProviderModule = {
   blankTabOrder: 11,
   capabilities: PI_PROVIDER_CAPABILITIES,
   chatUIConfig: piChatUIConfig,
-  createInlineEditService: (plugin) => new PiInlineEditService(plugin),
-  createInstructionRefineService: (plugin) => new PiInstructionRefineService(plugin),
-  createRuntime: ({ plugin }) => new PiChatRuntime(plugin, {
-    extensionUiRenderer: new ObsidianPiExtensionUiRenderer(plugin.app),
-  }),
-  createTitleGenerationService: (plugin) => new PiTitleGenerationService(plugin),
+  createExecutionBackend: (plugin) => new PiExecutionBackend(
+    plugin,
+    getPiWorkspaceServices(),
+    { extensionUiRenderer: new ObsidianPiExtensionUiRenderer(plugin.app) },
+  ),
+  resolveTitleGenerationModel: (plugin) => {
+    const settings = plugin.settings as unknown as Record<string, unknown>;
+    const titleModel = typeof settings.titleGenerationModel === 'string'
+      ? settings.titleGenerationModel
+      : '';
+    return piChatUIConfig.ownsModel(titleModel, settings) ? titleModel : undefined;
+  },
   displayName: 'Pi',
   environmentKeyPatterns: [/^PI_/i],
   historyService: new PiConversationHistoryService(),
@@ -32,10 +40,14 @@ export const piProviderRegistration: ProviderModule = {
   settingsStorage: {
     hostScopedFields: ['cliPathsByHost'],
     normalizeStored(target, stored) {
+      const storedConfig = getProviderConfig(stored, 'pi');
       updatePiProviderSettings(target, getPiProviderSettings(stored));
-      return false;
+      return hasStoredConfigNormalization(
+        storedConfig,
+        getProviderConfig(target, 'pi'),
+      );
     },
   },
-  taskResultInterpreter: new PiTaskResultInterpreter(),
+  taskResultInterpreter: NOOP_TASK_RESULT_INTERPRETER,
   workspace: piWorkspaceRegistration,
 };

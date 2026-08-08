@@ -2,60 +2,35 @@
 
 `src/core/` is provider-neutral infrastructure. Features depend on core contracts; providers implement those contracts behind the registry boundary.
 
-## Ownership
-
-| Module | Owns |
-| --- | --- |
-| `bootstrap/` | Provider-neutral session metadata storage and shared app-storage contracts |
-| `commands/` | Built-in cross-provider commands |
-| `mcp/` | Provider-neutral MCP coordination and config parsing |
-| `prompt/` | Shared prompt templates |
-| `providers/` | Registry, capability, environment, model-routing, and workspace-service contracts |
-| `providers/commands/` | Shared command catalog contracts |
-| `runtime/` | `ChatRuntime`, turn preparation, streaming, approval, and query contracts |
-| `security/` | Permission and approval helpers |
-| `storage/` | Generic vault/home filesystem adapters |
-| `tools/` | Shared tool constants and formatting helpers |
-| `types/` | Shared type definitions |
-
 ## Dependency Rules
 
-```text
-types/ <- all modules
-storage/ <- bootstrap/, provider workspace services
-runtime/ + providers/ <- provider implementations
-features/ -> core contracts only
-```
+- `bootstrap/` defines provider-neutral persistence contracts and normalization, including recovery-only native locators. It must not interpret provider-native session formats or make those locators resumable.
+- `execution/` defines leases, sessions, requests, events, interactions, and lifecycle coordination. It must not construct concrete providers.
+- `providers/` defines registries, capabilities, routing, workspace-service contracts, and provider-state boundaries. Registrations supply the concrete implementations.
+- `process/` and `rpc/` provide mechanics only. Provider launch arguments, protocol extensions, retry policy, and message semantics stay provider-owned.
+- `auxiliary/` may orchestrate provider-neutral executions through core contracts but must not special-case a concrete provider.
 
-Do not import provider implementation files from `core/`. If shared behavior needs provider data, add an explicit contract and have providers implement it.
+Core must consume provider data through explicit contracts. Do not branch on provider IDs when a capability can express the distinction or promote provider-native state into a shared type.
 
-## Key Contracts
+## State Ownership
 
-```typescript
-const runtime = ProviderRegistry.createChatRuntime({ plugin, providerId });
-const preparedTurn = runtime.prepareTurn(request);
+- `ProviderExecutionLifecycleRegistry` is the source of truth for provider generations, transition fencing, and live session leases. It does not own per-tab turn state or impose a global execution-capacity policy.
+- Provider execution sessions own native runtime interaction behind the `ProviderExecutionSession` contract.
+- Bootstrap persistence stores Claudian metadata and input ledgers. Provider transcript files remain provider-owned and read-only.
+- Registries own registration and lookup; they do not absorb the lifecycle or storage responsibilities of the registered service.
 
-for await (const chunk of runtime.query(preparedTurn, history)) {
-  // Feature layer consumes provider-neutral StreamChunk values.
-}
-```
+## Routing Rules
 
-Title generation is provider-routed by the global `titleGenerationModel` setting and is independent from the active chat tab provider.
-
-Workspace services are resolved through `ProviderWorkspaceRegistry`:
-
-```typescript
-const catalog = ProviderWorkspaceRegistry.getCommandCatalog(providerId);
-const agentMentions = ProviderWorkspaceRegistry.getAgentMentionProvider(providerId);
-const cliResolver = ProviderWorkspaceRegistry.getCliResolver(providerId);
-```
+- Title generation routes by the global `titleGenerationModel`, independently of the active chat provider. Core owns its shared prompt, parsing, cancellation, and callback flow over ephemeral execution sessions.
+- For instruction refinement and inline edit, core owns multi-turn orchestration and response parsing; provider backends own native continuation, tools, and lifecycle behavior.
+- Resolve provider workspace services through `ProviderWorkspaceRegistry`, not concrete providers.
+- Chat model resolution distinguishes historical provider ownership from current enabled-option availability. Global future-tab fallback and conversation fallback may use only current provider options and a validated provider-owned default; opaque historical ownership alone is not availability.
+- For an unavailable durable conversation selection, `ConversationModelResolution.model` remains the readable stored value and `modelToPersist` carries the desired fallback. Readers must not project `modelToPersist`; the application repository publishes it only after persistence succeeds.
+- Provider alias canonicalization used during availability checks must not choose a fallback model. Fallback policy remains a separate ordered/default resolution step.
+- Provider fallback order is the registry's explicit blank-tab display order. Do not derive fallback from display-name sorting, registration insertion order, or the current settings projection.
 
 ## Gotchas
 
-- `ChatRuntime.cleanup()` must run when a tab is disposed.
-- `Conversation.providerState` is opaque to feature code. Provider-specific fields belong behind typed provider helpers.
-- Plan mode is capability-driven. Do not hardcode provider IDs in feature logic unless the provider contract cannot express the distinction.
-- Command discovery differs by provider:
-  - Claude merges runtime-discovered commands with vault commands and skills.
-  - Codex skills come from `CodexSkillCatalog` and do not depend on runtime command discovery.
-  - OpenCode and Pi expose runtime commands through their provider protocols.
+- Missing historical model selections are recovered through `ProviderConversationHistoryService`; core defines the contract, providers interpret native history, and the application repository coordinates persistence and race fencing.
+- Command discovery is provider-owned; do not normalize provider-specific discovery sources in feature code.
+- Provider command caches and live snapshots are resource-generation fenced; cache identities contain only provider-owned non-secret fingerprints and monotonic generations.

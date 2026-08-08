@@ -63,12 +63,27 @@ describe('types.ts', () => {
       expect(getClaudeProviderSettings(DEFAULT_SETTINGS).customModels).toBe('');
     });
 
+    it('should enable Claude by default for backward compatibility', () => {
+      expect(getClaudeProviderSettings(DEFAULT_SETTINGS).enabled).toBe(true);
+      expect(getClaudeProviderSettings({ providerConfigs: { claude: {} } }).enabled).toBe(true);
+    });
+
     it('should have lastCustomModel as empty string by default', () => {
       expect(DEFAULT_SETTINGS.lastCustomModel).toBe('');
     });
 
     it('should collapse file edits by default', () => {
       expect(DEFAULT_SETTINGS.expandFileEditsByDefault).toBe(false);
+    });
+
+    it('should keep five agent processes warm by default', () => {
+      expect(DEFAULT_SETTINGS.maxWarmAgentProcesses).toBe(5);
+    });
+
+    it('should enable the right-side dual pane by default', () => {
+      expect(DEFAULT_SETTINGS.enableDualPane).toBe(true);
+      expect(DEFAULT_SETTINGS.enableFilePane).toBe(true);
+      expect(DEFAULT_SETTINGS.dualPaneSide).toBe('right');
     });
   });
 
@@ -78,6 +93,7 @@ describe('types.ts', () => {
         userName: '',
         model: 'haiku',
         enableAutoTitleGeneration: true,
+        titleGenerationLocale: '',
         titleGenerationModel: '',
         thinkingBudget: 'off',
         serviceTier: 'default',
@@ -100,19 +116,23 @@ describe('types.ts', () => {
         claudeCliPath: '',
         claudeCliPathsByHost: {},
         loadUserClaudeSettings: false,
-        maxTabs: 3,
+        maxWarmAgentProcesses: 5,
         enableChrome: false,
         enableBangBash: false,
         enableAutoScroll: true,
         deferMathRenderingDuringStreaming: true,
         expandFileEditsByDefault: false,
         chatViewPlacement: 'right-sidebar',
+        enableDualPane: true,
+        enableFilePane: true,
+        dualPaneSide: 'right',
         hiddenProviderCommands: {
           claude: [],
           codex: [],
         },
         effortLevel: 'high',
-        settingsProvider: 'claude',
+      settingsProvider: 'claude',
+      lastSelectedChatModel: null,
         codexEnabled: false,
         savedProviderModel: {},
         savedProviderEffort: {},
@@ -131,6 +151,7 @@ describe('types.ts', () => {
         userName: '',
         model: 'anthropic/custom-model-v1',
         enableAutoTitleGeneration: true,
+        titleGenerationLocale: 'zh-CN',
         titleGenerationModel: '',
         thinkingBudget: 'medium',
         serviceTier: 'default',
@@ -153,19 +174,23 @@ describe('types.ts', () => {
         claudeCliPath: '',
         claudeCliPathsByHost: {},
         loadUserClaudeSettings: false,
-        maxTabs: 3,
+        maxWarmAgentProcesses: 5,
         enableChrome: false,
         enableBangBash: false,
         enableAutoScroll: true,
         deferMathRenderingDuringStreaming: true,
         expandFileEditsByDefault: false,
         chatViewPlacement: 'right-sidebar',
+        enableDualPane: true,
+        enableFilePane: true,
+        dualPaneSide: 'right',
         hiddenProviderCommands: {
           claude: [],
           codex: [],
         },
         effortLevel: 'high',
-        settingsProvider: 'claude',
+      settingsProvider: 'claude',
+      lastSelectedChatModel: null,
         codexEnabled: false,
         savedProviderModel: {},
         savedProviderEffort: {},
@@ -183,6 +208,7 @@ describe('types.ts', () => {
         userName: '',
         model: 'sonnet',
         enableAutoTitleGeneration: true,
+        titleGenerationLocale: '',
         titleGenerationModel: '',
         lastClaudeModel: 'opus',
         lastCustomModel: 'custom/model',
@@ -207,19 +233,23 @@ describe('types.ts', () => {
         claudeCliPath: '',
         claudeCliPathsByHost: {},
         loadUserClaudeSettings: false,
-        maxTabs: 5,
+        maxWarmAgentProcesses: 5,
         enableChrome: false,
         enableBangBash: false,
         enableAutoScroll: false,
         deferMathRenderingDuringStreaming: true,
         expandFileEditsByDefault: true,
         chatViewPlacement: 'right-sidebar',
+        enableDualPane: false,
+        enableFilePane: false,
+        dualPaneSide: 'left',
         hiddenProviderCommands: {
           claude: [],
           codex: [],
         },
         effortLevel: 'high',
-        settingsProvider: 'claude',
+      settingsProvider: 'claude',
+      lastSelectedChatModel: null,
         codexEnabled: false,
         savedProviderModel: {},
         savedProviderEffort: {},
@@ -434,7 +464,7 @@ describe('types.ts', () => {
         providerId: 'claude',
         title: 'Test Conversation',
         createdAt: 1700000000000,
-        updatedAt: 1700000001000,
+        lastActivityAt: 1700000001000,
         sessionId: 'session-abc',
         messages: [],
       };
@@ -442,7 +472,7 @@ describe('types.ts', () => {
       expect(conversation.id).toBe('conv-123');
       expect(conversation.title).toBe('Test Conversation');
       expect(conversation.createdAt).toBe(1700000000000);
-      expect(conversation.updatedAt).toBe(1700000001000);
+      expect(conversation.lastActivityAt).toBe(1700000001000);
       expect(conversation.sessionId).toBe('session-abc');
       expect(conversation.messages).toEqual([]);
     });
@@ -453,7 +483,7 @@ describe('types.ts', () => {
         providerId: 'claude',
         title: 'New Chat',
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         sessionId: null,
         messages: [],
       };
@@ -472,7 +502,7 @@ describe('types.ts', () => {
         providerId: 'claude',
         title: 'Chat with Messages',
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         sessionId: 'session-xyz',
         messages,
       };
@@ -490,7 +520,7 @@ describe('types.ts', () => {
         providerId: 'claude',
         title: 'Test Conversation',
         createdAt: 1700000000000,
-        updatedAt: 1700000001000,
+        lastActivityAt: 1700000001000,
         messageCount: 5,
         preview: 'Hello, how can I...',
       };
@@ -498,7 +528,7 @@ describe('types.ts', () => {
       expect(meta.id).toBe('conv-123');
       expect(meta.title).toBe('Test Conversation');
       expect(meta.createdAt).toBe(1700000000000);
-      expect(meta.updatedAt).toBe(1700000001000);
+      expect(meta.lastActivityAt).toBe(1700000001000);
       expect(meta.messageCount).toBe(5);
       expect(meta.preview).toBe('Hello, how can I...');
     });
@@ -509,7 +539,7 @@ describe('types.ts', () => {
         providerId: 'claude',
         title: 'Empty Chat',
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         messageCount: 0,
         preview: 'New conversation',
       };

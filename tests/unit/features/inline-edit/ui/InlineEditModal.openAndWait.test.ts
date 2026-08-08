@@ -1,6 +1,6 @@
 import '@/providers';
 
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 import { MarkdownRenderer, Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
@@ -42,10 +42,23 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+function createInertInlineEditService() {
+  return {
+    cancel: jest.fn(),
+    continueConversation: jest.fn(),
+    editText: jest.fn(),
+    resetConversation: jest.fn(),
+    setModelOverride: jest.fn(),
+  };
+}
+
 describe('InlineEditModal - openAndWait', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized').mockResolvedValue(undefined);
+    jest
+      .spyOn(ProviderRegistry, 'createInlineEditService')
+      .mockReturnValue(createInertInlineEditService() as any);
   });
 
   afterEach(() => {
@@ -91,6 +104,97 @@ describe('InlineEditModal - openAndWait', () => {
     const noticeMock = Notice as unknown as jest.Mock;
     expect(noticeMock).toHaveBeenCalledWith(
       'Inline edit unavailable: could not access the active editor. Try reopening the note.'
+    );
+  });
+
+  it('uses an enabled settings provider when no chat tab is open', async () => {
+    const editor = {} as any;
+    const app = {} as any;
+    const plugin = {
+      settings: {
+        settingsProvider: 'claude',
+        providerConfigs: {
+          claude: { enabled: false },
+          codex: { enabled: true },
+        },
+      },
+      getView: jest.fn().mockReturnValue(null),
+    } as any;
+    plugin.providerHost = plugin;
+    const view = { editor } as any;
+    const editContext: InlineEditContext = {
+      mode: 'cursor',
+      cursorContext: {
+        beforeCursor: '',
+        afterCursor: '',
+        isInbetween: true,
+        line: 0,
+        column: 0,
+      },
+    };
+
+    jest.spyOn(editorUtils, 'getEditorView').mockReturnValue({} as any);
+    jest.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized')
+      .mockRejectedValue(new Error('stop after provider resolution'));
+
+    const modal = new InlineEditModal(app, plugin, editor, view, editContext, 'note.md');
+
+    await expect(modal.openAndWait()).resolves.toEqual({ decision: 'reject' });
+    expect(ProviderWorkspaceRegistry.ensureInitialized).toHaveBeenCalledWith(
+      plugin,
+      'codex',
+      'inline-edit',
+    );
+  });
+
+  it('uses an enabled settings provider when the active conversation provider is disabled', async () => {
+    const editor = {} as any;
+    const app = {} as any;
+    const plugin = {
+      settings: {
+        settingsProvider: 'codex',
+        providerConfigs: {
+          claude: { enabled: false },
+          codex: { enabled: true },
+        },
+      },
+      getConversationSync: jest.fn().mockReturnValue({
+        id: 'claude-conversation',
+        providerId: 'claude',
+        selectedModel: 'sonnet',
+      }),
+      getView: jest.fn().mockReturnValue({
+        getActiveTab: jest.fn().mockReturnValue({
+          conversationId: 'claude-conversation',
+          providerId: 'claude',
+          selectedModel: 'sonnet',
+        }),
+      }),
+    } as any;
+    plugin.providerHost = plugin;
+    const view = { editor } as any;
+    const editContext: InlineEditContext = {
+      mode: 'cursor',
+      cursorContext: {
+        beforeCursor: '',
+        afterCursor: '',
+        isInbetween: true,
+        line: 0,
+        column: 0,
+      },
+    };
+
+    jest.spyOn(editorUtils, 'getEditorView').mockReturnValue({} as any);
+    jest.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized')
+      .mockRejectedValue(new Error('stop after provider resolution'));
+
+    const modal = new InlineEditModal(app, plugin, editor, view, editContext, 'note.md');
+
+    await expect(modal.openAndWait()).resolves.toEqual({ decision: 'reject' });
+    expect(ProviderWorkspaceRegistry.ensureInitialized).toHaveBeenCalledWith(
+      plugin,
+      'codex',
+      'inline-edit',
     );
   });
 
@@ -219,6 +323,9 @@ describe('InlineEditModal - openAndWait', () => {
             claude: ['commit'],
             codex: ['analyze'],
           },
+          providerConfigs: {
+            codex: { enabled: true },
+          },
         },
         getConversationSync: jest.fn().mockReturnValue(null),
         getView: jest.fn().mockReturnValue({
@@ -230,6 +337,16 @@ describe('InlineEditModal - openAndWait', () => {
         }),
       } as any;
       plugin.providerHost = plugin;
+      jest.spyOn(ProviderWorkspaceRegistry, 'getCommandCatalog').mockReturnValue({
+        getDropdownConfig: jest.fn().mockReturnValue({
+          providerId: 'codex',
+          triggerChars: ['/', '$'],
+          builtInPrefix: '/',
+          skillPrefix: '$',
+          commandPrefix: '/',
+        }),
+        listDropdownEntries: jest.fn().mockResolvedValue([]),
+      } as any);
       const editor = {} as any;
       const view = { editor } as any;
 
@@ -288,6 +405,9 @@ describe('InlineEditModal - openAndWait', () => {
       );
       const constructorCall = SlashCommandDropdown.mock.calls[0];
       expect(Array.from(constructorCall[3].hiddenCommands)).toEqual(['analyze']);
+      expect(constructorCall[3].includeBuiltIns).toBe(false);
+      expect(constructorCall[3].providerDiscovery).toBeDefined();
+      expect(constructorCall[3].getProviderEntries).toBeUndefined();
 
       widgetRef?.reject();
       await expect(resultPromise).resolves.toEqual({ decision: 'reject' });
@@ -330,6 +450,12 @@ describe('InlineEditModal - openAndWait', () => {
           hiddenProviderCommands: {
             claude: [],
             opencode: [],
+          },
+          providerConfigs: {
+            opencode: {
+              enabled: true,
+              visibleModels: ['anthropic/claude-sonnet-4'],
+            },
           },
         },
         getConversationSync: jest.fn().mockReturnValue(null),
@@ -449,6 +575,9 @@ describe('InlineEditModal - openAndWait', () => {
           hiddenProviderCommands: {
             claude: [],
             opencode: [],
+          },
+          providerConfigs: {
+            opencode: { enabled: true },
           },
         },
         getConversationSync: jest.fn().mockReturnValue(conversation),

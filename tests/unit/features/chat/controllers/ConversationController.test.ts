@@ -1,8 +1,9 @@
-import { createMockEl } from '@test/helpers/mockElement';
-import { Menu, Notice } from 'obsidian';
+import { createMockEl } from '@test/helpers/MockElement';
+import { Menu, Notice, setIcon } from 'obsidian';
 
 import { ConversationController, type ConversationControllerDeps } from '@/features/chat/controllers/ConversationController';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { OPENAI_PROVIDER_ICON } from '@/shared/icons';
 import { confirm } from '@/shared/modals/ConfirmModal';
 
 jest.mock('@/shared/modals/ConfirmModal', () => ({
@@ -11,7 +12,18 @@ jest.mock('@/shared/modals/ConfirmModal', () => ({
 
 const mockNotice = Notice as jest.Mock;
 
-function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): ConversationControllerDeps {
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function createMockDeps(overrides: Record<string, unknown> = {}): ConversationControllerDeps {
   const state = new ChatState();
   const inputEl = { value: '', focus: jest.fn() } as unknown as HTMLTextAreaElement;
   const historyDropdown = createMockEl();
@@ -34,7 +46,7 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
         messages: [],
         sessionId: null,
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       }),
       switchConversation: jest.fn().mockResolvedValue({
         id: 'switched-conv',
@@ -42,7 +54,7 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
         messages: [],
         sessionId: null,
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       }),
       getConversationById: jest.fn().mockResolvedValue(null),
       getConversationSync: jest.fn().mockReturnValue(null),
@@ -93,8 +105,9 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
     getStatusPanel: () => ({
       remount: jest.fn(),
     }) as any,
+    getExecutionCoordinator: () => null,
     ...overrides,
-  };
+  } as ConversationControllerDeps;
 }
 
 describe('ConversationController', () => {
@@ -130,6 +143,7 @@ describe('ConversationController', () => {
       it('should save current conversation before creating new one', async () => {
         deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
         deps.state.currentConversationId = 'old-conv';
+        deps.state.hasPendingConversationSave = true;
 
         await controller.createNew();
 
@@ -158,6 +172,15 @@ describe('ConversationController', () => {
 
         expect(fileContextManager.resetForNewConversation).toHaveBeenCalled();
         expect(fileContextManager.autoAttachActiveFile).toHaveBeenCalled();
+      });
+
+      it('should recreate the branded welcome for a new conversation', async () => {
+        await controller.createNew();
+
+        const welcomeEl = deps.getWelcomeEl()!;
+        expect(welcomeEl.querySelector('.claudian-welcome-brand')?.textContent)
+          .toBe('Claudian');
+        expect(welcomeEl.querySelector('.claudian-welcome-greeting')).not.toBeNull();
       });
 
       it('should clear todos for new conversation', async () => {
@@ -206,6 +229,19 @@ describe('ConversationController', () => {
         await controller.switchTo('new-conv');
 
         expect(deps.clearQueuedMessage).toHaveBeenCalled();
+      });
+
+      it('does not touch session activity when switching away without pending messages', async () => {
+        deps.state.currentConversationId = 'old-conv';
+        deps.state.messages = [{ id: '1', role: 'user', content: 'Existing', timestamp: 1 }];
+        deps.state.hasPendingConversationSave = false;
+
+        await controller.switchTo('new-conv');
+
+        expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
+          'old-conv',
+          expect.any(Object),
+        );
       });
 
       it('should not switch while streaming', async () => {
@@ -316,16 +352,13 @@ describe('ConversationController', () => {
       const welcomeEl = deps.getWelcomeEl()!;
       const createDivSpy = jest.spyOn(welcomeEl, 'createDiv');
 
-      // First call should add greeting
       controller.initializeWelcome();
-      expect(createDivSpy).toHaveBeenCalledTimes(1);
+      const initialCallCount = createDivSpy.mock.calls.length;
+      expect(welcomeEl.querySelector('.claudian-welcome-brand')).not.toBeNull();
+      expect(welcomeEl.querySelector('.claudian-welcome-greeting')).not.toBeNull();
 
-      // Mock querySelector to return an element (greeting already exists)
-      welcomeEl.querySelector = jest.fn().mockReturnValue(createMockEl());
-
-      // Second call should not add another greeting
       controller.initializeWelcome();
-      expect(createDivSpy).toHaveBeenCalledTimes(1); // Still 1, not 2
+      expect(createDivSpy).toHaveBeenCalledTimes(initialCallCount);
     });
   });
 
@@ -404,7 +437,7 @@ describe('ConversationController', () => {
         messages: [],
         sessionId: null,
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       });
 
       await controller.save();
@@ -417,15 +450,10 @@ describe('ConversationController', () => {
       );
     });
 
-    it('should preserve the active runtime provider when lazily creating a conversation', async () => {
+    it('should preserve the active provider and selected model when lazily creating a conversation', async () => {
       deps = createMockDeps({
-        getAgentService: () => ({
-          providerId: 'codex',
-          getSessionId: jest.fn().mockReturnValue('session-codex'),
-          consumeSessionInvalidation: jest.fn().mockReturnValue(false),
-          buildSessionUpdates: jest.fn().mockReturnValue({ updates: {} }),
-          syncConversationState: jest.fn(),
-        }) as any,
+        getProviderId: () => 'codex',
+        getSelectedModel: () => 'gpt-5.1-codex',
       });
       controller = new ConversationController(deps);
       deps.state.currentConversationId = null;
@@ -438,18 +466,47 @@ describe('ConversationController', () => {
         messages: [],
         sessionId: 'session-codex',
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       });
 
       await controller.save();
 
       expect(deps.plugin.createConversation).toHaveBeenCalledWith({
         providerId: 'codex',
-        sessionId: 'session-codex',
+        selectedModel: 'gpt-5.1-codex',
       });
     });
 
-    it('should set lastResponseAt when updateLastResponse is true', async () => {
+    it('should include the active note when lazily creating a conversation', async () => {
+      const fileContextManager = deps.getFileContextManager()!;
+      (fileContextManager.getCurrentNotePath as jest.Mock).mockReturnValue(
+        'Projects/Plan.md',
+      );
+      deps.state.currentConversationId = null;
+      deps.state.messages = [
+        { id: '1', role: 'user', content: 'hello', timestamp: Date.now() },
+      ];
+      (deps.plugin.createConversation as jest.Mock).mockResolvedValue({
+        id: 'linked-conv',
+        title: 'New Conversation',
+        messages: [],
+        sessionId: null,
+        createdAt: Date.now(),
+        lastActivityAt: Date.now(),
+      });
+
+      await controller.save();
+
+      expect(deps.plugin.createConversation).toHaveBeenCalledWith(
+        expect.objectContaining({ currentNote: 'Projects/Plan.md' }),
+      );
+      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
+        'linked-conv',
+        expect.objectContaining({ currentNote: 'Projects/Plan.md' }),
+      );
+    });
+
+    it('should set lastActivityAt when updateLastActivity is true', async () => {
       deps.state.currentConversationId = 'conv-1';
       deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
 
@@ -459,12 +516,12 @@ describe('ConversationController', () => {
 
       const call = (deps.plugin.updateConversation as jest.Mock).mock.calls[0];
       const updates = call[1];
-      expect(updates.lastResponseAt).toBeDefined();
-      expect(updates.lastResponseAt).toBeGreaterThanOrEqual(beforeCall);
-      expect(updates.lastResponseAt).toBeLessThanOrEqual(Date.now());
+      expect(updates.lastActivityAt).toBeDefined();
+      expect(updates.lastActivityAt).toBeGreaterThanOrEqual(beforeCall);
+      expect(updates.lastActivityAt).toBeLessThanOrEqual(Date.now());
     });
 
-    it('should NOT clear resumeAtMessageId when updateLastResponse is true (caller must pass extraUpdates)', async () => {
+    it('should NOT clear resumeAtMessageId when updateLastActivity is true (caller must pass options)', async () => {
       deps.state.currentConversationId = 'conv-1';
       deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
 
@@ -627,8 +684,8 @@ describe('ConversationController', () => {
     describe('updateHistoryDropdown with conversations', () => {
       it('should render conversation items when conversations exist', () => {
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'First Conversation', createdAt: 1000, lastResponseAt: 3000 },
-          { id: 'conv-2', title: 'Second Conversation', createdAt: 2000, lastResponseAt: 2000 },
+          { id: 'conv-1', title: 'First Conversation', createdAt: 1000, lastActivityAt: 3000 },
+          { id: 'conv-2', title: 'Second Conversation', createdAt: 2000, lastActivityAt: 2000 },
         ]);
 
         controller.updateHistoryDropdown();
@@ -648,11 +705,11 @@ describe('ConversationController', () => {
         expect(list.children[0].hasClass('claudian-history-empty')).toBe(true);
       });
 
-      it('should sort conversations by lastResponseAt descending', () => {
+      it('should sort conversations by lastActivityAt descending', () => {
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-old', title: 'Old', createdAt: 1000, lastResponseAt: 1000 },
-          { id: 'conv-new', title: 'New', createdAt: 2000, lastResponseAt: 5000 },
-          { id: 'conv-mid', title: 'Mid', createdAt: 3000, lastResponseAt: 3000 },
+          { id: 'conv-old', title: 'Old', createdAt: 1000, lastActivityAt: 1000 },
+          { id: 'conv-new', title: 'New', createdAt: 2000, lastActivityAt: 5000 },
+          { id: 'conv-mid', title: 'Mid', createdAt: 3000, lastActivityAt: 3000 },
         ]);
 
         controller.updateHistoryDropdown();
@@ -662,12 +719,40 @@ describe('ConversationController', () => {
         expect(firstTitle?.textContent).toBe('New');
       });
 
+      it('uses the same activity ordering in the single-mode history surface', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'metadata-newer',
+            title: 'Metadata newer',
+            createdAt: 1,
+            lastActivityAt: 100,
+          },
+          {
+            id: 'response-newer',
+            title: 'Response newer',
+            createdAt: 2,
+            lastActivityAt: 200,
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+        });
+
+        const titles = container.querySelectorAll('.claudian-history-item-title');
+        expect(titles.map((title: { textContent: string }) => title.textContent)).toEqual([
+          'Response newer',
+          'Metadata newer',
+        ]);
+      });
+
       it('should mark current conversation as active', () => {
         deps.state.currentConversationId = 'conv-1';
 
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 1000 },
-          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 2000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 1000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 2000 },
         ]);
 
         controller.updateHistoryDropdown();
@@ -680,7 +765,7 @@ describe('ConversationController', () => {
 
       it('should show loading indicator for pending title generation', () => {
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Generating...', createdAt: 1000, lastResponseAt: 1000, titleGenerationStatus: 'pending' },
+          { id: 'conv-1', title: 'Generating...', createdAt: 1000, lastActivityAt: 1000, titleGenerationStatus: 'pending' },
         ]);
 
         controller.updateHistoryDropdown();
@@ -693,7 +778,7 @@ describe('ConversationController', () => {
 
       it('should show regenerate button for failed title generation', () => {
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Fallback Title', createdAt: 1000, lastResponseAt: 1000, titleGenerationStatus: 'failed' },
+          { id: 'conv-1', title: 'Fallback Title', createdAt: 1000, lastActivityAt: 1000, titleGenerationStatus: 'failed' },
         ]);
 
         controller.updateHistoryDropdown();
@@ -710,7 +795,7 @@ describe('ConversationController', () => {
         deps.state.currentConversationId = 'conv-1';
 
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 1000 },
         ]);
 
         controller.updateHistoryDropdown();
@@ -726,14 +811,14 @@ describe('ConversationController', () => {
         deps.state.currentConversationId = 'conv-1';
 
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.updateHistoryDropdown();
 
         const list = dropdown.children[1];
-        // conv-2 is the non-current one (sorted second by lastResponseAt)
+        // conv-2 is the non-current one (sorted second by lastActivityAt)
         const otherItem = list.children[1];
         const content = otherItem.querySelector('.claudian-history-item-content');
         const listeners = content?._eventListeners?.get('click');
@@ -745,7 +830,7 @@ describe('ConversationController', () => {
         deps.state.isStreaming = true;
 
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Test', createdAt: 1000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Test', createdAt: 1000, lastActivityAt: 1000 },
         ]);
 
         controller.updateHistoryDropdown();
@@ -764,17 +849,819 @@ describe('ConversationController', () => {
     });
 
     describe('renderHistoryDropdown', () => {
+      it('labels the conversation selector as Sessions', () => {
+        const container = createMockEl();
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+        });
+
+        expect(container.children[0].children[0].textContent).toBe('Sessions');
+      });
+
       it('should render history items to provided container', () => {
         const container = createMockEl();
         const onSelectConversation = jest.fn();
 
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Test', createdAt: 1000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Test', createdAt: 1000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, { onSelectConversation });
 
         expect(container.children.length).toBe(2); // header + list
+      });
+
+      it('partitions pinned sessions into a dedicated dual-mode section', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'normal', title: 'Normal', createdAt: 2, lastActivityAt: 2 },
+          { id: 'pinned-old', title: 'Pinned old', createdAt: 1, lastActivityAt: 1, isPinned: true },
+          { id: 'pinned-new', title: 'Pinned new', createdAt: 3, lastActivityAt: 3, isPinned: true },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          sort: 'last-updated',
+        });
+
+        const pinnedSection = container.querySelector('.claudian-history-section--pinned')!;
+        const sessionsSection = container.querySelector('.claudian-history-section--sessions')!;
+        expect(pinnedSection.querySelector('.claudian-history-section-label')?.textContent)
+          .toBe('Pinned');
+        expect(sessionsSection.querySelector('.claudian-history-section-label')?.textContent)
+          .toBe('Sessions');
+        expect(pinnedSection.querySelectorAll('.claudian-history-item-title')
+          .map((el: { textContent: string }) => el.textContent))
+          .toEqual(['Pinned new', 'Pinned old']);
+        expect(sessionsSection.querySelectorAll('.claudian-history-item-title')
+          .map((el: { textContent: string }) => el.textContent))
+          .toEqual(['Normal']);
+      });
+
+      it('moves pinned note groups above standalone pinned sessions without duplication', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'note-regular',
+            title: 'Note regular',
+            createdAt: 4,
+            lastActivityAt: 4,
+            currentNote: 'Projects/Plan.md',
+          },
+          {
+            id: 'note-pinned-session',
+            title: 'Note pinned session',
+            createdAt: 3,
+            lastActivityAt: 3,
+            currentNote: 'Projects/Plan.md',
+            isPinned: true,
+          },
+          {
+            id: 'standalone',
+            title: 'Standalone pinned',
+            createdAt: 2,
+            lastActivityAt: 2,
+            isPinned: true,
+          },
+          {
+            id: 'regular',
+            title: 'Regular',
+            createdAt: 1,
+            lastActivityAt: 1,
+            currentNote: 'Projects/Other.md',
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          organization: 'linked-note',
+          sort: 'last-updated',
+          language: 'en',
+          noteExists: () => true,
+          pinnedLinkedNotePaths: new Set([
+            'Projects/Plan.md',
+            'Projects/Empty.md',
+          ]),
+        });
+
+        const pinnedSection = container.querySelector('.claudian-history-section--pinned')!;
+        const pinnedHeaders = pinnedSection.querySelectorAll('.claudian-session-group-header');
+        expect(pinnedHeaders.map((header: any) => header.getAttribute('data-note-path'))).toEqual([
+          'Projects/Plan.md',
+          'Projects/Empty.md',
+        ]);
+        expect(pinnedSection.querySelectorAll('.claudian-session-group-body')[0]
+          .querySelectorAll('.claudian-history-item-title')
+          .map((item: any) => item.textContent))
+          .toEqual(['Note regular', 'Note pinned session']);
+        expect(pinnedSection.querySelectorAll('.claudian-history-item-title')
+          .map((item: any) => item.textContent))
+          .toEqual(['Note regular', 'Note pinned session', 'Standalone pinned']);
+
+        const sessionsSection = container.querySelector('.claudian-history-section--sessions')!;
+        expect(sessionsSection.querySelectorAll('.claudian-history-item-title')
+          .map((item: any) => item.textContent))
+          .toEqual(['Regular']);
+        expect(container.querySelectorAll('.claudian-history-item').filter((item: any) => (
+          item.getAttribute('data-conversation-id') === 'note-pinned-session'
+        ))).toHaveLength(1);
+      });
+
+      it('offers note pinning from linked-note header context menus', async () => {
+        const container = createMockEl();
+        const onSetLinkedNotePinned = jest.fn().mockResolvedValue(undefined);
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'plan',
+            title: 'Plan session',
+            createdAt: 2,
+            currentNote: 'Projects/Plan.md',
+          },
+          {
+            id: 'other',
+            title: 'Other session',
+            createdAt: 1,
+            currentNote: 'Projects/Other.md',
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          organization: 'linked-note',
+          sort: 'created',
+          language: 'en',
+          noteExists: () => true,
+          pinnedLinkedNotePaths: new Set(['Projects/Plan.md']),
+          onSetLinkedNotePinned,
+        });
+
+        const groupHeaders = container.querySelectorAll('.claudian-session-group-header');
+        const pinnedHeader = groupHeaders.find((header: any) => (
+          header.getAttribute('data-note-path') === 'Projects/Plan.md'
+        ))!;
+        pinnedHeader.dispatchEvent({
+          type: 'contextmenu',
+          preventDefault: jest.fn(),
+          stopPropagation: jest.fn(),
+        });
+        let menu = (Menu as typeof Menu & {
+          instances: Array<{ items: Array<{ title: string; clickHandler: (() => void) | null }> }>;
+        }).instances.at(-1)!;
+        expect(menu.items.map(item => item.title)).toEqual(['Unpin linked note']);
+        menu.items[0].clickHandler?.();
+        await Promise.resolve();
+        expect(onSetLinkedNotePinned).toHaveBeenCalledWith('Projects/Plan.md', false);
+
+        const regularHeader = groupHeaders.find((header: any) => (
+          header.getAttribute('data-note-path') === 'Projects/Other.md'
+        ))!;
+        regularHeader.dispatchEvent({
+          type: 'contextmenu',
+          preventDefault: jest.fn(),
+          stopPropagation: jest.fn(),
+        });
+        menu = (Menu as typeof Menu & {
+          instances: Array<{ items: Array<{ title: string; clickHandler: (() => void) | null }> }>;
+        }).instances.at(-1)!;
+        expect(menu.items.map(item => item.title)).toEqual(['Pin linked note']);
+        menu.items[0].clickHandler?.();
+        await Promise.resolve();
+        expect(onSetLinkedNotePinned).toHaveBeenCalledWith('Projects/Other.md', true);
+      });
+
+      it('uses a DOM menu and archives non-running sessions from a linked-note header', async () => {
+        const container = createMockEl();
+        const onSetConversationsArchived = jest.fn().mockResolvedValue(undefined);
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'ready',
+            title: 'Ready session',
+            createdAt: 3,
+            currentNote: 'Projects/Plan.md',
+          },
+          {
+            id: 'running',
+            title: 'Running session',
+            createdAt: 2,
+            currentNote: 'Projects/Plan.md',
+          },
+          {
+            id: 'hidden',
+            title: 'Hidden session',
+            createdAt: 1,
+            currentNote: 'Projects/Plan.md',
+          },
+          {
+            id: 'busy',
+            title: 'Busy session',
+            createdAt: 0,
+            currentNote: 'Projects/Busy.md',
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          organization: 'linked-note',
+          sessionActionMode: 'active',
+          searchQuery: 'ready',
+          getConversationStatus: id => ({
+            openState: 'closed',
+            isRunning: id === 'running' || id === 'busy',
+          }),
+          onSetLinkedNotePinned: jest.fn().mockResolvedValue(undefined),
+          onSetConversationsArchived,
+        });
+
+        const groupHeaders = container.querySelectorAll('.claudian-session-group-header');
+        const planHeader = groupHeaders.find((header: any) => (
+          header.getAttribute('data-note-path') === 'Projects/Plan.md'
+        ))!;
+        planHeader.dispatchEvent({
+          type: 'contextmenu',
+          preventDefault: jest.fn(),
+          stopPropagation: jest.fn(),
+        });
+        let menu = (Menu as typeof Menu & {
+          instances: Array<{
+            items: Array<{
+              title: string;
+              disabled: boolean;
+              clickHandler: (() => void) | null;
+            }>;
+            useNativeMenu: boolean | null;
+          }>;
+        }).instances.at(-1)!;
+        expect(menu.useNativeMenu).toBe(false);
+        expect(menu.items.map(item => item.title)).toEqual([
+          'Pin linked note',
+          'Archive all sessions',
+        ]);
+        expect(menu.items[1].disabled).toBe(false);
+        menu.items[1].clickHandler?.();
+        await Promise.resolve();
+        expect(onSetConversationsArchived).toHaveBeenCalledWith(['ready', 'hidden']);
+
+        const busyContainer = createMockEl();
+        controller.renderHistoryDropdown(busyContainer, {
+          onSelectConversation: jest.fn(),
+          organization: 'linked-note',
+          sessionActionMode: 'active',
+          searchQuery: 'busy',
+          getConversationStatus: id => ({
+            openState: 'closed',
+            isRunning: id === 'running' || id === 'busy',
+          }),
+          onSetLinkedNotePinned: jest.fn().mockResolvedValue(undefined),
+          onSetConversationsArchived,
+        });
+        const busyHeader = busyContainer.querySelector('.claudian-session-group-header')!;
+        busyHeader.dispatchEvent({
+          type: 'contextmenu',
+          preventDefault: jest.fn(),
+          stopPropagation: jest.fn(),
+        });
+        menu = (Menu as typeof Menu & {
+          instances: Array<{
+            items: Array<{
+              title: string;
+              disabled: boolean;
+              clickHandler: (() => void) | null;
+            }>;
+            useNativeMenu: boolean | null;
+          }>;
+        }).instances.at(-1)!;
+        expect(menu.items[1].disabled).toBe(true);
+        expect(menu.items[1].clickHandler).toBeNull();
+      });
+
+      it('renders dual-mode sessions on one row with metadata in a hover card', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([{
+          id: 'session-1',
+          providerId: 'codex',
+          selectedModel: 'gpt-5.1-codex',
+          title: 'Review architecture',
+          createdAt: 1_000,
+          lastActivityAt: 2_000,
+          currentNote: 'Projects/Architecture.md',
+        }]);
+        jest.spyOn(controller, 'formatMetadataDate').mockReturnValue('Aug 3, 2026');
+        jest.spyOn(controller, 'formatMetadataDateTime').mockReturnValue('Aug 5, 2026, 14:28');
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showMetadataPopover: true,
+          getProviderIcon: () => OPENAI_PROVIDER_ICON,
+          getModelLabel: () => 'GPT-5.1 Codex',
+        });
+
+        const item = container.querySelector('.claudian-history-item')!;
+        item.getBoundingClientRect = jest.fn().mockReturnValue({
+          top: 120,
+          left: 20,
+          width: 200,
+          height: 28,
+          right: 220,
+          bottom: 148,
+          x: 20,
+          y: 120,
+          toJSON: jest.fn(),
+        });
+        const body = createMockEl();
+        Object.defineProperty(item.ownerDocument, 'body', {
+          configurable: true,
+          value: body,
+        });
+        const content = item.querySelector('.claudian-history-item-content')!;
+        expect(item.getAttribute('tabindex')).toBeNull();
+        expect(item.getAttribute('role')).toBeNull();
+        expect(content.getAttribute('tabindex')).toBe('0');
+        expect(content.getAttribute('role')).toBe('button');
+        expect(item.querySelector('.claudian-history-item-date')).toBeNull();
+
+        item.dispatchEvent({ type: 'mouseenter' });
+
+        const popover = body.querySelector('.claudian-session-metadata-popover')!;
+        expect(popover.getAttribute('role')).toBe('tooltip');
+        expect(popover.querySelectorAll('.claudian-session-metadata-label')
+          .map((label: { textContent: string }) => label.textContent))
+          .toEqual(['Created', 'Last active']);
+        expect(popover.querySelectorAll('.claudian-session-metadata-value')
+          .map((value: { textContent: string }) => value.textContent))
+          .toEqual([
+            'Architecture',
+            'GPT-5.1 Codex',
+            'Aug 3, 2026',
+            'Aug 5, 2026, 14:28',
+          ]);
+        expect(popover.querySelector('.claudian-session-metadata-provider-icon'))
+          .not.toBeNull();
+        expect(popover.style.top).toBe('120px');
+        const noteValue = popover.querySelector(
+          '.claudian-session-metadata-value--note',
+        )!;
+        expect(noteValue.getAttribute('title')).toBe('Projects/Architecture.md');
+
+        content.dispatchEvent({
+          type: 'keydown',
+          key: 'Escape',
+          stopPropagation: jest.fn(),
+        });
+        expect(popover.hasClass('claudian-hidden')).toBe(true);
+
+        content.dispatchEvent({ type: 'focusin' });
+        expect(body.querySelectorAll('.claudian-session-metadata-popover'))
+          .toHaveLength(2);
+      });
+
+      it.each(['Enter', ' '])('opens a focusable dual-mode session with %s', async (key) => {
+        const container = createMockEl();
+        const onSelectConversation = jest.fn().mockResolvedValue(undefined);
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([{
+          id: 'session-1',
+          providerId: 'claude',
+          title: 'Keyboard session',
+          createdAt: 1_000,
+          lastActivityAt: 2_000,
+        }]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation,
+          showMetadataPopover: true,
+        });
+
+        const item = container.querySelector('.claudian-history-item')!;
+        const content = item.querySelector('.claudian-history-item-content')!;
+        const preventDefault = jest.fn();
+        const stopPropagation = jest.fn();
+        expect(item.getAttribute('role')).toBeNull();
+        expect(content.getAttribute('role')).toBe('button');
+
+        content.dispatchEvent({
+          type: 'keydown',
+          key,
+          target: content,
+          preventDefault,
+          stopPropagation,
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(preventDefault).toHaveBeenCalledTimes(1);
+        expect(stopPropagation).toHaveBeenCalledTimes(1);
+        expect(onSelectConversation).toHaveBeenCalledWith('session-1');
+      });
+
+      it('omits the note metadata row for unlinked sessions', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([{
+          id: 'session-1',
+          providerId: 'codex',
+          selectedModel: 'gpt-5.1-codex',
+          title: 'Review architecture',
+          createdAt: 1_000,
+          lastActivityAt: 2_000,
+        }]);
+        jest.spyOn(controller, 'formatMetadataDate').mockReturnValue('Aug 3, 2026');
+        jest.spyOn(controller, 'formatMetadataDateTime').mockReturnValue('Aug 5, 2026, 14:28');
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showMetadataPopover: true,
+          getProviderIcon: () => OPENAI_PROVIDER_ICON,
+          getModelLabel: () => 'GPT-5.1 Codex',
+        });
+
+        const item = container.querySelector('.claudian-history-item')!;
+        const body = createMockEl();
+        Object.defineProperty(item.ownerDocument, 'body', {
+          configurable: true,
+          value: body,
+        });
+
+        item.dispatchEvent({ type: 'mouseenter' });
+
+        const popover = body.querySelector('.claudian-session-metadata-popover')!;
+        expect(popover.querySelectorAll('.claudian-session-metadata-row')).toHaveLength(3);
+        expect(popover.querySelectorAll('.claudian-session-metadata-value')
+          .map((value: { textContent: string }) => value.textContent))
+          .toEqual(['GPT-5.1 Codex', 'Aug 3, 2026', 'Aug 5, 2026, 14:28']);
+      });
+
+      it('hides the pinned section when no sessions are pinned', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'normal', title: 'Normal', createdAt: 1 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+        });
+
+        expect(container.querySelector('.claudian-history-section--pinned')).toBeNull();
+        expect(container.querySelector('.claudian-history-section--sessions')).not.toBeNull();
+      });
+
+      it('marks attention rows for title animation without session action buttons', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'review-pinned',
+            title: 'Pinned review',
+            createdAt: 4,
+            isPinned: true,
+          },
+          { id: 'action', title: 'Action required', createdAt: 3 },
+          { id: 'review', title: 'Review later', createdAt: 2 },
+          { id: 'normal', title: 'Normal', createdAt: 1 },
+        ]);
+        const attentionById = new Map([
+          ['review-pinned', { kind: 'review' as const, since: 300 }],
+          ['action', { kind: 'action-required' as const, since: 100 }],
+          ['review', { kind: 'review' as const, since: 200 }],
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          getConversationStatus: id => ({
+            attention: attentionById.get(id) ?? null,
+            isRunning: false,
+            openState: 'open',
+          }),
+          onSelectConversation: jest.fn(),
+          sessionActionMode: 'active',
+          onSetConversationPinned: jest.fn().mockResolvedValue(undefined),
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+          showAttentionState: true,
+          showPinnedSection: true,
+        });
+
+        expect(container.querySelector('.claudian-history-section--attention')).toBeNull();
+        expect(container.querySelectorAll('.claudian-history-item')).toHaveLength(4);
+        const attentionItems = container.querySelectorAll('.claudian-history-item--attention');
+        expect(attentionItems).toHaveLength(3);
+        expect(container.querySelector('.claudian-session-attention-indicator')).toBeNull();
+        for (const item of attentionItems) {
+          expect(item.querySelector('.claudian-pin-btn')).toBeNull();
+          expect(item.querySelector('.claudian-archive-btn')).toBeNull();
+        }
+        const normalItem = container.querySelectorAll('.claudian-history-item').find(
+          (item: HTMLElement) => item.getAttribute('data-conversation-id') === 'normal',
+        )!;
+        expect(normalItem.querySelector('.claudian-pin-btn')).not.toBeNull();
+        expect(normalItem.querySelector('.claudian-archive-btn')).not.toBeNull();
+      });
+
+      it('does not mark archived rows for attention presentation', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'archived', title: 'Archived', createdAt: 1, isArchived: true },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          getConversationStatus: () => ({
+            attention: { kind: 'action-required', since: 1 },
+            isRunning: false,
+            openState: 'open',
+          }),
+          onSelectConversation: jest.fn(),
+          sessionScope: 'archived',
+          showArchivedSection: true,
+          showAttentionState: false,
+        });
+
+        expect(container.querySelector('.claudian-history-item--attention')).toBeNull();
+      });
+
+      it('renders active session management actions without archived sessions', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'active', title: 'Active', createdAt: 2 },
+          { id: 'archived', title: 'Archived', createdAt: 1, isArchived: true },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          sessionScope: 'active',
+          sessionActionMode: 'active',
+          onSetConversationPinned: jest.fn().mockResolvedValue(undefined),
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+        });
+
+        expect(container.querySelectorAll('.claudian-history-item-title')
+          .map((el: { textContent: string }) => el.textContent))
+          .toEqual(['Active']);
+        expect(container.querySelector('.claudian-pin-btn')).not.toBeNull();
+        expect(container.querySelector('.claudian-archive-btn')).not.toBeNull();
+        expect(container.querySelector('.claudian-delete-btn')).toBeNull();
+        expect(container.querySelectorAll('.claudian-action-btn').some(
+          (button: { getAttribute(name: string): string | null | undefined }) => (
+            button.getAttribute('aria-label') === 'Rename'
+          ),
+        )).toBe(false);
+      });
+
+      it('filters the current session scope by title and linked-note path', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'active-title',
+            title: 'Roadmap review',
+            createdAt: 4,
+            lastActivityAt: 4,
+          },
+          {
+            id: 'active-note',
+            title: 'Planning notes',
+            currentNote: 'Projects/Roadmap.md',
+            createdAt: 3,
+            lastActivityAt: 3,
+          },
+          {
+            id: 'active-other',
+            title: 'Other',
+            createdAt: 2,
+            lastActivityAt: 2,
+          },
+          {
+            id: 'archived-match',
+            title: 'Archived roadmap',
+            createdAt: 1,
+            lastActivityAt: 1,
+            isArchived: true,
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          sessionScope: 'active',
+          searchQuery: 'ROADMAP',
+        });
+
+        expect(container.querySelectorAll('.claudian-history-item-title')
+          .map((el: { textContent: string }) => el.textContent))
+          .toEqual(['Roadmap review', 'Planning notes']);
+      });
+
+      it('shows a search-specific empty state within the archived scope', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'archived', title: 'Archived', createdAt: 1, isArchived: true },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showArchivedSection: true,
+          sessionScope: 'archived',
+          searchQuery: 'missing',
+        });
+
+        expect(container.querySelector('.claudian-history-empty')?.textContent)
+          .toBe('No matching sessions');
+      });
+
+      it('renders archived sessions with restore and delete actions only', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'active', title: 'Active', createdAt: 2 },
+          { id: 'archived', title: 'Archived', createdAt: 1, isArchived: true },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showArchivedSection: true,
+          sessionScope: 'archived',
+          sessionActionMode: 'archived',
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+        });
+
+        expect(container.querySelector('.claudian-history-section-label')?.textContent)
+          .toBe('Archived');
+        expect(container.querySelectorAll('.claudian-history-item-title')
+          .map((el: { textContent: string }) => el.textContent))
+          .toEqual(['Archived']);
+        expect(container.querySelector('.claudian-restore-btn')).not.toBeNull();
+        expect(container.querySelector('.claudian-delete-btn')).not.toBeNull();
+        expect(container.querySelector('.claudian-pin-btn')).toBeNull();
+        expect(container.querySelector('.claudian-archive-btn')).toBeNull();
+      });
+
+      it('disables archive actions for running sessions', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'running', title: 'Running', createdAt: 1 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          sessionScope: 'active',
+          sessionActionMode: 'active',
+          getConversationStatus: () => ({ openState: 'current', isRunning: true }),
+          onSetConversationPinned: jest.fn().mockResolvedValue(undefined),
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+        });
+
+        const archiveButton = container.querySelector('.claudian-archive-btn')!;
+        expect(archiveButton.getAttribute('disabled')).not.toBeNull();
+        expect(archiveButton.getAttribute('aria-label'))
+          .toBe('Cannot archive a running session');
+      });
+
+      it('uses the same linked-note grouping and sorting for archived sessions', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'archived-b',
+            title: 'Second',
+            createdAt: 2,
+            currentNote: 'Projects/B.md',
+            isArchived: true,
+          },
+          {
+            id: 'archived-a',
+            title: 'First',
+            createdAt: 1,
+            currentNote: 'Projects/A.md',
+            isArchived: true,
+          },
+          { id: 'active', title: 'Active', createdAt: 3 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showArchivedSection: true,
+          sessionScope: 'archived',
+          sessionActionMode: 'archived',
+          organization: 'linked-note',
+          sort: 'created',
+          language: 'en',
+          noteExists: () => true,
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+        });
+
+        expect(container.querySelectorAll('.claudian-session-group-label')
+          .map((el: { textContent: string }) => el.textContent))
+          .toEqual(['B', 'A']);
+      });
+
+      it('renders full-path note groups only for the linked-note organization', () => {
+        const container = createMockEl();
+        const onGroupCollapseChange = jest.fn();
+        const onGroupKeysChange = jest.fn();
+        const onStartLinkedNoteConversation = jest.fn().mockResolvedValue(undefined);
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'plan-a',
+            title: 'Plan A',
+            createdAt: 3,
+            currentNote: 'Projects/A/Plan.md',
+          },
+          {
+            id: 'plan-b',
+            title: 'Plan B',
+            createdAt: 2,
+            currentNote: 'Projects/B/Plan.md',
+          },
+          {
+            id: 'untitled',
+            title: 'Draft discussion',
+            createdAt: 1,
+            currentNote: 'Inbox/Untitled 2.md',
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          organization: 'linked-note',
+          sort: 'created',
+          language: 'en',
+          noteExists: () => true,
+          onGroupCollapseChange,
+          onGroupKeysChange,
+          onStartLinkedNoteConversation,
+        });
+
+        const labels = container
+          .querySelectorAll('.claudian-session-group-label')
+          .map((label: { textContent: string }) => label.textContent);
+        expect(labels).toEqual(['Plan', 'Plan', 'Unlinked']);
+        expect(labels).not.toContain('Untitled 2');
+        const groupHeaders = container.querySelectorAll('.claudian-session-group-header');
+        expect(groupHeaders[0].getAttribute('title')).toBe('Projects/A/Plan.md');
+        expect(groupHeaders[1].getAttribute('title')).toBe('Projects/B/Plan.md');
+        const groupIcons = container.querySelectorAll('.claudian-session-group-icon');
+        expect(groupIcons).toHaveLength(3);
+        expect(setIcon).toHaveBeenCalledWith(groupIcons[0], 'file-text');
+        expect(setIcon).toHaveBeenCalledWith(groupIcons[1], 'file-text');
+        expect(setIcon).toHaveBeenCalledWith(groupIcons[2], 'inbox');
+        const linkedNoteActions = container.querySelectorAll(
+          '.claudian-session-group-new-action',
+        );
+        expect(linkedNoteActions).toHaveLength(2);
+        expect(linkedNoteActions[0].tagName).toBe('SPAN');
+        expect(linkedNoteActions[0].getAttribute('role')).toBe('button');
+        expect(linkedNoteActions[0].getAttribute('tabindex')).toBe('0');
+        expect(setIcon).toHaveBeenCalledWith(linkedNoteActions[0], 'square-pen');
+        expect(linkedNoteActions[0].getAttribute('aria-label'))
+          .toBe('New chat for Plan');
+        const stopPropagation = jest.fn();
+        linkedNoteActions[0].dispatchEvent({ type: 'click', stopPropagation });
+        expect(stopPropagation).toHaveBeenCalledTimes(1);
+        expect(onStartLinkedNoteConversation).toHaveBeenCalledWith(
+          'Projects/A/Plan.md',
+        );
+        expect(groupHeaders[0].getAttribute('aria-expanded')).toBe('true');
+        expect(onGroupKeysChange).toHaveBeenCalledWith([
+          'note:Projects/A/Plan.md',
+          'note:Projects/B/Plan.md',
+          'ungrouped',
+        ]);
+        expect(groupHeaders[0].getAttribute('role')).toBe('button');
+        expect(groupHeaders[0].getAttribute('aria-expanded')).toBe('true');
+        const groupBodies = container.querySelectorAll('.claudian-session-group-body');
+        expect(groupBodies).toHaveLength(3);
+
+        groupHeaders[0].click();
+
+        expect(groupHeaders[0].getAttribute('aria-expanded')).toBe('false');
+        expect(groupBodies[0].hasClass('claudian-session-group-body--collapsed')).toBe(true);
+        expect(onGroupCollapseChange).toHaveBeenCalledWith(
+          'note:Projects/A/Plan.md',
+          true,
+        );
+        expect(container.querySelectorAll('.claudian-history-item')).toHaveLength(3);
+      });
+
+      it('delegates rerendering after deletion when the surface owner provides a callback', async () => {
+        const container = createMockEl();
+        const onRerender = jest.fn();
+
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Test', createdAt: 1000, lastActivityAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          onRerender,
+        });
+
+        const deleteBtn = container.querySelector('.claudian-delete-btn');
+        const clickHandlers = deleteBtn?._eventListeners?.get('click');
+        expect(clickHandlers).toBeDefined();
+
+        clickHandlers![0]({ stopPropagation: jest.fn() });
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(deps.plugin.deleteConversation).toHaveBeenCalledWith('conv-1');
+        expect(onRerender).toHaveBeenCalledTimes(1);
       });
 
       it('paginates large history lists and loads the next bounded page on demand', () => {
@@ -803,6 +1690,291 @@ describe('ConversationController', () => {
         expect(list.querySelector('.claudian-history-load-more')).not.toBeNull();
       });
 
+      it('keeps pagination bounded across pinned and regular dual-mode sessions', () => {
+        const container = createMockEl();
+        const onRerender = jest.fn();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          ...Array.from({ length: 20 }, (_, index) => ({
+            id: `pinned-${index}`,
+            title: `Pinned ${index}`,
+            createdAt: 100 - index,
+            isPinned: true,
+          })),
+          ...Array.from({ length: 20 }, (_, index) => ({
+            id: `regular-${index}`,
+            title: `Regular ${index}`,
+            createdAt: 50 - index,
+          })),
+        ]);
+
+        const options = {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          pageSize: 25,
+          preserveListState: true,
+          onRerender,
+        };
+        controller.renderHistoryDropdown(container, options);
+
+        let list = container.querySelector('.claudian-history-list')!;
+        expect(list.querySelectorAll('.claudian-history-item')).toHaveLength(25);
+        expect(list.querySelector('.claudian-history-load-more')).not.toBeNull();
+
+        list.querySelector('.claudian-history-load-more')!.click();
+        expect(onRerender).toHaveBeenCalledTimes(1);
+        expect(list.dataset.visibleCount).toBe('50');
+        expect(list.querySelectorAll('.claudian-history-item')).toHaveLength(25);
+
+        controller.renderHistoryDropdown(container, options);
+        list = container.querySelector('.claudian-history-list')!;
+        expect(list.querySelectorAll('.claudian-history-item')).toHaveLength(40);
+        expect(list.querySelector('.claudian-history-load-more')).toBeNull();
+      });
+
+      it('preserves grouped-list position and loaded count across an external rerender', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue(
+          Array.from({ length: 75 }, (_, index) => ({
+            id: `conv-${index}`,
+            title: `Conversation ${index}`,
+            createdAt: 75 - index,
+            currentNote: 'Projects/Plan.md',
+          })),
+        );
+        const options = {
+          onSelectConversation: jest.fn(),
+          organization: 'linked-note' as const,
+          sort: 'last-updated' as const,
+          language: 'en',
+          pageSize: 25,
+          preserveListState: true,
+        };
+
+        controller.renderHistoryDropdown(container, options);
+        container.querySelector('.claudian-history-load-more')?.click();
+        const previousList = container.querySelector('.claudian-history-list')!;
+        previousList.scrollTop = 320;
+
+        controller.renderHistoryDropdown(container, options);
+
+        const rerenderedList = container.querySelector('.claudian-history-list')!;
+        expect(rerenderedList.querySelectorAll('.claudian-history-item')).toHaveLength(50);
+        expect(rerenderedList.scrollTop).toBe(320);
+      });
+
+      it('preserves flat session-list position and loaded count across an external rerender', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue(
+          Array.from({ length: 75 }, (_, index) => ({
+            id: `conv-${index}`,
+            title: `Conversation ${index}`,
+            createdAt: 75 - index,
+          })),
+        );
+        const options = {
+          onSelectConversation: jest.fn(),
+          organization: 'list' as const,
+          sort: 'last-updated' as const,
+          pageSize: 25,
+          preserveListState: true,
+        };
+
+        controller.renderHistoryDropdown(container, options);
+        container.querySelector('.claudian-history-load-more')?.click();
+        const previousList = container.querySelector('.claudian-history-list')!;
+        previousList.scrollTop = 320;
+
+        controller.renderHistoryDropdown(container, options);
+
+        const rerenderedList = container.querySelector('.claudian-history-list')!;
+        expect(rerenderedList.querySelectorAll('.claudian-history-item')).toHaveLength(50);
+        expect(rerenderedList.scrollTop).toBe(320);
+      });
+
+      it('preserves the loaded session count through an empty search result', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue(
+          Array.from({ length: 75 }, (_, index) => ({
+            id: `conv-${index}`,
+            title: `Conversation ${index}`,
+            createdAt: 75 - index,
+          })),
+        );
+        const options = {
+          onSelectConversation: jest.fn(),
+          pageSize: 25,
+          preserveListState: true,
+          showPinnedSection: true,
+        };
+
+        controller.renderHistoryDropdown(container, options);
+        container.querySelector('.claudian-history-load-more')?.click();
+        controller.renderHistoryDropdown(container, options);
+        expect(container.querySelectorAll('.claudian-history-item')).toHaveLength(50);
+
+        controller.renderHistoryDropdown(container, {
+          ...options,
+          searchQuery: 'missing',
+        });
+        expect(container.querySelector('.claudian-history-list')?.dataset.visibleCount).toBe('50');
+
+        controller.renderHistoryDropdown(container, options);
+        expect(container.querySelectorAll('.claudian-history-item')).toHaveLength(50);
+      });
+
+      it('preserves dual-mode pinned and session scroll positions across a rerender', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'pinned', title: 'Pinned', createdAt: 100, isPinned: true },
+          ...Array.from({ length: 40 }, (_, index) => ({
+            id: `session-${index}`,
+            title: `Session ${index}`,
+            createdAt: 40 - index,
+          })),
+        ]);
+        const options = {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          pageSize: 50,
+          preserveListState: true,
+        };
+
+        controller.renderHistoryDropdown(container, options);
+        const pinnedItems = container.querySelector('.claudian-history-section--pinned')!
+          .querySelector('.claudian-history-section-items')!;
+        const sessionItems = container.querySelector('.claudian-session-list-items')!;
+        pinnedItems.scrollTop = 24;
+        sessionItems.scrollTop = 320;
+
+        controller.renderHistoryDropdown(container, options);
+
+        expect(
+          container.querySelector('.claudian-history-section--pinned')!
+            .querySelector('.claudian-history-section-items')!.scrollTop,
+        ).toBe(24);
+        expect(container.querySelector('.claudian-session-list-items')!.scrollTop).toBe(320);
+      });
+
+      it('preserves list position when archiving removes the final active session', () => {
+        const container = createMockEl();
+        const conversation = {
+          id: 'conv-1',
+          title: 'Conversation',
+          createdAt: 1,
+          isArchived: false,
+        };
+        (deps.plugin.getConversationList as jest.Mock).mockImplementation(() => [conversation]);
+        const options = {
+          onSelectConversation: jest.fn(),
+          sessionScope: 'active' as const,
+          sessionActionMode: 'active' as const,
+          preserveListState: true,
+        };
+
+        controller.renderHistoryDropdown(container, options);
+        container.querySelector('.claudian-history-list')!.scrollTop = 120;
+        conversation.isArchived = true;
+
+        controller.renderHistoryDropdown(container, options);
+
+        expect(container.querySelector('.claudian-history-list')!.scrollTop).toBe(120);
+      });
+
+      it('installs surface controls before restoring preserved list position', () => {
+        const container = createMockEl();
+        const order: string[] = [];
+        const restoreSpy = jest.spyOn(controller as any, 'restoreHistoryListPosition')
+          .mockImplementation(() => {
+            order.push('restore');
+          });
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Conversation', createdAt: 1 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          preserveListState: true,
+          onBeforeRestoreListState: (listContainer) => {
+            order.push('decorate');
+            const list = listContainer.querySelector('.claudian-history-list')!;
+            list.insertBefore(createMockEl(), list.firstChild);
+          },
+        });
+
+        expect(order).toEqual(['decorate', 'restore']);
+        restoreSpy.mockRestore();
+      });
+
+      it.each(['active', 'archived'] as const)(
+        'installs surface controls when the %s session scope is empty',
+        (sessionScope) => {
+          const container = createMockEl();
+          const onBeforeRestoreListState = jest.fn((listContainer: HTMLElement) => {
+            const list = listContainer.querySelector('.claudian-history-list')!;
+            list.insertBefore(createMockEl(), list.firstChild);
+          });
+          (deps.plugin.getConversationList as jest.Mock).mockReturnValue([]);
+
+          controller.renderHistoryDropdown(container, {
+            onSelectConversation: jest.fn(),
+            sessionScope,
+            preserveListState: true,
+            onBeforeRestoreListState,
+          });
+
+          const list = container.querySelector('.claudian-history-list')!;
+          expect(onBeforeRestoreListState).toHaveBeenCalledWith(container);
+          const emptyState = list.querySelector('.claudian-history-empty');
+          expect(list.children[0]).not.toBe(emptyState);
+          expect(emptyState).not.toBeNull();
+        },
+      );
+
+      it('does not let collapsed groups consume pagination or hide later headers', () => {
+        const container = createMockEl();
+        const collapsedGroupKeys = new Set(['note:Projects/A.md']);
+        const onRerender = jest.fn();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          ...Array.from({ length: 75 }, (_, index) => ({
+            id: `a-${index}`,
+            title: `A ${index}`,
+            createdAt: 1000 - index,
+            currentNote: 'Projects/A.md',
+          })),
+          {
+            id: 'b-1',
+            title: 'B 1',
+            createdAt: 1,
+            currentNote: 'Projects/B.md',
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          onRerender,
+          organization: 'linked-note',
+          sort: 'created',
+          pageSize: 25,
+          collapsedGroupKeys,
+          onGroupCollapseChange: (groupKey, collapsed) => {
+            if (collapsed) {
+              collapsedGroupKeys.add(groupKey);
+            } else {
+              collapsedGroupKeys.delete(groupKey);
+            }
+          },
+        });
+
+        const labels = container.querySelectorAll('.claudian-session-group-label');
+        expect(labels.map((label: { textContent: string }) => label.textContent))
+          .toEqual(['A', 'B']);
+        expect(container.querySelectorAll('.claudian-history-item')).toHaveLength(1);
+        expect(container.querySelector('.claudian-history-load-more')).toBeNull();
+
+        container.querySelectorAll('.claudian-session-group-header')[0].click();
+        expect(onRerender).toHaveBeenCalledTimes(1);
+      });
+
       it('does not render when the history render signal is already aborted', () => {
         const container = createMockEl();
         container.createDiv({ cls: 'sentinel' });
@@ -822,8 +1994,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -846,7 +2018,7 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -873,8 +2045,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -893,12 +2065,164 @@ describe('ConversationController', () => {
         expect(openItemDate?.textContent).toBe('Open in tab 2');
       });
 
+      it('shows timestamps instead of open-state labels when requested by the surface', () => {
+        const container = createMockEl();
+        jest.spyOn(controller, 'formatDate').mockImplementation(
+          (timestamp) => `Date ${timestamp}`,
+        );
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Open', createdAt: 2000, lastActivityAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationStatus: (id) => id === 'conv-1'
+            ? { openState: 'current', isRunning: false, location: 'current-view', tabIndex: 1 }
+            : { openState: 'open', isRunning: true, location: 'current-view', tabIndex: 2 },
+          showOpenStateLabels: false,
+        });
+
+        const list = container.children[1];
+        expect(list.children[0].querySelector('.claudian-history-item-date')?.textContent)
+          .toBe('Date 2000');
+        expect(list.children[1].querySelector('.claudian-history-item-date')?.textContent)
+          .toBe('Date 1000');
+        const runningIndicators = list.querySelectorAll(
+          '.claudian-session-running-indicator',
+        );
+        expect(runningIndicators).toHaveLength(1);
+        expect(setIcon).toHaveBeenCalledWith(runningIndicators[0], 'loader-2');
+      });
+
+      it('displays the timestamp selected by the session sort mode', () => {
+        const container = createMockEl();
+        jest.spyOn(controller, 'formatDate').mockImplementation(
+          (timestamp) => `Date ${timestamp}`,
+        );
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'conv-1',
+            title: 'Timestamped',
+            createdAt: 1000,
+            lastActivityAt: 2000,
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          sort: 'last-updated',
+          showOpenStateLabels: false,
+        });
+
+        expect(container.querySelector('.claudian-history-item-date')?.textContent)
+          .toBe('Date 2000');
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          sort: 'created',
+          showOpenStateLabels: false,
+        });
+
+        expect(container.querySelector('.claudian-history-item-date')?.textContent)
+          .toBe('Date 1000');
+      });
+
+      it('shows a running indicator on a collapsed linked-note header', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'running',
+            title: 'Running session',
+            createdAt: 1000,
+            currentNote: 'Projects/Plan.md',
+          },
+          {
+            id: 'idle',
+            title: 'Idle session',
+            createdAt: 900,
+            currentNote: 'Projects/Plan.md',
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          organization: 'linked-note',
+          sort: 'last-updated',
+          language: 'en',
+          showOpenStateLabels: false,
+          getConversationStatus: (id) => ({
+            openState: id === 'running' ? 'open' : 'closed',
+            isRunning: id === 'running',
+          }),
+        });
+
+        const header = container.querySelector('.claudian-session-group-header')!;
+        const headerIndicator = header.querySelector(
+          '.claudian-session-group-running-indicator',
+        )!;
+        expect(headerIndicator).not.toBeNull();
+        expect(headerIndicator.hasClass(
+          'claudian-session-group-running-indicator--visible',
+        )).toBe(false);
+
+        header.click();
+
+        expect(headerIndicator.hasClass(
+          'claudian-session-group-running-indicator--visible',
+        )).toBe(true);
+        expect(setIcon).toHaveBeenCalledWith(headerIndicator, 'loader-2');
+      });
+
+      it('marks a collapsed linked-note header when it contains attention', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          {
+            id: 'attention',
+            title: 'Needs review',
+            createdAt: 1000,
+            currentNote: 'Projects/Plan.md',
+          },
+          {
+            id: 'normal',
+            title: 'No attention',
+            createdAt: 900,
+            currentNote: 'Projects/Plan.md',
+          },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          organization: 'linked-note',
+          sort: 'last-updated',
+          language: 'en',
+          showAttentionState: true,
+          getConversationStatus: (id) => ({
+            openState: 'open',
+            isRunning: false,
+            attention: id === 'attention'
+              ? { kind: 'review', since: 1000 }
+              : null,
+          }),
+        });
+
+        const header = container.querySelector('.claudian-session-group-header')!;
+        expect(header.hasClass('claudian-session-group-header--attention')).toBe(false);
+        expect(header.querySelector('.claudian-session-group-attention-indicator')).toBeNull();
+
+        header.click();
+
+        expect(header.hasClass('claudian-session-group-header--attention')).toBe(true);
+      });
+
       it('should display running status for the current conversation', () => {
         const container = createMockEl();
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -924,8 +2248,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Running elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Running elsewhere', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -951,9 +2275,9 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
-          { id: 'conv-3', title: 'Running elsewhere', createdAt: 3000, lastResponseAt: 500 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastActivityAt: 1000 },
+          { id: 'conv-3', title: 'Running elsewhere', createdAt: 3000, lastActivityAt: 500 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -988,8 +2312,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Closed', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Closed', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -1017,8 +2341,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -1040,8 +2364,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -1076,8 +2400,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -1107,8 +2431,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -1139,8 +2463,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -1170,8 +2494,8 @@ describe('ConversationController', () => {
 
         deps.state.currentConversationId = 'conv-1';
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
         ]);
 
         controller.renderHistoryDropdown(container, {
@@ -1197,6 +2521,137 @@ describe('ConversationController', () => {
           'Delete',
         ]);
       });
+
+      it('hides tab-aware context actions on the Sessions surface', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Open elsewhere', createdAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationStatus: () => ({
+            openState: 'open',
+            isRunning: false,
+            location: 'current-view',
+            tabIndex: 2,
+          }),
+          showOpenStateActions: false,
+          showOpenStateLabels: false,
+        });
+
+        container.querySelector('.claudian-history-item')!.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+
+        const menu = (Menu as typeof Menu & {
+          instances: Array<{ items: Array<{ title: string }> }>;
+        }).instances[0];
+        expect(menu.items.map(item => item.title)).toEqual(['Rename', 'Delete']);
+      });
+
+      it('offers pin and unpin actions on the Sessions surface', async () => {
+        const container = createMockEl();
+        const onSetConversationPinned = jest.fn().mockResolvedValue(undefined);
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'normal', title: 'Normal', createdAt: 2 },
+          { id: 'pinned', title: 'Pinned', createdAt: 1, isPinned: true },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          onSetConversationPinned,
+          showOpenStateActions: false,
+        });
+
+        const normalItem = container.querySelector('.claudian-history-section--sessions')!
+          .querySelector('.claudian-history-item')!;
+        normalItem.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+        let menu = (Menu as typeof Menu & {
+          instances: Array<{ items: Array<{ title: string; clickHandler: (() => void) | null }> }>;
+        }).instances.at(-1)!;
+        expect(menu.items.map(item => item.title)).toEqual(['Pin', 'Rename', 'Delete']);
+        menu.items[0].clickHandler?.();
+        await Promise.resolve();
+        expect(onSetConversationPinned).toHaveBeenCalledWith('normal', true);
+
+        const pinnedItem = container.querySelector('.claudian-history-section--pinned')!
+          .querySelector('.claudian-history-item')!;
+        pinnedItem.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+        menu = (Menu as typeof Menu & {
+          instances: Array<{ items: Array<{ title: string; clickHandler: (() => void) | null }> }>;
+        }).instances.at(-1)!;
+        expect(menu.items.map(item => item.title)).toEqual(['Unpin', 'Rename', 'Delete']);
+        menu.items[0].clickHandler?.();
+        await Promise.resolve();
+        expect(onSetConversationPinned).toHaveBeenCalledWith('pinned', false);
+      });
+
+      it('keeps rename in the active context menu and delete in Archived only', () => {
+        const activeContainer = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'active', title: 'Active', createdAt: 2 },
+        ]);
+        controller.renderHistoryDropdown(activeContainer, {
+          onSelectConversation: jest.fn(),
+          showPinnedSection: true,
+          sessionScope: 'active',
+          sessionActionMode: 'active',
+          showOpenStateActions: false,
+          onSetConversationPinned: jest.fn().mockResolvedValue(undefined),
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+        });
+        activeContainer.querySelector('.claudian-history-item')!.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+        let menu = (Menu as typeof Menu & {
+          instances: Array<{
+            items: Array<{ title: string }>;
+            useNativeMenu: boolean | null;
+          }>;
+        }).instances.at(-1)!;
+        expect(menu.useNativeMenu).toBe(false);
+        expect(menu.items.map(item => item.title)).toEqual(['Pin', 'Archive', 'Rename']);
+
+        const archivedContainer = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'archived', title: 'Archived', createdAt: 1, isArchived: true },
+        ]);
+        controller.renderHistoryDropdown(archivedContainer, {
+          onSelectConversation: jest.fn(),
+          showArchivedSection: true,
+          sessionScope: 'archived',
+          sessionActionMode: 'archived',
+          showOpenStateActions: false,
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+        });
+        archivedContainer.querySelector('.claudian-history-item')!.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+        menu = (Menu as typeof Menu & {
+          instances: Array<{
+            items: Array<{ title: string }>;
+            useNativeMenu: boolean | null;
+          }>;
+        }).instances.at(-1)!;
+        expect(menu.useNativeMenu).toBe(false);
+        expect(menu.items.map(item => item.title)).toEqual(['Restore', 'Delete']);
+      });
     });
   });
 
@@ -1212,8 +2667,8 @@ describe('ConversationController', () => {
       deps.state.currentConversationId = 'conv-1';
 
       (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-        { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-        { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+        { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+        { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
       ]);
 
       controller.updateHistoryDropdown();
@@ -1225,7 +2680,11 @@ describe('ConversationController', () => {
       expect(clickHandlers).toBeDefined();
 
       await clickHandlers![0]({ stopPropagation: jest.fn() });
-      await Promise.resolve();
+      for (let attempt = 0;
+        attempt < 10 && (deps.plugin.switchConversation as jest.Mock).mock.calls.length === 0;
+        attempt += 1) {
+        await Promise.resolve();
+      }
 
       expect(deps.plugin.switchConversation).toHaveBeenCalledWith('conv-2');
     });
@@ -1238,7 +2697,7 @@ describe('ConversationController', () => {
       deps.getTitleGenerationService = () => mockTitleService as any;
 
       (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-        { id: 'conv-1', title: 'Failed', createdAt: 1000, lastResponseAt: 1000, titleGenerationStatus: 'failed' },
+        { id: 'conv-1', title: 'Failed', createdAt: 1000, lastActivityAt: 1000, titleGenerationStatus: 'failed' },
       ]);
 
       controller.updateHistoryDropdown();
@@ -1266,7 +2725,7 @@ describe('ConversationController', () => {
 
     it('should invoke rename handler when clicking rename button', () => {
       (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-        { id: 'conv-1', title: 'Test Title', createdAt: 1000, lastResponseAt: 1000 },
+        { id: 'conv-1', title: 'Test Title', createdAt: 1000, lastActivityAt: 1000 },
       ]);
 
       controller.updateHistoryDropdown();
@@ -1309,11 +2768,39 @@ describe('ConversationController', () => {
       }
     });
 
+    it('rerenders the owning session surface after inline rename', async () => {
+      const container = createMockEl();
+      const onRerender = jest.fn();
+      (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+        { id: 'conv-1', title: 'Old title', createdAt: 1000 },
+      ]);
+
+      controller.renderHistoryDropdown(container, {
+        onSelectConversation: jest.fn(),
+        onRerender,
+        organization: 'linked-note',
+        sort: 'created',
+      });
+
+      const item = container.querySelector('.claudian-history-item')!;
+      const title = item.querySelector('.claudian-history-item-title')!;
+      title.replaceWith = jest.fn();
+      item.querySelector('.claudian-history-item-actions')!.children[0].click();
+      const input = item.querySelector('.claudian-rename-input')!;
+      input.value = 'New title';
+      input.blur();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(deps.plugin.renameConversation).toHaveBeenCalledWith('conv-1', 'New title');
+      expect(onRerender).toHaveBeenCalledTimes(1);
+    });
+
     it('should delete conversation and reload active when deleting current conversation', async () => {
       deps.state.currentConversationId = 'conv-1';
 
       (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-        { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 1000 },
+        { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 1000 },
       ]);
 
       controller.updateHistoryDropdown();
@@ -1335,8 +2822,8 @@ describe('ConversationController', () => {
       deps.state.currentConversationId = 'conv-1';
 
       (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
-        { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
-        { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+        { id: 'conv-1', title: 'Current', createdAt: 1000, lastActivityAt: 2000 },
+        { id: 'conv-2', title: 'Other', createdAt: 2000, lastActivityAt: 1000 },
       ]);
 
       controller.updateHistoryDropdown();
@@ -1404,8 +2891,10 @@ describe('ConversationController - Callbacks', () => {
   });
 
   it('should call onConversationSwitched callback', async () => {
-    const onConversationSwitched = jest.fn();
     const deps = createMockDeps();
+    const onConversationSwitched = jest.fn(() => {
+      expect(deps.state.isSwitchingConversation).toBe(false);
+    });
     deps.state.currentConversationId = 'old-conv';
     const controller = new ConversationController(deps, { onConversationSwitched });
 
@@ -1644,7 +3133,7 @@ describe('ConversationController - MCP Server Persistence', () => {
         'conv-1',
         expect.objectContaining({
           enabledMcpServers: ['mcp-server-1', 'mcp-server-2'],
-        })
+        }),
       );
     });
 
@@ -1658,7 +3147,7 @@ describe('ConversationController - MCP Server Persistence', () => {
         'conv-1',
         expect.objectContaining({
           enabledMcpServers: undefined,
-        })
+        }),
       );
     });
   });
@@ -1728,7 +3217,7 @@ describe('ConversationController - MCP Server Persistence', () => {
     });
 
     it('should ensure the tab service matches the switched conversation provider', async () => {
-      const ensureServiceForConversation = jest.fn().mockResolvedValue(undefined);
+      const ensureExecutionForConversation = jest.fn().mockResolvedValue(undefined);
       const switchedConversation = {
         id: 'new-conv',
         providerId: 'codex',
@@ -1736,11 +3225,11 @@ describe('ConversationController - MCP Server Persistence', () => {
         messages: [],
         sessionId: null,
         createdAt: Date.now(),
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       };
 
       deps = createMockDeps({
-        ensureServiceForConversation,
+        ensureExecutionForConversation,
         plugin: {
           ...createMockDeps().plugin,
           switchConversation: jest.fn().mockResolvedValue(switchedConversation),
@@ -1751,7 +3240,7 @@ describe('ConversationController - MCP Server Persistence', () => {
 
       await controller.switchTo('new-conv');
 
-      expect(ensureServiceForConversation).toHaveBeenCalledWith(switchedConversation);
+      expect(ensureExecutionForConversation).toHaveBeenCalledWith(switchedConversation);
     });
   });
 
@@ -1795,6 +3284,10 @@ describe('ConversationController - Race Condition Guards', () => {
     it('should reset even when streaming if force is true', async () => {
       deps.state.isStreaming = true;
       deps.state.cancelRequested = false;
+      deps.state.currentConversationId = 'active-conversation';
+      deps.state.messages = [
+        { id: 'message-1', role: 'user', content: 'Working', timestamp: 1 },
+      ];
       const initialGeneration = deps.state.streamGeneration;
 
       await controller.createNew({ force: true });
@@ -1803,6 +3296,10 @@ describe('ConversationController - Race Condition Guards', () => {
       expect(deps.state.cancelRequested).toBe(true);
       expect(deps.state.streamGeneration).toBe(initialGeneration + 1);
       expect(deps.state.currentConversationId).toBeNull();
+      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
+        'active-conversation',
+        expect.objectContaining({ lastActivityAt: expect.any(Number) }),
+      );
     });
 
     it('should set and reset isCreatingConversation flag during entry point reset', async () => {
@@ -1822,6 +3319,45 @@ describe('ConversationController - Race Condition Guards', () => {
   });
 
   describe('switchTo guards', () => {
+    it('serializes a newer switch behind in-flight hydration instead of dropping it', async () => {
+      const firstConversation = deferred<any>();
+      (deps.plugin.switchConversation as jest.Mock).mockImplementation(async (id: string) => {
+        if (id === 'conversation-a') return firstConversation.promise;
+        return {
+          id,
+          title: id,
+          messages: [],
+          sessionId: null,
+          createdAt: Date.now(),
+          lastActivityAt: Date.now(),
+        };
+      });
+      deps.state.currentConversationId = 'old-conversation';
+
+      const firstSwitch = controller.switchTo('conversation-a');
+      for (let attempt = 0;
+        attempt < 10 && (deps.plugin.switchConversation as jest.Mock).mock.calls.length === 0;
+        attempt += 1) {
+        await Promise.resolve();
+      }
+      const secondSwitch = controller.switchTo('conversation-b');
+
+      expect(deps.plugin.switchConversation).toHaveBeenCalledTimes(1);
+      firstConversation.resolve({
+        id: 'conversation-a',
+        title: 'Conversation A',
+        messages: [],
+        sessionId: null,
+        createdAt: Date.now(),
+        lastActivityAt: Date.now(),
+      });
+      await Promise.all([firstSwitch, secondSwitch]);
+
+      expect(deps.plugin.switchConversation).toHaveBeenNthCalledWith(1, 'conversation-a');
+      expect(deps.plugin.switchConversation).toHaveBeenNthCalledWith(2, 'conversation-b');
+      expect(deps.state.currentConversationId).toBe('conversation-b');
+    });
+
     it('should not switch when isSwitchingConversation is already true', async () => {
       deps.state.currentConversationId = 'old-conv';
       deps.state.isSwitchingConversation = true;
@@ -1869,7 +3405,7 @@ describe('ConversationController - Race Condition Guards', () => {
           messages: [],
           sessionId: null,
           createdAt: Date.now(),
-          updatedAt: Date.now(),
+          lastActivityAt: Date.now(),
         };
       });
 
@@ -2105,332 +3641,6 @@ describe('ConversationController - Persistent External Context Paths', () => {
   });
 });
 
-function createMockBuildSessionUpdates(mockService: any) {
-  return jest.fn().mockImplementation(({ conversation, sessionInvalidated }: any) => {
-    const sessionId = mockService.getSessionId();
-    const legacyMessages = conversation?.messages ?? [];
-    const hasSession = !!sessionId;
-    const legacyCutoffAt = hasSession && !conversation?.providerSessionId
-      ? legacyMessages[legacyMessages.length - 1]?.timestamp
-      : conversation?.legacyCutoffAt;
-    const oldSdkSessionId = conversation?.providerSessionId;
-    const sessionChanged = hasSession && sessionId && oldSdkSessionId && sessionId !== oldSdkSessionId;
-    const previousProviderSessionIds = sessionChanged
-      ? [...new Set([...(conversation?.previousProviderSessionIds || []), oldSdkSessionId])]
-      : conversation?.previousProviderSessionIds;
-    const isForkSourceOnly = !!conversation?.forkSource &&
-      !conversation?.providerSessionId &&
-      sessionId === conversation.forkSource.sessionId;
-    let resolvedSessionId: string | null;
-    if (sessionInvalidated) {
-      resolvedSessionId = null;
-    } else if (isForkSourceOnly) {
-      resolvedSessionId = conversation?.sessionId ?? null;
-    } else {
-      resolvedSessionId = sessionId ?? conversation?.sessionId ?? null;
-    }
-    const updates: any = {
-      sessionId: resolvedSessionId,
-      providerSessionId: hasSession && sessionId && !isForkSourceOnly ? sessionId : conversation?.providerSessionId,
-      previousProviderSessionIds,
-      legacyCutoffAt,
-    };
-    if (conversation?.forkSource && sessionId && sessionId !== conversation.forkSource.sessionId) {
-      updates.forkSource = undefined;
-    }
-    return { updates };
-  });
-}
-
-describe('ConversationController - Previous SDK Session IDs', () => {
-  let controller: ConversationController;
-  let deps: ConversationControllerDeps;
-  let mockAgentService: any;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockAgentService = {
-      getSessionId: jest.fn().mockReturnValue(null),
-      setSessionId: jest.fn(),
-      consumeSessionInvalidation: jest.fn().mockReturnValue(false),
-      buildSessionUpdates: null as any,
-    };
-    mockAgentService.buildSessionUpdates = createMockBuildSessionUpdates(mockAgentService);
-    deps = createMockDeps({
-      getAgentService: () => mockAgentService,
-    });
-    controller = new ConversationController(deps);
-  });
-
-  describe('save - session change detection', () => {
-    it('should accumulate old providerSessionId when SDK creates new session', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
-
-      // Existing conversation has providerSessionId 'session-A'
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
-        id: 'conv-1',
-        messages: [],
-        providerSessionId: 'session-A',
-        previousProviderSessionIds: undefined,
-      });
-
-      // Agent service reports new session 'session-B' (resume failed, new session created)
-      mockAgentService.getSessionId.mockReturnValue('session-B');
-
-      await controller.save();
-
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          providerSessionId: 'session-B',
-          previousProviderSessionIds: ['session-A'],
-        })
-      );
-    });
-
-    it('should preserve existing previousProviderSessionIds when session changes again', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
-
-      // Conversation already has previous sessions [A], current is B
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
-        id: 'conv-1',
-        messages: [],
-        providerSessionId: 'session-B',
-        previousProviderSessionIds: ['session-A'],
-      });
-
-      // Agent service reports new session 'session-C'
-      mockAgentService.getSessionId.mockReturnValue('session-C');
-
-      await controller.save();
-
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          providerSessionId: 'session-C',
-          previousProviderSessionIds: ['session-A', 'session-B'],
-        })
-      );
-    });
-
-    it('should not modify previousProviderSessionIds when session has not changed', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
-
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
-        id: 'conv-1',
-        messages: [],
-        providerSessionId: 'session-A',
-        previousProviderSessionIds: undefined,
-      });
-
-      mockAgentService.getSessionId.mockReturnValue('session-A');
-
-      await controller.save();
-
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          providerSessionId: 'session-A',
-          previousProviderSessionIds: undefined,
-        })
-      );
-    });
-
-    it('should deduplicate session IDs to prevent duplicates from race conditions', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
-
-      // Simulate a race condition where session-A is already in previousProviderSessionIds
-      // but providerSessionId is still session-A (should not duplicate)
-      (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
-        id: 'conv-1',
-        messages: [],
-        providerSessionId: 'session-A',
-        previousProviderSessionIds: ['session-A'], // Already contains A (from prior bug/race)
-      });
-
-      // Agent reports new session-B
-      mockAgentService.getSessionId.mockReturnValue('session-B');
-
-      await controller.save();
-
-      // Should deduplicate: [A, A] -> [A]
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          providerSessionId: 'session-B',
-          previousProviderSessionIds: ['session-A'], // Deduplicated, not ['session-A', 'session-A']
-        })
-      );
-    });
-  });
-});
-
-describe('ConversationController - Fork Session ID Isolation', () => {
-  let controller: ConversationController;
-  let deps: ConversationControllerDeps;
-  let mockAgentService: any;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockAgentService = {
-      getSessionId: jest.fn().mockReturnValue(null),
-      setSessionId: jest.fn(),
-      consumeSessionInvalidation: jest.fn().mockReturnValue(false),
-      buildSessionUpdates: null as any,
-    };
-    mockAgentService.buildSessionUpdates = createMockBuildSessionUpdates(mockAgentService);
-    deps = createMockDeps({
-      getAgentService: () => mockAgentService,
-    });
-    controller = new ConversationController(deps);
-  });
-
-  it('should not persist fork source session ID as conversation own sessionId/providerSessionId', async () => {
-    deps.state.currentConversationId = 'fork-conv';
-    deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
-
-    // Fork conversation: has forkSource but no own providerSessionId yet
-    (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
-      id: 'fork-conv',
-      messages: [],
-      sessionId: null,
-      providerSessionId: undefined,
-      forkSource: { sessionId: 'source-session-abc', resumeAt: 'assistant-uuid-1' },
-    });
-
-    // Agent service has the fork source ID set for resume purposes
-    mockAgentService.getSessionId.mockReturnValue('source-session-abc');
-
-    await controller.save();
-
-    expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-      'fork-conv',
-      expect.objectContaining({
-        sessionId: null,
-        providerSessionId: undefined,
-      })
-    );
-  });
-
-  it('should persist new session ID after SDK captures a different session for fork', async () => {
-    deps.state.currentConversationId = 'fork-conv';
-    deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
-
-    (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
-      id: 'fork-conv',
-      messages: [],
-      sessionId: null,
-      providerSessionId: undefined,
-      forkSource: { sessionId: 'source-session-abc', resumeAt: 'assistant-uuid-1' },
-    });
-
-    // SDK captured a new session (different from fork source)
-    mockAgentService.getSessionId.mockReturnValue('new-session-xyz');
-
-    await controller.save();
-
-    expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-      'fork-conv',
-      expect.objectContaining({
-        sessionId: 'new-session-xyz',
-        providerSessionId: 'new-session-xyz',
-        forkSource: undefined,
-      })
-    );
-  });
-
-  it('should allow normal session ID persistence when fork metadata is already cleared', async () => {
-    deps.state.currentConversationId = 'fork-conv';
-    deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
-
-    // Fork conversation after fork metadata was cleared (has its own providerSessionId)
-    (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
-      id: 'fork-conv',
-      messages: [],
-      sessionId: 'new-session-xyz',
-      providerSessionId: 'new-session-xyz',
-      forkSource: undefined,
-    });
-
-    mockAgentService.getSessionId.mockReturnValue('new-session-xyz');
-
-    await controller.save();
-
-    expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-      'fork-conv',
-      expect.objectContaining({
-        sessionId: 'new-session-xyz',
-        providerSessionId: 'new-session-xyz',
-      })
-    );
-  });
-});
-
-describe('ConversationController - switchTo fork path', () => {
-  let controller: ConversationController;
-  let deps: ConversationControllerDeps;
-  let mockAgentService: any;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockAgentService = {
-      getSessionId: jest.fn().mockReturnValue(null),
-      syncConversationState: jest.fn(),
-      consumeSessionInvalidation: jest.fn().mockReturnValue(false),
-      buildSessionUpdates: null as any,
-    };
-    mockAgentService.buildSessionUpdates = createMockBuildSessionUpdates(mockAgentService);
-    deps = createMockDeps({
-      getAgentService: () => mockAgentService,
-    });
-    controller = new ConversationController(deps);
-  });
-
-  it('should sync conversation state for pending fork conversations', async () => {
-    deps.state.currentConversationId = 'old-conv';
-
-    const forkConversation = {
-      id: 'fork-conv',
-      messages: [{ id: '1', role: 'user', content: 'forked msg', timestamp: Date.now() }],
-      sessionId: null,
-      providerSessionId: undefined,
-      forkSource: { sessionId: 'source-session-abc', resumeAt: 'assistant-uuid-1' },
-    };
-    (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(forkConversation);
-
-    await controller.switchTo('fork-conv');
-
-    expect(mockAgentService.syncConversationState).toHaveBeenCalledWith(
-      forkConversation,
-      expect.any(Array),
-    );
-  });
-
-  it('should resolve to own sessionId when fork already has its own session', async () => {
-    deps.state.currentConversationId = 'old-conv';
-
-    const forkConversation = {
-      id: 'fork-conv',
-      messages: [{ id: '1', role: 'user', content: 'forked msg', timestamp: Date.now() }],
-      sessionId: 'own-session-xyz',
-      providerSessionId: 'own-session-xyz',
-      forkSource: { sessionId: 'source-session-abc', resumeAt: 'assistant-uuid-1' },
-    };
-    (deps.plugin.switchConversation as jest.Mock).mockResolvedValue(forkConversation);
-
-    await controller.switchTo('fork-conv');
-
-    expect(mockAgentService.syncConversationState).toHaveBeenCalledWith(
-      forkConversation,
-      expect.any(Array),
-    );
-  });
-});
-
 describe('ConversationController - restoreExternalContextPaths null selector', () => {
   it('should return early when external context selector is null', async () => {
     const deps = createMockDeps({
@@ -2558,21 +3768,16 @@ describe('ConversationController - regenerateTitle callback branches', () => {
 describe('ConversationController - Rewind', () => {
   let controller: ConversationController;
   let deps: ConversationControllerDeps;
-  let mockAgentService: any;
+  let mockCoordinator: any;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockAgentService = {
-      getSessionId: jest.fn().mockReturnValue(null),
-      setSessionId: jest.fn(),
-      consumeSessionInvalidation: jest.fn().mockReturnValue(false),
+    mockCoordinator = {
+      previewRewind: jest.fn().mockResolvedValue({ canRewind: true }),
       rewind: jest.fn().mockResolvedValue({ canRewind: true, filesChanged: ['a.ts'] }),
-      getCapabilities: jest.fn().mockReturnValue({ supportsRewind: true }),
-      buildSessionUpdates: null as any,
     };
-    mockAgentService.buildSessionUpdates = createMockBuildSessionUpdates(mockAgentService);
     deps = createMockDeps({
-      getAgentService: () => mockAgentService,
+      getExecutionCoordinator: () => mockCoordinator,
     });
     controller = new ConversationController(deps);
   });
@@ -2589,7 +3794,61 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m3');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
+    expect(mockCoordinator.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
+  });
+
+  it('should initialize a cold conversation execution before previewing rewind', async () => {
+    let coordinator: typeof mockCoordinator | null = null;
+    const ensureExecutionInitialized = jest.fn().mockImplementation(async () => {
+      coordinator = mockCoordinator;
+      return true;
+    });
+    deps = createMockDeps({
+      getExecutionCoordinator: () => coordinator,
+      ensureExecutionInitialized,
+    });
+    controller = new ConversationController(deps);
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'user-uuid' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+
+    await controller.rewind('m2');
+
+    expect(ensureExecutionInitialized).toHaveBeenCalledTimes(1);
+    expect(mockCoordinator.previewRewind).toHaveBeenCalledWith(
+      'user-uuid',
+      'prev-a',
+      'code-and-conversation',
+    );
+    expect(mockCoordinator.rewind).toHaveBeenCalled();
+  });
+
+  it('should reject a second rewind while the first preview is pending', async () => {
+    const previewResolvers: Array<(value: { canRewind: true }) => void> = [];
+    mockCoordinator.previewRewind = jest.fn().mockImplementation(() => (
+      new Promise(resolve => { previewResolvers.push(resolve); })
+    ));
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'user-uuid' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+
+    const firstRewind = controller.rewind('m2');
+    await Promise.resolve();
+    const secondRewind = controller.rewind('m2');
+    await Promise.resolve();
+    const previewCallCountBeforeResolution = mockCoordinator.previewRewind.mock.calls.length;
+    previewResolvers.forEach(resolve => resolve({ canRewind: true }));
+    await Promise.all([firstRewind, secondRewind]);
+
+    expect(previewCallCountBeforeResolution).toBe(1);
+    expect(mockCoordinator.rewind).toHaveBeenCalledTimes(1);
+    expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('rewind to finish'));
   });
 
   it('should show Notice when message ID not found', async () => {
@@ -2602,7 +3861,7 @@ describe('ConversationController - Rewind', () => {
     await controller.rewind('nonexistent');
 
     expect(mockNotice).toHaveBeenCalled();
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).not.toHaveBeenCalled();
   });
 
   it('should show Notice when streaming', async () => {
@@ -2616,7 +3875,7 @@ describe('ConversationController - Rewind', () => {
     await controller.rewind('m2');
 
     expect(mockNotice).toHaveBeenCalled();
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).not.toHaveBeenCalled();
   });
 
   it('should show Notice when user message has no userMessageId', async () => {
@@ -2629,7 +3888,7 @@ describe('ConversationController - Rewind', () => {
     await controller.rewind('m2');
 
     expect(mockNotice).toHaveBeenCalled();
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).not.toHaveBeenCalled();
   });
 
   it('should allow rewind when no previous assistant with uuid exists', async () => {
@@ -2640,7 +3899,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m1');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('u1', undefined, 'code-and-conversation');
+    expect(mockCoordinator.rewind).toHaveBeenCalledWith('u1', undefined, 'code-and-conversation');
   });
 
   it('should show Notice when no response assistant with uuid exists', async () => {
@@ -2652,23 +3911,24 @@ describe('ConversationController - Rewind', () => {
     await controller.rewind('m2');
 
     expect(mockNotice).toHaveBeenCalled();
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).not.toHaveBeenCalled();
   });
 
-  it('should show i18n Notice on SDK rewind exception', async () => {
+  it('should show i18n Notice on coordinator rewind exception', async () => {
     deps.state.currentConversationId = 'conv-1';
     deps.state.messages = [
       { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'a1' },
       { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'u1' },
       { id: 'm3', role: 'assistant', content: '', timestamp: 3, assistantMessageId: 'a2' },
     ];
-    mockAgentService.rewind.mockRejectedValue(new Error('SDK error'));
+    mockCoordinator.rewind.mockRejectedValue(new Error('Coordinator error'));
 
     await controller.rewind('m2');
 
     expect(mockNotice).toHaveBeenCalled();
     const msg = mockNotice.mock.calls[0][0] as string;
-    expect(msg).toContain('SDK error');
+    expect(msg).toContain('Coordinator error');
+    expect(deps.state.isRewinding).toBe(false);
   });
 
   it('should show i18n Notice when canRewind is false', async () => {
@@ -2678,7 +3938,7 @@ describe('ConversationController - Rewind', () => {
       { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'u1' },
       { id: 'm3', role: 'assistant', content: '', timestamp: 3, assistantMessageId: 'a2' },
     ];
-    mockAgentService.rewind.mockResolvedValue({ canRewind: false, error: 'No checkpoints' });
+    mockCoordinator.rewind.mockResolvedValue({ canRewind: false, error: 'No checkpoints' });
 
     await controller.rewind('m2');
 
@@ -2689,6 +3949,7 @@ describe('ConversationController - Rewind', () => {
 
   it('should truncateAt, save with resumeAtMessageId, and renderMessages on success', async () => {
     deps.state.currentConversationId = 'conv-1';
+    deps.state.usage = { inputTokens: 100, outputTokens: 50 } as any;
     deps.state.messages = [
       { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
       { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'user-uuid' },
@@ -2699,8 +3960,9 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m2');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
+    expect(mockCoordinator.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
     expect(truncateSpy).toHaveBeenCalledWith('m2');
+    expect(deps.state.usage).toBeNull();
     expect(deps.renderer.renderMessages).toHaveBeenCalledWith(
       expect.any(Array),
       expect.any(Function)
@@ -2722,6 +3984,37 @@ describe('ConversationController - Rewind', () => {
     truncateSpy.mockRestore();
   });
 
+  it('should restore the rewound message through the composer owner', async () => {
+    const restoreMessageToComposer = jest.fn();
+    deps = createMockDeps({
+      getExecutionCoordinator: () => mockCoordinator,
+      restoreMessageToComposer,
+    });
+    controller = new ConversationController(deps);
+    const images = [{ id: 'image-1', name: 'reference.png' }];
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      {
+        content: '',
+        displayContent: 'restore this prompt',
+        id: 'm2',
+        images: images as any,
+        role: 'user',
+        timestamp: 2,
+        userMessageId: 'user-uuid',
+      },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+
+    await controller.rewind('m2');
+
+    expect(restoreMessageToComposer).toHaveBeenCalledWith({
+      content: 'restore this prompt',
+      images,
+    });
+  });
+
   it('should rewind to before the first user message and clear provider session state', async () => {
     deps.state.currentConversationId = 'conv-1';
     deps.state.messages = [
@@ -2738,8 +4031,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m1');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', undefined, 'code-and-conversation');
-    expect(mockAgentService.buildSessionUpdates).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).toHaveBeenCalledWith('user-uuid', undefined, 'code-and-conversation');
     expect(deps.state.messages).toEqual([]);
     expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
       'conv-1',
@@ -2768,13 +4060,109 @@ describe('ConversationController - Rewind', () => {
       'Rewind conversation to this point? File changes will be kept.',
       'Rewind',
     );
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'conversation');
+    expect(mockCoordinator.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'conversation');
     expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
       'conv-1',
       expect.objectContaining({ resumeAtMessageId: 'prev-a' })
     );
     const noticeMsg = mockNotice.mock.calls[0][0] as string;
     expect(noticeMsg).toBe('Rewound conversation; file changes kept');
+  });
+
+  it('should warn that file rewind is destructive', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'user-uuid' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+
+    await controller.rewind('m2');
+
+    expect(confirm).toHaveBeenCalledWith(
+      deps.plugin.app,
+      expect.stringContaining('cannot be undone'),
+      'Rewind',
+    );
+    expect((confirm as jest.Mock).mock.calls[0][1]).not.toContain('does not affect');
+  });
+
+  it('should preview file rewind and surface provider conflicts before confirmation', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'user-uuid' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+    mockCoordinator.previewRewind = jest.fn().mockResolvedValue({
+      canRewind: true,
+      conflicts: [{ conflictType: 'modified_externally', path: 'notes/conflicted.md' }],
+      filesChanged: ['notes/conflicted.md'],
+    });
+
+    await controller.rewind('m2');
+
+    expect(mockCoordinator.previewRewind).toHaveBeenCalledWith(
+      'user-uuid',
+      'prev-a',
+      'code-and-conversation',
+    );
+    expect(confirm).toHaveBeenCalledWith(
+      deps.plugin.app,
+      expect.stringContaining('notes/conflicted.md'),
+      'Rewind',
+    );
+    expect((confirm as jest.Mock).mock.calls[0][1]).toContain('overwritten');
+    expect(mockCoordinator.rewind).toHaveBeenCalled();
+  });
+
+  it('should abort when provider rewind preview rejects the checkpoint', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'user-uuid' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+    mockCoordinator.previewRewind = jest.fn().mockResolvedValue({
+      canRewind: false,
+      error: 'Checkpoint is no longer available',
+    });
+
+    await controller.rewind('m2');
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).not.toHaveBeenCalled();
+    expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('Checkpoint is no longer available'));
+  });
+
+  it('should leave provider-native session persistence to the coordinator', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'user', content: 'first prompt', timestamp: 1, userMessageId: 'user-uuid' },
+      { id: 'm2', role: 'assistant', content: 'resp', timestamp: 2, assistantMessageId: 'resp-a' },
+    ];
+    mockCoordinator.rewind.mockResolvedValue({
+      canRewind: true,
+      filesChanged: [],
+      sessionStrategy: 'preserve-provider-session',
+    });
+    (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
+      id: 'conv-1',
+      messages: deps.state.messages,
+      providerId: 'grok',
+      providerState: { sessionDirectory: '/trusted/native-session' },
+      sessionId: 'native-session',
+    });
+
+    await controller.rewind('m1');
+
+    const updates = (deps.plugin.updateConversation as jest.Mock).mock.calls[0][1];
+    expect(updates).toEqual(expect.objectContaining({
+      messages: [],
+      resumeAtMessageId: undefined,
+    }));
+    expect(updates).not.toHaveProperty('sessionId');
+    expect(updates).not.toHaveProperty('providerState');
   });
 
   it('should abort when confirmation is declined', async () => {
@@ -2788,7 +4176,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m2');
 
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).not.toHaveBeenCalled();
     expect(mockNotice).not.toHaveBeenCalled();
   });
 
@@ -2806,7 +4194,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m2');
 
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockCoordinator.rewind).not.toHaveBeenCalled();
     expect(mockNotice).toHaveBeenCalled();
   });
 
@@ -2822,7 +4210,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m2');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
+    expect(mockCoordinator.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
     const msg = mockNotice.mock.calls[0][0] as string;
     expect(msg).toContain('Save failed');
   });

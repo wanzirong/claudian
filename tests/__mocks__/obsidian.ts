@@ -13,6 +13,7 @@ export class Plugin {
   addCommand = jest.fn();
   addSettingTab = jest.fn();
   registerView = jest.fn();
+  registerEvent = jest.fn();
   loadData = jest.fn().mockResolvedValue({});
   saveData = jest.fn().mockResolvedValue(undefined);
 }
@@ -211,6 +212,8 @@ class MockMenuItem {
   title = '';
   icon = '';
   disabled = false;
+  checked: boolean | null = null;
+  isLabel = false;
   clickHandler: (() => void) | null = null;
 
   setTitle = jest.fn((title: string) => {
@@ -228,6 +231,16 @@ class MockMenuItem {
     return this;
   });
 
+  setChecked = jest.fn((checked: boolean | null) => {
+    this.checked = checked;
+    return this;
+  });
+
+  setIsLabel = jest.fn((isLabel: boolean) => {
+    this.isLabel = isLabel;
+    return this;
+  });
+
   onClick = jest.fn((handler: () => void) => {
     this.clickHandler = handler;
     return this;
@@ -238,7 +251,9 @@ export class Menu {
   static instances: Menu[] = [];
 
   items: MockMenuItem[] = [];
+  useNativeMenu: boolean | null = null;
   showAtMouseEvent = jest.fn();
+  showAtPosition = jest.fn();
 
   constructor() {
     Menu.instances.push(this);
@@ -250,6 +265,15 @@ export class Menu {
     this.items.push(item);
     return this;
   }
+
+  addSeparator(): this {
+    return this;
+  }
+
+  setUseNativeMenu = jest.fn((useNativeMenu: boolean) => {
+    this.useNativeMenu = useNativeMenu;
+    return this;
+  });
 }
 
 const renderMarkdownMock = jest.fn<Promise<void>, [string, unknown, string, unknown]>().mockResolvedValue(undefined);
@@ -260,6 +284,10 @@ export const MarkdownRenderer = {
   ),
   renderMarkdown: renderMarkdownMock,
 };
+
+export const loadPrism = jest.fn().mockResolvedValue({
+  highlightElement: jest.fn(),
+});
 
 export const setIcon = jest.fn();
 

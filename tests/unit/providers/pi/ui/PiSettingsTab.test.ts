@@ -7,9 +7,11 @@ const mockNotices: string[] = [];
 
 jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
   ProviderSettingsCoordinator: {
+    canApplyProviderEnablement: jest.fn(() => true),
     applyProviderEnablement: jest.fn((settings: Record<string, unknown>, providerId: string, enabled: boolean) => {
       const providerConfigs = settings.providerConfigs as Record<string, { enabled: boolean }>;
       providerConfigs[providerId].enabled = enabled;
+      return true;
     }),
   },
 }));
@@ -59,6 +61,7 @@ class MockSetting {
   dropdownComponents: MockDropdownComponent[] = [];
   heading = false;
   name = '';
+  settingEl = { addClass: jest.fn() };
   textComponents: MockTextComponent[] = [];
   toggleComponents: MockToggleComponent[] = [];
 
@@ -332,17 +335,35 @@ function applyElementAttrs(element: any, attrs?: Record<string, unknown>): void 
 
 function createContext(settings: Record<string, unknown>) {
   const saveSettings = jest.fn().mockResolvedValue(undefined);
+  const runProviderExecutionTransition = jest.fn(async (
+    _providerIds: string[],
+    mutation: () => Promise<void>,
+  ) => mutation());
+  const mutateSettings = jest.fn(async (
+    mutation: (current: any) => void | Promise<void>,
+  ) => {
+    await mutation(settings);
+    await saveSettings();
+  });
+  const applyProviderRuntimeSettings = jest.fn(async (
+    providerIds: string[],
+    mutation: (current: any) => void | Promise<void>,
+    onApplied?: () => void | Promise<void>,
+  ) => runProviderExecutionTransition(providerIds, async () => {
+    await mutateSettings(mutation);
+    await onApplied?.();
+  }));
   return {
     plugin: {
+      applyProviderRuntimeSettings,
+      notifyProviderChatOptionsChanged: jest.fn(),
+      runProviderExecutionTransition,
       saveSettings,
       settings,
-      mutateSettings: jest.fn(async (mutation: (current: any) => void | Promise<void>) => {
-        await mutation(settings);
-        await saveSettings();
-      }),
+      mutateSettings,
     },
-    refreshModelSelectors: jest.fn(),
-    refreshTitleGenerationModelOptions: jest.fn(),
+    renderAgentSkillSettings: jest.fn(),
+    notifyProviderModelOptionsChanged: jest.fn(),
     renderHiddenProviderCommandSetting: jest.fn(),
   };
 }
@@ -403,19 +424,117 @@ describe('PiSettingsTab', () => {
     const settings: Record<string, unknown> = { providerConfigs: { pi: { enabled: false } } };
     const context = render(settings);
 
-    await findSetting('Enable Pi').toggleComponents[0].onChangeCallback?.(true);
+    const enableSetting = findSetting('Enable Pi');
+    expect(enableSetting.desc).toBe(
+      'Make enabled Pi models available for new conversations. Existing sessions are preserved when disabled.',
+    );
+    await enableSetting.toggleComponents[0].onChangeCallback?.(true);
 
     expect(getPiProviderSettings(settings).enabled).toBe(true);
     expect(context.plugin.saveSettings).toHaveBeenCalled();
-    expect(context.refreshModelSelectors).toHaveBeenCalled();
-    expect(context.refreshTitleGenerationModelOptions).toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('pi');
   });
 
-  it('does not render hidden command settings for Pi', () => {
+  it('commits Pi enablement inside the execution transition without metadata startup', async () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: { pi: { enabled: true } },
+    };
+    const context = render(settings);
+    const enableSetting = findSetting('Enable Pi');
+    context.plugin.runProviderExecutionTransition.mockImplementationOnce(async (
+      providerIds: string[],
+      mutation: () => Promise<void>,
+    ) => {
+      expect(providerIds).toEqual(['pi']);
+      expect(getPiProviderSettings(settings).enabled).toBe(true);
+      await mutation();
+      expect(getPiProviderSettings(settings).enabled).toBe(false);
+    });
+
+    await enableSetting.toggleComponents[0].onChangeCallback?.(false);
+
+    expect(context.plugin.runProviderExecutionTransition).toHaveBeenCalledTimes(1);
+    expect(mockDiscoverModels).not.toHaveBeenCalled();
+  });
+
+  it('resynchronizes the Pi toggle when disabling the final provider is rejected', async () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: { pi: { enabled: true } },
+    };
+    const context = render(settings);
+    const toggle = findSetting('Enable Pi').toggleComponents[0];
+    const coordinator = jest.requireMock('@/core/providers/ProviderSettingsCoordinator')
+      .ProviderSettingsCoordinator;
+    coordinator.canApplyProviderEnablement.mockImplementationOnce(() => false);
+    toggle.setValue.mockClear();
+
+    await toggle.onChangeCallback?.(false);
+
+    expect(toggle.setValue).toHaveBeenLastCalledWith(true);
+    expect(context.plugin.runProviderExecutionTransition).not.toHaveBeenCalled();
+    expect(coordinator.applyProviderEnablement).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+
+    await toggle.onChangeCallback?.(true);
+  });
+
+  it('restores the Pi enablement toggle when the execution transition fails', async () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: { pi: { enabled: false } },
+    };
+    const context = render(settings);
+    const toggle = findSetting('Enable Pi').toggleComponents[0];
+    context.plugin.runProviderExecutionTransition.mockRejectedValueOnce(
+      new Error('transition failed'),
+    );
+
+    await expect(toggle.onChangeCallback?.(true)).rejects.toThrow(
+      'transition failed',
+    );
+
+    expect(getPiProviderSettings(settings).enabled).toBe(false);
+    expect(toggle.setValue).toHaveBeenLastCalledWith(false);
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+    expect(mockDiscoverModels).not.toHaveBeenCalled();
+  });
+
+  it('resynchronizes Pi enablement to durable settings after a late transition failure', async () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: { pi: { enabled: false } },
+    };
+    const context = render(settings);
+    const toggle = findSetting('Enable Pi').toggleComponents[0];
+    context.plugin.runProviderExecutionTransition.mockImplementationOnce(async (
+      _providerIds: string[],
+      mutation: () => Promise<void>,
+    ) => {
+      await mutation();
+      throw new Error('transition completion failed');
+    });
+
+    await expect(toggle.onChangeCallback?.(true)).rejects.toThrow(
+      'transition completion failed',
+    );
+
+    expect(getPiProviderSettings(settings).enabled).toBe(true);
+    expect(toggle.setValue).toHaveBeenLastCalledWith(true);
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+    expect(mockDiscoverModels).not.toHaveBeenCalled();
+  });
+
+  it('renders shared skills and keeps hidden provider commands separate', () => {
     const settings: Record<string, unknown> = { providerConfigs: { pi: {} } };
     const context = render(settings);
 
-    expect(context.renderHiddenProviderCommandSetting).not.toHaveBeenCalled();
+    expect(context.renderAgentSkillSettings).toHaveBeenCalledWith(
+      expect.anything(),
+      'pi',
+    );
+    expect(context.renderHiddenProviderCommandSetting).toHaveBeenCalledWith(
+      expect.anything(),
+      'pi',
+      expect.objectContaining({ name: 'Hidden Pi commands and skills' }),
+    );
   });
 
   it('does not render the chat input tool mode setting for Pi', () => {
@@ -442,6 +561,103 @@ describe('PiSettingsTab', () => {
     });
     expect(mockCliResolverReset).toHaveBeenCalled();
     expect(context.plugin.saveSettings).toHaveBeenCalled();
+  });
+
+  it('commits the Pi CLI path and clears discovery inside the execution transition', async () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: { 'current-host': '/old/pi' },
+          discoveredModels: [{ id: 'cached' }],
+        },
+      },
+    };
+    const context = render(settings);
+    const cliInput = findSetting('CLI path').textComponents[0];
+    const order: string[] = [];
+    mockCliResolverReset.mockImplementationOnce(() => {
+      order.push('resolver-reset');
+    });
+    context.plugin.runProviderExecutionTransition.mockImplementationOnce(async (
+      providerIds: string[],
+      mutation: () => Promise<void>,
+    ) => {
+      order.push('transition-start');
+      expect(providerIds).toEqual(['pi']);
+      expect(getPiProviderSettings(settings).cliPathsByHost['current-host'])
+        .toBe('/old/pi');
+      await mutation();
+      order.push('settings-committed');
+      expect(getPiProviderSettings(settings).discoveredModels).toEqual([]);
+      expect(mockCliResolverReset).toHaveBeenCalledTimes(1);
+      order.push('transition-end');
+    });
+
+    await cliInput.onChangeCallback?.('/new/pi');
+
+    expect(order).toEqual([
+      'transition-start',
+      'resolver-reset',
+      'settings-committed',
+      'transition-end',
+    ]);
+    expect(getPiProviderSettings(settings).cliPathsByHost).toEqual({
+      'current-host': '/new/pi',
+    });
+    expect(context.plugin.applyProviderRuntimeSettings).toHaveBeenCalledWith(
+      ['pi'],
+      expect.any(Function),
+      expect.any(Function),
+    );
+  });
+
+  it('resynchronizes the Pi CLI input when transition setup fails before mutation', async () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        pi: { cliPathsByHost: { 'current-host': '/old/pi' } },
+      },
+    };
+    const context = render(settings);
+    const cliInput = findSetting('CLI path').textComponents[0];
+    cliInput.inputEl.value = '/failed/pi';
+    context.plugin.runProviderExecutionTransition.mockRejectedValueOnce(
+      new Error('transition failed'),
+    );
+
+    await expect(cliInput.onChangeCallback?.('/failed/pi')).rejects.toThrow(
+      'transition failed',
+    );
+
+    expect(getPiProviderSettings(settings).cliPathsByHost).toEqual({
+      'current-host': '/old/pi',
+    });
+    expect(cliInput.inputEl.value).toBe('/old/pi');
+    expect(mockCliResolverReset).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+  });
+
+  it('resynchronizes the Pi CLI input to durable settings when resolver reset fails', async () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        pi: { cliPathsByHost: { 'current-host': '/old/pi' } },
+      },
+    };
+    const context = render(settings);
+    const cliInput = findSetting('CLI path').textComponents[0];
+    cliInput.inputEl.value = '/new/pi';
+    mockCliResolverReset.mockImplementationOnce(() => {
+      throw new Error('resolver reset failed');
+    });
+
+    await expect(cliInput.onChangeCallback?.('/new/pi')).rejects.toThrow(
+      'resolver reset failed',
+    );
+
+    expect(getPiProviderSettings(settings).cliPathsByHost).toEqual({
+      'current-host': '/new/pi',
+    });
+    expect(cliInput.inputEl.value).toBe('/new/pi');
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
   });
 
   it('discovers models through PiModelDiscoveryService and reports failures', async () => {
@@ -472,7 +688,7 @@ describe('PiSettingsTab', () => {
     expect(mockDiscoverModels).toHaveBeenCalledTimes(1);
     expect(getPiProviderSettings(settings).discoveredModels).toHaveLength(1);
     expect(getPiProviderSettings(settings).visibleModels).toEqual(['pi:anthropic/claude-sonnet-4']);
-    expect(context.refreshModelSelectors).toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('pi');
 
     mockDiscoverModels.mockResolvedValueOnce({
       diagnostics: 'not logged in',
@@ -516,6 +732,37 @@ describe('PiSettingsTab', () => {
     expect(context.plugin.saveSettings).not.toHaveBeenCalled();
   });
 
+  it('does not publish unchanged model discovery', async () => {
+    const cachedModel = {
+      encodedId: 'pi:anthropic/claude-sonnet-4',
+      id: 'claude-sonnet-4',
+      input: ['text'] as Array<'text'>,
+      label: 'Claude Sonnet 4',
+      provider: 'anthropic',
+      reasoning: true,
+      thinkingLevels: ['off', 'medium'] as Array<'off' | 'medium'>,
+    };
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        pi: {
+          discoveredModels: [cachedModel],
+          visibleModels: [cachedModel.encodedId],
+        },
+      },
+    };
+    const context = render(settings);
+    mockDiscoverModels.mockResolvedValueOnce({
+      kind: 'completed',
+      models: [cachedModel],
+    });
+
+    await findElement('button', 'claudian-provider-model-picker-action').dispatchMockEvent('click');
+    await flushPromises();
+
+    expect(context.plugin.saveSettings).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+  });
+
   it('persists visible model choices and aliases', async () => {
     const settings: Record<string, unknown> = {
       providerConfigs: {
@@ -549,6 +796,7 @@ describe('PiSettingsTab', () => {
     expect(getPiProviderSettings(settings).modelAliases).toEqual({
       'pi:anthropic/claude-sonnet-4': 'Sonnet',
     });
-    expect(context.refreshModelSelectors).toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledTimes(2);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('pi');
   });
 });

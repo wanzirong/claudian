@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Writable } from 'node:stream';
 
 import {
   AcpJsonRpcTransport,
@@ -140,6 +140,28 @@ describe('AcpJsonRpcTransport', () => {
     });
   });
 
+  it('exposes the native request ID to server-request handlers', async () => {
+    harness.transport.start();
+    const handler = jest.fn().mockResolvedValue({ content: 'ok' });
+    harness.transport.onRequest('fs/read_text_file', handler);
+
+    harness.sendInbound({
+      id: 'native-acp-id',
+      jsonrpc: '2.0',
+      method: 'fs/read_text_file',
+      params: { path: '/tmp/file.ts' },
+    });
+
+    await expect(harness.nextOutbound()).resolves.toMatchObject({
+      id: 'native-acp-id',
+      result: { content: 'ok' },
+    });
+    expect(handler).toHaveBeenCalledWith(
+      { path: '/tmp/file.ts' },
+      { method: 'fs/read_text_file', requestId: 'native-acp-id' },
+    );
+  });
+
   it('rejects pending requests when disposed', async () => {
     const requestPromise = harness.transport.request('session/prompt', {
       prompt: [{ text: 'hi', type: 'text' }],
@@ -152,6 +174,34 @@ describe('AcpJsonRpcTransport', () => {
     harness.transport.dispose(new Error('transport stopped'));
 
     await expect(requestPromise).rejects.toThrow('transport stopped');
+  });
+
+  it('flushes all preceding notification writes before resolving', async () => {
+    const input = new PassThrough();
+    const pendingWrite: { release?: () => void } = {};
+    const output = new Writable({
+      write(chunk, _encoding, callback) {
+        if (chunk.length === 0) {
+          callback();
+          return;
+        }
+        pendingWrite.release = callback;
+      },
+    });
+    const transport = new AcpJsonRpcTransport({ input, output });
+    transport.notify('session/cancel', { sessionId: 'session-1' });
+
+    let flushed = false;
+    const flush = transport.flush().then(() => { flushed = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(flushed).toBe(false);
+
+    pendingWrite.release?.();
+    await flush;
+    expect(flushed).toBe(true);
+    transport.dispose();
+    input.end();
+    output.end();
   });
 
   it('rejects pending requests when input closes', async () => {

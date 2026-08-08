@@ -1,17 +1,19 @@
 import { getProviderConfig, setProviderConfig } from '../../core/providers/providerConfig';
 import { getProviderEnvironmentVariables } from '../../core/providers/providerEnvironment';
 import { DEFAULT_REASONING_VALUE } from '../../core/providers/reasoning';
-import type { HostnameCliPaths } from '../../core/types/settings';
+import { normalizeHostnameStringMap } from '../../core/providers/settings/HostnameStringMap';
 import {
-  getHostnameKey,
-  getLegacyHostnameKey,
-  migrateLegacyHostnameKeyedMap,
-} from '../../utils/env';
+  readStoredBoolean,
+  readStoredString,
+} from '../../core/providers/settings/storedSettings';
+import type { HostnameCliPaths } from '../../core/types/settings';
+import { getHostnameKey } from '../../utils/env';
 import {
   type CodexDiscoveredModel,
   findCodexModel,
   getCodexDefaultReasoningEffort,
   getDefaultCodexModel,
+  isCodexModelAvailable,
   normalizeCodexDiscoveredModels,
 } from './models';
 import { toCodexRuntimeModelId } from './modelSelection';
@@ -22,6 +24,9 @@ export type CodexReasoningSummary = 'auto' | 'concise' | 'detailed' | 'none';
 export type CodexInstallationMethod = 'native-windows' | 'wsl';
 export type HostnameInstallationMethods = Record<string, CodexInstallationMethod>;
 
+const CODEX_SAFE_MODES = ['workspace-write', 'read-only'] as const;
+const CODEX_REASONING_SUMMARIES = ['auto', 'concise', 'detailed', 'none'] as const;
+
 export interface CodexProviderConfig {
   enabled: boolean;
   safeMode: CodexSafeMode;
@@ -31,6 +36,7 @@ export interface CodexProviderConfig {
   discoveredModels: CodexDiscoveredModel[];
   modelAliases: Record<string, string>;
   visibleModels: string[] | null;
+  enableUltraEffort: boolean;
   reasoningSummary: CodexReasoningSummary;
   environmentVariables: string;
   environmentHash: string;
@@ -43,7 +49,6 @@ export interface CodexProviderConfig {
 export interface NormalizeCodexStoredConfigContext {
   platform?: NodeJS.Platform;
   hostnameKey?: string;
-  legacyHostnameKey?: string;
 }
 
 export interface NormalizeCodexStoredConfigResult {
@@ -59,6 +64,27 @@ function normalizeOptionalString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function readStoredCodexSafeMode(
+  value: unknown,
+  fallback: CodexSafeMode,
+): CodexSafeMode {
+  if (value === undefined) {
+    return fallback;
+  }
+  return (CODEX_SAFE_MODES as readonly unknown[]).includes(value)
+    ? value as CodexSafeMode
+    : 'read-only';
+}
+
+function readStoredCodexReasoningSummary(
+  value: unknown,
+  fallback: CodexReasoningSummary,
+): CodexReasoningSummary {
+  return (CODEX_REASONING_SUMMARIES as readonly unknown[]).includes(value)
+    ? value as CodexReasoningSummary
+    : fallback;
+}
+
 function shouldPersistCodexInstallationSettings(): boolean {
   return process.platform === 'win32';
 }
@@ -66,7 +92,6 @@ function shouldPersistCodexInstallationSettings(): boolean {
 function omitCurrentHost<T>(entries: Record<string, T>, hostnameKey: string): Record<string, T> {
   const next = { ...entries };
   delete next[hostnameKey];
-  delete next[getLegacyHostnameKey()];
   return next;
 }
 
@@ -98,6 +123,7 @@ export interface CodexProviderSettings {
   discoveredModels: CodexProviderConfig['discoveredModels'];
   modelAliases: CodexProviderConfig['modelAliases'];
   visibleModels: CodexProviderConfig['visibleModels'];
+  enableUltraEffort: CodexProviderConfig['enableUltraEffort'];
   reasoningSummary: CodexProviderConfig['reasoningSummary'];
   environmentVariables: CodexProviderConfig['environmentVariables'];
   environmentHash: CodexProviderConfig['environmentHash'];
@@ -118,6 +144,7 @@ export const DEFAULT_CODEX_PROVIDER_CONFIG: Readonly<CodexProviderConfig> = Obje
   discoveredModels: [],
   modelAliases: {},
   visibleModels: null,
+  enableUltraEffort: false,
   reasoningSummary: 'detailed',
   environmentVariables: '',
   environmentHash: '',
@@ -152,27 +179,15 @@ export function applyCodexModelDefaults(
   model: string,
   settings: Record<string, unknown>,
 ): void {
-  const modelMetadata = findCodexModel(getCodexProviderSettings(settings).discoveredModels, model);
+  const codexSettings = getCodexProviderSettings(settings);
+  const modelMetadata = findCodexModel(codexSettings.discoveredModels, model);
   settings.effortLevel = modelMetadata
-    ? getCodexDefaultReasoningEffort(modelMetadata)
+    ? getCodexDefaultReasoningEffort(modelMetadata, codexSettings.enableUltraEffort)
+      ?? DEFAULT_REASONING_VALUE
     : DEFAULT_REASONING_VALUE;
   if (shouldDisableCodexReasoningSummary(model)) {
     updateCodexProviderSettings(settings, { reasoningSummary: 'none' });
   }
-}
-
-function normalizeHostnameCliPaths(value: unknown): HostnameCliPaths {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const result: HostnameCliPaths = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === 'string' && entry.trim()) {
-      result[key] = entry.trim();
-    }
-  }
-  return result;
 }
 
 export function normalizeCodexVisibleModels(
@@ -239,21 +254,26 @@ export function createCodexVisibleModelFilter(
   value: unknown,
   discoveredModels: CodexDiscoveredModel[],
 ): string[] | null {
-  const normalized = normalizeCodexVisibleModels(value, discoveredModels);
-  return normalized !== null
-    && discoveredModels.length > 0
-    && normalized.length === discoveredModels.length
-    ? null
-    : normalized;
+  return normalizeCodexVisibleModels(value, discoveredModels);
 }
 
 export function getVisibleCodexModelIds(
   visibleModels: string[] | null,
   discoveredModels: CodexDiscoveredModel[],
 ): string[] {
-  return visibleModels === null
-    ? discoveredModels.map(model => model.model)
-    : normalizeCodexVisibleModels(visibleModels, discoveredModels) ?? [];
+  if (visibleModels !== null) {
+    return normalizeCodexVisibleModels(visibleModels, discoveredModels) ?? [];
+  }
+
+  const defaultModel = getDefaultCodexModel(discoveredModels);
+  return defaultModel
+    ? [
+      defaultModel.model,
+      ...discoveredModels
+        .filter(model => model.model !== defaultModel.model)
+        .map(model => model.model),
+    ]
+    : [];
 }
 
 function pruneCodexModelAliases(
@@ -296,9 +316,11 @@ function retargetRemovedCodexSelections(
     return;
   }
 
-  const fallbackModel = getDefaultCodexModel(
-    next.discoveredModels.filter(model => visibleModelIds.has(model.model)),
-  );
+  const fallbackModel = next.visibleModels
+    .map(modelId => next.discoveredModels.find(model => model.model === modelId))
+    .find((model): model is CodexDiscoveredModel => Boolean(
+      model && isCodexModelAvailable(model, next.enableUltraEffort),
+    )) ?? null;
   if (!fallbackModel) {
     return;
   }
@@ -322,14 +344,20 @@ function retargetRemovedCodexSelections(
   const nextSavedModel = maybeRetarget(savedCodexModel);
   if (nextSavedModel) {
     ensureCodexProjectionMap(settings, 'savedProviderModel').codex = nextSavedModel;
-    ensureCodexProjectionMap(settings, 'savedProviderEffort').codex = getCodexDefaultReasoningEffort(fallbackModel);
+    ensureCodexProjectionMap(settings, 'savedProviderEffort').codex = getCodexDefaultReasoningEffort(
+      fallbackModel,
+      next.enableUltraEffort,
+    ) ?? DEFAULT_REASONING_VALUE;
     ensureCodexProjectionMap(settings, 'savedProviderServiceTier').codex = fallbackServiceTier;
   }
 
   const nextTopLevelModel = maybeRetarget(settings.model);
   if (nextTopLevelModel) {
     settings.model = nextTopLevelModel;
-    settings.effortLevel = getCodexDefaultReasoningEffort(fallbackModel);
+    settings.effortLevel = getCodexDefaultReasoningEffort(
+      fallbackModel,
+      next.enableUltraEffort,
+    ) ?? DEFAULT_REASONING_VALUE;
     settings.serviceTier = fallbackServiceTier;
   }
 
@@ -340,15 +368,15 @@ function retargetRemovedCodexSelections(
 }
 
 function normalizeInstallationMethodsByHost(value: unknown): HostnameInstallationMethods {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
+  const normalized = normalizeHostnameStringMap(value);
   const result: HostnameInstallationMethods = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof key === 'string' && key.trim()) {
-      result[key] = normalizeCodexInstallationMethod(entry);
-    }
+  for (const [key, entry] of Object.entries(normalized)) {
+    Object.defineProperty(result, key, {
+      configurable: true,
+      enumerable: true,
+      value: normalizeCodexInstallationMethod(entry),
+      writable: true,
+    });
   }
   return result;
 }
@@ -359,61 +387,67 @@ function hasOwnEntry<T>(entries: Record<string, T>, key: string): boolean {
 
 function getCodexStoredConfig(
   settings: Record<string, unknown>,
-  hostnameKey: string,
-  legacyHostnameKey: string,
 ): CodexProviderConfig {
   const config = getProviderConfig(settings, 'codex');
-  const normalizedCliPathsByHost = normalizeHostnameCliPaths(config.cliPathsByHost ?? settings.codexCliPathsByHost);
-  const normalizedInstallationMethodsByHost = normalizeInstallationMethodsByHost(config.installationMethodsByHost);
-  const normalizedWslDistroOverridesByHost = normalizeHostnameCliPaths(config.wslDistroOverridesByHost);
-  const cliPathsByHost = migrateLegacyHostnameKeyedMap(normalizedCliPathsByHost, hostnameKey, legacyHostnameKey);
-  const installationMethodsByHost = migrateLegacyHostnameKeyedMap(
-    normalizedInstallationMethodsByHost,
-    hostnameKey,
-    legacyHostnameKey,
+  const cliPathsByHost = normalizeHostnameStringMap(
+    config.cliPathsByHost ?? settings.codexCliPathsByHost,
   );
-  const wslDistroOverridesByHost = migrateLegacyHostnameKeyedMap(
-    normalizedWslDistroOverridesByHost,
-    hostnameKey,
-    legacyHostnameKey,
+  const installationMethodsByHost = normalizeInstallationMethodsByHost(
+    config.installationMethodsByHost,
+  );
+  const wslDistroOverridesByHost = normalizeHostnameStringMap(
+    config.wslDistroOverridesByHost,
   );
   const discoveredModels = normalizeCodexDiscoveredModels(config.discoveredModels);
   const visibleModels = normalizeCodexVisibleModels(config.visibleModels, discoveredModels);
 
   return {
-    enabled: (config.enabled as boolean | undefined)
-      ?? (settings.codexEnabled as boolean | undefined)
-      ?? DEFAULT_CODEX_PROVIDER_CONFIG.enabled,
-    safeMode: (config.safeMode as CodexSafeMode | undefined)
-      ?? (settings.codexSafeMode as CodexSafeMode | undefined)
-      ?? DEFAULT_CODEX_PROVIDER_CONFIG.safeMode,
-    cliPath: (config.cliPath as string | undefined)
-      ?? (settings.codexCliPath as string | undefined)
-      ?? DEFAULT_CODEX_PROVIDER_CONFIG.cliPath,
+    enabled: readStoredBoolean(
+      config.enabled,
+      readStoredBoolean(settings.codexEnabled, DEFAULT_CODEX_PROVIDER_CONFIG.enabled),
+    ),
+    safeMode: readStoredCodexSafeMode(
+      config.safeMode,
+      readStoredCodexSafeMode(settings.codexSafeMode, DEFAULT_CODEX_PROVIDER_CONFIG.safeMode),
+    ),
+    cliPath: readStoredString(
+      config.cliPath,
+      readStoredString(settings.codexCliPath, DEFAULT_CODEX_PROVIDER_CONFIG.cliPath),
+    ),
     cliPathsByHost,
-    customModels: (config.customModels as string | undefined)
-      ?? DEFAULT_CODEX_PROVIDER_CONFIG.customModels,
+    customModels: readStoredString(config.customModels, DEFAULT_CODEX_PROVIDER_CONFIG.customModels),
     discoveredModels,
     modelAliases: pruneCodexModelAliases(
       normalizeCodexModelAliases(config.modelAliases, discoveredModels),
       getCodexAliasModelIds(visibleModels, discoveredModels),
     ),
     visibleModels,
-    reasoningSummary: (config.reasoningSummary as CodexReasoningSummary | undefined)
-      ?? (settings.codexReasoningSummary as CodexReasoningSummary | undefined)
-      ?? DEFAULT_CODEX_PROVIDER_CONFIG.reasoningSummary,
-    environmentVariables: (config.environmentVariables as string | undefined)
-      ?? getProviderEnvironmentVariables(settings, 'codex')
-      ?? DEFAULT_CODEX_PROVIDER_CONFIG.environmentVariables,
-    environmentHash: (config.environmentHash as string | undefined)
-      ?? (settings.lastCodexEnvHash as string | undefined)
-      ?? DEFAULT_CODEX_PROVIDER_CONFIG.environmentHash,
+    enableUltraEffort: config.enableUltraEffort === true,
+    reasoningSummary: readStoredCodexReasoningSummary(
+      config.reasoningSummary,
+      readStoredCodexReasoningSummary(
+        settings.codexReasoningSummary,
+        DEFAULT_CODEX_PROVIDER_CONFIG.reasoningSummary,
+      ),
+    ),
+    environmentVariables: readStoredString(
+      config.environmentVariables,
+      getProviderEnvironmentVariables(settings, 'codex')
+        ?? DEFAULT_CODEX_PROVIDER_CONFIG.environmentVariables,
+    ),
+    environmentHash: readStoredString(
+      config.environmentHash,
+      readStoredString(settings.lastCodexEnvHash, DEFAULT_CODEX_PROVIDER_CONFIG.environmentHash),
+    ),
     catalogTimestamp: typeof config.catalogTimestamp === 'number'
+      && Number.isFinite(config.catalogTimestamp)
+      && config.catalogTimestamp >= 0
       ? config.catalogTimestamp
       : DEFAULT_CODEX_PROVIDER_CONFIG.catalogTimestamp,
-    catalogFingerprint: typeof config.catalogFingerprint === 'string'
-      ? config.catalogFingerprint
-      : DEFAULT_CODEX_PROVIDER_CONFIG.catalogFingerprint,
+    catalogFingerprint: readStoredString(
+      config.catalogFingerprint,
+      DEFAULT_CODEX_PROVIDER_CONFIG.catalogFingerprint,
+    ),
     installationMethodsByHost,
     wslDistroOverridesByHost,
   };
@@ -425,7 +459,6 @@ function getNormalizedCodexStoredConfigContext(
   return {
     platform: context.platform ?? process.platform,
     hostnameKey: context.hostnameKey ?? getHostnameKey(),
-    legacyHostnameKey: context.legacyHostnameKey ?? getLegacyHostnameKey(),
   };
 }
 
@@ -452,9 +485,8 @@ export function normalizeCodexStoredConfig(
   const {
     platform,
     hostnameKey,
-    legacyHostnameKey,
   } = getNormalizedCodexStoredConfigContext(context);
-  const storedConfig = getCodexStoredConfig(settings, hostnameKey, legacyHostnameKey);
+  const storedConfig = getCodexStoredConfig(settings);
   const installationMethodsByHost = { ...storedConfig.installationMethodsByHost };
   const wslDistroOverridesByHost = { ...storedConfig.wslDistroOverridesByHost };
 
@@ -471,9 +503,7 @@ export function normalizeCodexStoredConfig(
     }
   } else {
     delete installationMethodsByHost[hostnameKey];
-    delete installationMethodsByHost[legacyHostnameKey];
     delete wslDistroOverridesByHost[hostnameKey];
-    delete wslDistroOverridesByHost[legacyHostnameKey];
   }
 
   const normalizedConfig: CodexProviderConfig & Record<string, unknown> = {
@@ -497,8 +527,7 @@ export function getCodexProviderSettings(
 ): CodexProviderSettings {
   const config = getProviderConfig(settings, 'codex');
   const hostnameKey = getHostnameKey();
-  const legacyHostnameKey = getLegacyHostnameKey();
-  const storedConfig = getCodexStoredConfig(settings, hostnameKey, legacyHostnameKey);
+  const storedConfig = getCodexStoredConfig(settings);
   const hasHostScopedInstallationMethods = Object.keys(storedConfig.installationMethodsByHost).length > 0;
   const hasHostScopedWslDistroOverrides = Object.keys(storedConfig.wslDistroOverridesByHost).length > 0;
   const legacyInstallationMethod = normalizeCodexInstallationMethod(config.installationMethod);
@@ -532,7 +561,7 @@ export function updateCodexProviderSettings(
     ? normalizeInstallationMethodsByHost(updates.installationMethodsByHost)
     : { ...current.installationMethodsByHost };
   const updatedWslDistroOverridesByHost = 'wslDistroOverridesByHost' in updates
-    ? normalizeHostnameCliPaths(updates.wslDistroOverridesByHost)
+    ? normalizeHostnameStringMap(updates.wslDistroOverridesByHost)
     : { ...current.wslDistroOverridesByHost };
   const installationMethodsByHost = persistInstallationSettings
     ? updatedInstallationMethodsByHost
@@ -606,6 +635,7 @@ export function updateCodexProviderSettings(
     discoveredModels: next.discoveredModels,
     modelAliases: next.modelAliases,
     visibleModels: next.visibleModels,
+    enableUltraEffort: next.enableUltraEffort,
     reasoningSummary: next.reasoningSummary,
     environmentVariables: next.environmentVariables,
     environmentHash: next.environmentHash,

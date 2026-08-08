@@ -1,9 +1,13 @@
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+
 import type { ProviderHistoryPathContext } from '../../../core/providers/types';
-import { isSubagentToolName } from '../../../core/tools/toolNames';
 import type { ChatMessage, SubagentInfo, ToolCallInfo } from '../../../core/types';
+import { ClaudeTaskToolNormalizer } from '../normalization/ClaudeTaskToolNormalizer';
+import { isClaudeSubagentToolName } from '../subagentToolNames';
 import { buildAsyncSubagentInfo } from './sdkAsyncSubagent';
 import { filterActiveBranch } from './sdkBranchFilter';
-import type { SDKSessionLoadResult } from './sdkHistoryTypes';
+import type { SDKNativeMessage, SDKSessionLoadResult } from './sdkHistoryTypes';
 import {
   collectAsyncSubagentResults,
   collectStructuredPatchResults,
@@ -16,7 +20,6 @@ import {
   parseSDKMessageToChat,
 } from './sdkMessageParsing';
 import {
-  deleteSDKSession,
   encodeVaultPathForSDK,
   getSDKProjectsPath,
   getSDKSessionAvailability,
@@ -35,6 +38,14 @@ import {
 } from './sdkSubagentSidecar';
 
 export type {
+  ClaudeSessionTimeCandidate,
+  ClaudeSessionTimeFingerprint,
+} from './ClaudeSessionRecovery';
+export {
+  recoverSDKSessionIdByTime,
+  selectClaudeSessionRecoveryCandidate,
+} from './ClaudeSessionRecovery';
+export type {
   AsyncSubagentResult,
   ResolvedAsyncStatus,
   SDKNativeContentBlock,
@@ -44,7 +55,6 @@ export type {
 } from './sdkHistoryTypes';
 export {
   collectAsyncSubagentResults,
-  deleteSDKSession,
   encodeVaultPathForSDK,
   extractXmlTag,
   filterActiveBranch,
@@ -65,6 +75,54 @@ export {
   extractAgentIdFromToolUseResult,
   resolveToolUseResultStatus,
 } from './sdkAsyncSubagent';
+
+export function parseLegacyConversationSessionId(
+  content: string,
+  conversationId: string,
+): string | null {
+  const firstLine = content.split(/\r?\n/, 1)[0];
+  if (!firstLine) {
+    return null;
+  }
+
+  try {
+    const record = JSON.parse(firstLine) as {
+      type?: unknown;
+      id?: unknown;
+      sessionId?: unknown;
+    };
+    if (
+      record.type !== 'meta'
+      || record.id !== conversationId
+      || typeof record.sessionId !== 'string'
+      || !isValidSessionId(record.sessionId)
+    ) {
+      return null;
+    }
+    return record.sessionId;
+  } catch {
+    return null;
+  }
+}
+
+export async function readLegacyConversationSessionId(
+  vaultPath: string,
+  conversationId: string,
+): Promise<string | null> {
+  if (!isValidSessionId(conversationId)) {
+    return null;
+  }
+
+  try {
+    const content = await fs.readFile(
+      path.join(vaultPath, '.claude', 'sessions', `${conversationId}.jsonl`),
+      'utf8',
+    );
+    return parseLegacyConversationSessionId(content, conversationId);
+  } catch {
+    return null;
+  }
+}
 
 export async function loadSDKSessionMessages(
   vaultPath: string,
@@ -91,6 +149,7 @@ export async function loadSDKSessionMessages(
 
   const chatMessages: ChatMessage[] = [];
   let pendingAssistant: ChatMessage | null = null;
+  const taskToolNormalizer = new ClaudeTaskToolNormalizer();
 
   // Merge consecutive assistant messages until an actual user message appears
   for (const sdkMsg of filteredEntries) {
@@ -101,6 +160,7 @@ export async function loadSDKSessionMessages(
 
     const chatMsg = parseSDKMessageToChat(sdkMsg, toolResults);
     if (!chatMsg) continue;
+    normalizeTaskToolCalls(chatMsg, taskToolNormalizer, toolUseResults);
 
     if (chatMsg.role === 'assistant') {
       // context_compacted must not merge with previous assistant (it's a standalone separator)
@@ -139,7 +199,7 @@ export async function loadSDKSessionMessages(
     for (const msg of chatMessages) {
       if (msg.role !== 'assistant' || !msg.toolCalls) continue;
       for (const toolCall of msg.toolCalls) {
-        if (!isSubagentToolName(toolCall.name)) continue;
+        if (!isClaudeSubagentToolName(toolCall.name)) continue;
         if (toolCall.subagent) continue;
         if (toolCall.input?.run_in_background !== true) continue;
 
@@ -188,4 +248,77 @@ export async function loadSDKSessionMessages(
   chatMessages.sort((a, b) => a.timestamp - b.timestamp);
 
   return { messages: chatMessages, skippedLines: result.skippedLines };
+}
+
+export function getLastSDKSessionModel(
+  entries: SDKNativeMessage[],
+  resumeAtMessageId?: string,
+): string | null {
+  const activeBranch = filterActiveBranch(entries, resumeAtMessageId);
+  if (
+    resumeAtMessageId
+    && !activeBranch.some(entry => entry.uuid === resumeAtMessageId)
+  ) {
+    return null;
+  }
+
+  let model: string | null = null;
+  for (const entry of activeBranch) {
+    const candidate = entry.type === 'assistant'
+      ? entry.message?.model?.trim()
+      : '';
+    if (candidate && candidate !== '<synthetic>') {
+      model = candidate;
+    }
+  }
+  return model;
+}
+
+export async function loadSDKSessionModel(
+  vaultPath: string,
+  sessionId: string,
+  resumeAtMessageId?: string,
+  sessionPath?: string,
+  pathContext?: ProviderHistoryPathContext,
+): Promise<string | null> {
+  const result = sessionPath
+    ? await readSDKSessionFile(sessionPath)
+    : await (pathContext
+      ? readSDKSession(vaultPath, sessionId, pathContext)
+      : readSDKSession(vaultPath, sessionId));
+  return result.error
+    ? null
+    : getLastSDKSessionModel(result.messages, resumeAtMessageId);
+}
+
+function normalizeTaskToolCalls(
+  message: ChatMessage,
+  normalizer: ClaudeTaskToolNormalizer,
+  toolUseResults: Map<string, unknown>,
+): void {
+  if (message.role !== 'assistant' || !message.toolCalls) return;
+
+  for (const toolCall of message.toolCalls) {
+    const normalizedUse = normalizer.normalizeToolUse(
+      toolCall.id,
+      toolCall.name,
+      toolCall.input,
+    );
+    if (!normalizedUse) continue;
+
+    const rawOutput = toolUseResults.get(toolCall.id);
+    const normalizedResult = toolCall.status === 'running'
+      ? null
+      : normalizer.normalizeToolResult(toolCall.id, rawOutput, {
+        fallbackContent: toolCall.result,
+        isError: toolCall.status === 'error' || toolCall.status === 'blocked',
+      });
+    const normalized = normalizedResult ?? normalizedUse;
+    toolCall.name = normalized.name;
+    toolCall.input = normalized.input;
+    toolCall.providerPayload = {
+      ...toolCall.providerPayload,
+      ...normalized.providerPayload,
+    };
+  }
 }

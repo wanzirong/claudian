@@ -91,6 +91,45 @@ describe('mapOpencodeMessages', () => {
     ]);
   });
 
+  it('replays a persisted late unknown tool title without remapping it', () => {
+    const messages = mapOpencodeMessages([
+      {
+        info: {
+          id: 'msg-user-future',
+          role: 'user',
+          time: { created: 1_000 },
+        },
+        parts: [{ id: 'part-user-future', text: 'Use future tool', type: 'text' }],
+      },
+      {
+        info: {
+          id: 'msg-assistant-future',
+          role: 'assistant',
+          time: { created: 2_000, completed: 3_000 },
+        },
+        parts: [{
+          callID: 'tool-future',
+          id: 'part-tool-future',
+          state: {
+            input: { command: 'pwd', opaque: ['future'] },
+            output: 'Concise result',
+            status: 'completed',
+          },
+          tool: 'future_tool',
+          type: 'tool',
+        }],
+      },
+    ]);
+
+    expect(JSON.parse(JSON.stringify(messages))[1].toolCalls[0]).toMatchObject({
+      id: 'tool-future',
+      input: { command: 'pwd', opaque: ['future'] },
+      name: 'future_tool',
+      result: 'Concise result',
+      status: 'completed',
+    });
+  });
+
   it('rehydrates user file image parts', () => {
     const messages = mapOpencodeMessages([
       {
@@ -370,6 +409,7 @@ describe('loadOpencodeSessionMessages', () => {
 
   it('loads conversation content without selecting raw message metadata', async () => {
     expect(OPENCODE_MESSAGE_ROW_SQL).toContain("json_extract(data, '$.role')");
+    expect(OPENCODE_MESSAGE_ROW_SQL).toContain("json_extract(data, '$.modelID')");
     expect(OPENCODE_MESSAGE_ROW_SQL).not.toMatch(/\btime_created,\s*data\s+from\s+message\b/i);
 
     const dbPath = path.join(tmpRoot, 'opencode.db');

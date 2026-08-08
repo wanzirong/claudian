@@ -3,12 +3,12 @@ import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
   ProviderCliResolver,
+  ProviderModelCatalogRefreshResult,
+  ProviderTransitionOwnerContext,
   ProviderWorkspaceRegistration,
   ProviderWorkspaceServices,
 } from '../../../core/providers/types';
-import type { HomeFileAdapter } from '../../../core/storage/HomeFileAdapter';
 import type { VaultFileAdapter } from '../../../core/storage/VaultFileAdapter';
-import { getVaultPath } from '../../../utils/path';
 import { CodexAgentMentionProvider } from '../agents/CodexAgentMentionProvider';
 import { CodexSkillCatalog } from '../commands/CodexSkillCatalog';
 import { CodexCliResolver } from '../runtime/CodexCliResolver';
@@ -16,7 +16,6 @@ import { CodexModelCatalogCoordinator } from '../runtime/CodexModelCatalogCoordi
 import { CodexModelDiscoveryService } from '../runtime/CodexModelDiscoveryService';
 import { getCodexProviderSettings } from '../settings';
 import { CodexSkillListingService } from '../skills/CodexSkillListingService';
-import { CodexSkillStorage } from '../storage/CodexSkillStorage';
 import { CodexSubagentStorage } from '../storage/CodexSubagentStorage';
 import { codexSettingsTabRenderer } from '../ui/CodexSettingsTab';
 
@@ -26,6 +25,15 @@ export interface CodexWorkspaceServices extends ProviderWorkspaceServices {
   agentMentionProvider: CodexAgentMentionProvider;
   cliResolver: ProviderCliResolver;
   modelCatalogCoordinator: CodexModelCatalogCoordinator;
+  refreshModelCatalog(
+    context?: ProviderTransitionOwnerContext,
+  ): Promise<ProviderModelCatalogRefreshResult>;
+  dispose(): Promise<void>;
+}
+
+export interface CodexWorkspaceServicesOptions {
+  readonly modelCatalogCoordinator?: CodexModelCatalogCoordinator;
+  readonly skillListingService?: CodexSkillListingService;
 }
 
 function createCodexCliResolver(): ProviderCliResolver {
@@ -35,22 +43,35 @@ function createCodexCliResolver(): ProviderCliResolver {
 export async function createCodexWorkspaceServices(
   plugin: ProviderHost,
   vaultAdapter: VaultFileAdapter,
-  homeAdapter: HomeFileAdapter,
+  options: CodexWorkspaceServicesOptions = {},
 ): Promise<CodexWorkspaceServices> {
   const subagentStorage = new CodexSubagentStorage(vaultAdapter);
   const agentMentionProvider = new CodexAgentMentionProvider(subagentStorage);
 
-  const skillListProvider = new CodexSkillListingService(plugin);
-  const modelDiscovery = new CodexModelDiscoveryService(plugin);
-  const modelCatalogCoordinator = new CodexModelCatalogCoordinator(plugin, modelDiscovery);
-  const commandCatalog = new CodexSkillCatalog(
-    new CodexSkillStorage(
-      vaultAdapter,
-      homeAdapter,
-    ),
-    skillListProvider,
-    getVaultPath(plugin.app),
-  );
+  const skillListProvider = options.skillListingService
+    ?? new CodexSkillListingService(plugin);
+  const modelCatalogCoordinator = options.modelCatalogCoordinator
+    ?? new CodexModelCatalogCoordinator(
+      plugin,
+      new CodexModelDiscoveryService(plugin),
+    );
+  const commandCatalog = new CodexSkillCatalog(skillListProvider);
+  const unregisterTransitionHook = plugin.executionLifecycleRegistry
+    .registerTransitionHook('codex', {
+      beforeTransition: async () => {
+        modelCatalogCoordinator.beginEnvironmentTransition();
+        skillListProvider.beginEnvironmentTransition();
+        await Promise.all([
+          modelCatalogCoordinator.quiesceForEnvironmentChange(),
+          skillListProvider.quiesceForEnvironmentChange(),
+        ]);
+      },
+      afterTransition: () => {
+        modelCatalogCoordinator.endEnvironmentTransition();
+        skillListProvider.endEnvironmentTransition();
+      },
+    });
+  let disposePromise: Promise<void> | null = null;
 
   if (getCodexProviderSettings(plugin.settings).enabled) {
     plugin.app.workspace.onLayoutReady(() => {
@@ -68,17 +89,24 @@ export async function createCodexWorkspaceServices(
     refreshAgentMentions: async () => {
       await agentMentionProvider.loadAgents();
     },
-    refreshModelCatalog: async () => modelCatalogCoordinator.refreshModelCatalog(),
+    refreshModelCatalog: async context => modelCatalogCoordinator.refreshModelCatalog(context),
     prepareSettings: async () => agentMentionProvider.loadAgents(),
-    dispose: () => modelCatalogCoordinator.dispose(),
+    dispose() {
+      if (disposePromise) return disposePromise;
+      unregisterTransitionHook();
+      disposePromise = Promise.all([
+        modelCatalogCoordinator.dispose(),
+        skillListProvider.dispose(),
+      ]).then(() => undefined);
+      return disposePromise;
+    },
   };
 }
 
 export const codexWorkspaceRegistration: ProviderWorkspaceRegistration<CodexWorkspaceServices> = {
-  initialize: async ({ plugin, vaultAdapter, homeAdapter }) => createCodexWorkspaceServices(
+  initialize: async ({ plugin, vaultAdapter }) => createCodexWorkspaceServices(
     plugin,
     vaultAdapter,
-    homeAdapter,
   ),
 };
 

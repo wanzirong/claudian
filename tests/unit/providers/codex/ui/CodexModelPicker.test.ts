@@ -4,6 +4,8 @@ import { getCodexProviderSettings } from '@/providers/codex/settings';
 import { renderCodexModelPicker } from '@/providers/codex/ui/CodexModelPicker';
 
 const settingNames: string[] = [];
+const settingDescriptions: string[] = [];
+const settingClasses: string[] = [];
 const elements: FakeElement[] = [];
 const mockNormalizeAllModelVariants = jest.fn();
 
@@ -16,6 +18,10 @@ jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
 jest.mock('obsidian', () => ({
   Notice: jest.fn(),
   Setting: class MockSetting {
+    settingEl = {
+      addClass: (value: string) => settingClasses.push(value),
+    };
+
     constructor(_container: unknown) {}
 
     setName(name: string) {
@@ -23,7 +29,8 @@ jest.mock('obsidian', () => ({
       return this;
     }
 
-    setDesc(_description: string) {
+    setDesc(description: string) {
+      settingDescriptions.push(description);
       return this;
     }
   },
@@ -42,9 +49,9 @@ interface FakeElement {
   text: string;
   title: string;
   value: string;
-  addEventListener(event: string, handler: () => unknown): void;
+  addEventListener(event: string, handler: (...args: any[]) => unknown): void;
   appendText(value: string): void;
-  classList: { add(value: string): void };
+  classList: { add(value: string): void; remove(value: string): void };
   createDiv(options?: { cls?: string; text?: string }): FakeElement;
   createEl(tag: string, options?: { cls?: string; text?: string; type?: string }): FakeElement;
   createSpan(options?: { cls?: string; text?: string }): FakeElement;
@@ -52,7 +59,7 @@ interface FakeElement {
   setAttribute(name: string, value: string): void;
   setText(value: string): void;
   toggleClass(value: string, force: boolean): void;
-  trigger(event: string): unknown[];
+  trigger(event: string, eventArg?: unknown): unknown[];
 }
 
 function createElement(
@@ -60,7 +67,7 @@ function createElement(
   options: { cls?: string; text?: string; type?: string } = {},
   parent: FakeElement | null = null,
 ): FakeElement {
-  const listeners = new Map<string, Array<() => unknown>>();
+  const listeners = new Map<string, Array<(...args: any[]) => unknown>>();
   const classes = new Set(options.cls?.split(/\s+/).filter(Boolean) ?? []);
   const element: FakeElement = {
     attrs: options.type ? { type: options.type } : {},
@@ -86,6 +93,9 @@ function createElement(
     classList: {
       add(value) {
         classes.add(value);
+      },
+      remove(value) {
+        classes.delete(value);
       },
     },
     createDiv(childOptions = {}) {
@@ -113,8 +123,8 @@ function createElement(
         classes.delete(value);
       }
     },
-    trigger(event) {
-      return (listeners.get(event) ?? []).map(handler => handler());
+    trigger(event, eventArg) {
+      return (listeners.get(event) ?? []).map(handler => handler(eventArg));
     },
   };
   elements.push(element);
@@ -154,7 +164,7 @@ function createPlugin() {
 function createContext(plugin: ReturnType<typeof createPlugin>) {
   return {
     plugin,
-    refreshModelSelectors: jest.fn(),
+    notifyProviderModelOptionsChanged: jest.fn(),
   } as any;
 }
 
@@ -173,6 +183,8 @@ async function flushPromises(): Promise<void> {
 describe('CodexModelPicker', () => {
   beforeEach(() => {
     settingNames.length = 0;
+    settingDescriptions.length = 0;
+    settingClasses.length = 0;
     elements.length = 0;
     jest.clearAllMocks();
   });
@@ -186,10 +198,25 @@ describe('CodexModelPicker', () => {
     } as any);
 
     expect(settingNames).toContain('Visible models');
+    expect(settingDescriptions).toContain(
+      'Choose which models are available in the chat selector. Drag to reorder them; the provider uses the first currently usable model as its default. Select at least one model to use this provider.',
+    );
+    expect(settingClasses).toContain('claudian-provider-model-picker-setting');
     expect(elements.filter(element => element.attrs.type === 'checkbox').map(element => element.checked))
       .toEqual([true, true]);
-    expect(elements.filter(element => element.tag === 'label').map(element => element.title))
+    expect(elements.filter(element => element.tag === 'label' && element.title).map(element => element.title))
       .toEqual(['gpt-5.4-mini', 'gpt-5.5']);
+
+    const aliasField = findElement(element =>
+      element.classes.has('claudian-provider-model-picker-selected-alias-field')
+    );
+    expect(aliasField.tag).toBe('label');
+    expect(aliasField.children.find(element =>
+      element.classes.has('claudian-provider-model-picker-selected-alias-label')
+    )?.text).toBe('Alias (optional)');
+    expect(aliasField.children.some(element =>
+      element.classes.has('claudian-provider-model-picker-selected-alias')
+    )).toBe(true);
 
     findElement(element => element.attrs['aria-label'] === 'Clear all selected Codex models')
       .trigger('click');
@@ -197,7 +224,122 @@ describe('CodexModelPicker', () => {
 
     expect(getCodexProviderSettings(plugin.settings).visibleModels).toEqual([]);
     expect(plugin.saveSettings).toHaveBeenCalledTimes(1);
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
+  });
+
+  it('marks the first selected model as default and reorders from the drag handle', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+
+    renderCodexModelPicker(createElement() as any, context, {
+      refreshModelCatalog: jest.fn(),
+    } as any);
+
+    expect(elements.filter(element =>
+      element.classes.has('claudian-provider-model-picker-selected-default')
+    ).map(element => element.text)).toEqual(['Default']);
+    expect(elements.some(element =>
+      element.classes.has('claudian-provider-model-picker-selected-order')
+    )).toBe(false);
+    const dragHandle = findElement(element =>
+      element.classes.has('claudian-provider-model-picker-selected-drag')
+    );
+    expect(dragHandle.attrs['aria-label']).toContain('Reorder ');
+    const preventDefault = jest.fn();
+
+    dragHandle.trigger('keydown', { key: 'ArrowDown', preventDefault });
+    await flushPromises();
+
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(getCodexProviderSettings(plugin.settings).visibleModels).toEqual([
+      'gpt-5.4-mini',
+      'gpt-5.5',
+    ]);
+  });
+
+  it('marks the first currently available ordered model as default', () => {
+    const plugin = createPlugin();
+    plugin.settings.providerConfigs.codex.discoveredModels = [
+      {
+        ...TEST_CODEX_CATALOG[1],
+        model: 'gpt-ultra-only',
+        displayName: 'GPT Ultra Only',
+        supportedReasoningEfforts: [{ value: 'ultra', description: 'Ultra' }],
+      },
+      ...TEST_CODEX_CATALOG,
+    ];
+    plugin.settings.providerConfigs.codex.enableUltraEffort = false;
+    plugin.settings.providerConfigs.codex.visibleModels = ['gpt-ultra-only', 'gpt-5.5'];
+
+    renderCodexModelPicker(createElement() as any, createContext(plugin), {
+      refreshModelCatalog: jest.fn(),
+    } as any);
+
+    const defaultBadge = findElement(element =>
+      element.classes.has('claudian-provider-model-picker-selected-default')
+    );
+    expect(defaultBadge.parent?.parent?.parent?.attrs['data-model-id']).toBe('gpt-5.5');
+  });
+
+
+  it('persists drag reordering of selected models', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+
+    renderCodexModelPicker(createElement() as any, context, {
+      refreshModelCatalog: jest.fn(),
+    } as any);
+
+    const dragHandles = elements.filter(element =>
+      element.classes.has('claudian-provider-model-picker-selected-drag')
+    );
+    const selectedRows = elements.filter(element =>
+      element.classes.has('claudian-provider-model-picker-selected-row')
+    );
+    const dataTransfer = {
+      effectAllowed: '',
+      getData: jest.fn().mockReturnValue(''),
+      setData: jest.fn(),
+    };
+    dragHandles[1].trigger('dragstart', { dataTransfer });
+    selectedRows[0].trigger('drop', {
+      dataTransfer,
+      preventDefault: jest.fn(),
+    });
+    await flushPromises();
+
+    expect(dataTransfer.setData).toHaveBeenCalledWith('text/plain', 'gpt-5.4-mini');
+    expect(getCodexProviderSettings(plugin.settings).visibleModels).toEqual([
+      'gpt-5.4-mini',
+      'gpt-5.5',
+    ]);
+  });
+
+  it('marks an ultra-only model unavailable while ultra effort is disabled', () => {
+    const plugin = createPlugin();
+    plugin.settings.providerConfigs.codex = {
+      discoveredModels: [{
+        ...TEST_CODEX_CATALOG[0],
+        model: 'gpt-ultra-only',
+        displayName: 'GPT Ultra Only',
+        supportedReasoningEfforts: [
+          { value: 'ultra', description: 'Automatic task delegation' },
+        ],
+        defaultReasoningEffort: 'ultra',
+      }],
+      enableUltraEffort: false,
+      modelAliases: {},
+      visibleModels: null,
+    };
+
+    renderCodexModelPicker(createElement() as any, createContext(plugin), {} as any);
+
+    expect(findElement(element =>
+      element.classes.has('claudian-provider-model-picker-row-badge')
+    ).text).toBe('Unavailable');
+    expect(findElement(element =>
+      element.classes.has('claudian-provider-model-picker-selected-unavailable')
+    ).text).toBe('Requires Ultra effort to be enabled');
   });
 
   it('registers void-returning DOM event callbacks for asynchronous actions', async () => {
@@ -278,7 +420,7 @@ describe('CodexModelPicker', () => {
       'gpt-5.5': 'Primary',
     });
     expect(plugin.saveSettings).toHaveBeenCalledTimes(1);
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
   });
 
   it('refreshes the app-server catalog through the provider-owned persistence boundary', async () => {
@@ -299,7 +441,7 @@ describe('CodexModelPicker', () => {
 
     expect(ensureFresh).toHaveBeenCalledWith('model-picker', { force: true });
     expect(plugin.saveSettings).not.toHaveBeenCalled();
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
   });
 
   it('does not save when refresh only changes the runtime catalog', async () => {
@@ -319,7 +461,7 @@ describe('CodexModelPicker', () => {
     await flushPromises();
 
     expect(plugin.saveSettings).not.toHaveBeenCalled();
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
   });
 
   it('checks cached catalog freshness on open and rerenders after background refresh', async () => {
@@ -377,6 +519,6 @@ describe('CodexModelPicker', () => {
     expect(elements.some(element => (
       element.tag === 'label' && element.title === 'gpt-5.6-new'
     ))).toBe(true);
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(2);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
   });
 });

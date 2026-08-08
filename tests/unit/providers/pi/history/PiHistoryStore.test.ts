@@ -9,6 +9,7 @@ import {
   type PiSessionEntry,
   resolvePiActivePath,
   resolvePiEntryPath,
+  rollbackCreatedPiForkSessionFile,
 } from '@/providers/pi/history/PiHistoryStore';
 
 describe('PiHistoryStore', () => {
@@ -67,6 +68,50 @@ describe('PiHistoryStore', () => {
       role: 'user',
     });
     expect(messages[0].displayContent).toBeUndefined();
+  });
+
+  it.each([
+    {
+      displayContent: '/skill:commit-push',
+      suffix: '',
+    },
+    {
+      displayContent: '/skill:commit-push include untracked files',
+      suffix: [
+        '',
+        '',
+        'include untracked files',
+        '',
+        '<linked_note path="notes/release.md" />',
+      ].join('\n'),
+    },
+  ])('restores $displayContent from Pi-expanded skill prompts', ({
+    displayContent,
+    suffix,
+  }) => {
+    const expandedPrompt = [
+      '<skill name="commit-push" location="/Users/test/.agents/skills/commit-push/SKILL.md">',
+      'References are relative to /Users/test/.agents/skills/commit-push.',
+      '',
+      'Commit all uncommitted changes, then push to remote.',
+      '</skill>',
+    ].join('\n') + suffix;
+    const content = JSON.stringify({
+      id: 'u1',
+      type: 'message',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: expandedPrompt }],
+      },
+    });
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages[0]).toMatchObject({
+      content: expandedPrompt,
+      displayContent,
+      role: 'user',
+    });
   });
 
   it('rehydrates user image content parts', () => {
@@ -170,6 +215,67 @@ describe('PiHistoryStore', () => {
       status: 'completed',
     }]);
     expect(messages[0].contentBlocks).toEqual([{ toolId: 'tool-1', type: 'tool_use' }]);
+  });
+
+  it('rehydrates Pi web extension tools with shared renderer names', () => {
+    const content = [
+      JSON.stringify({
+        id: 'assistant-web',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              arguments: { count: 5, query: 'provider protocol' },
+              id: 'web-search-1',
+              name: 'web_search',
+              type: 'toolCall',
+            },
+            {
+              arguments: { url: 'https://example.com/reference' },
+              id: 'web-fetch-1',
+              name: 'web_fetch',
+              type: 'toolCall',
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'message',
+        message: {
+          content: [{ text: 'Search result', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'web-search-1',
+          toolName: 'web_search',
+        },
+      }),
+      JSON.stringify({
+        type: 'message',
+        message: {
+          content: [{ text: 'Fetched page', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'web-fetch-1',
+          toolName: 'web_fetch',
+        },
+      }),
+    ].join('\n');
+
+    const toolCalls = parsePiSessionContent(content)[0].toolCalls ?? [];
+
+    expect(toolCalls).toEqual([
+      expect.objectContaining({
+        input: { count: 5, query: 'provider protocol' },
+        name: 'WebSearch',
+        result: 'Search result',
+      }),
+      expect.objectContaining({
+        input: { url: 'https://example.com/reference' },
+        name: 'WebFetch',
+        result: 'Fetched page',
+      }),
+    ]);
   });
 
   it('merges Pi assistant continuations split by tool results into one chat message', () => {
@@ -500,6 +606,33 @@ describe('PiHistoryStore', () => {
       { id: 'u1', parentId: null, type: 'message', message: { role: 'user', content: 'First' } },
       { id: 'a1', parentId: 'u1', type: 'message', message: { role: 'assistant', content: 'Done' } },
     ]);
+  });
+
+  it('rolls back only the exact newly created fork target and joins duplicate cleanup', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-fork-rollback-'));
+    const sourceFile = path.join(dir, 'source.jsonl');
+    await fs.writeFile(sourceFile, [
+      JSON.stringify({ id: 'source', type: 'session', version: 3 }),
+      JSON.stringify({ id: 'a1', type: 'message', message: { role: 'assistant', content: 'Done' } }),
+    ].join('\n'));
+    const forked = await createPiForkSessionFile(sourceFile, 'a1', {
+      sessionId: 'fork-session',
+    });
+    const createdTarget = forked.sessionFile;
+
+    forked.sessionFile = sourceFile;
+    forked.parentSession = createdTarget;
+    await Promise.all([
+      rollbackCreatedPiForkSessionFile(forked),
+      rollbackCreatedPiForkSessionFile(forked),
+    ]);
+
+    await expect(fs.access(sourceFile)).resolves.toBeUndefined();
+    await expect(fs.access(createdTarget)).rejects.toThrow();
+    await expect(rollbackCreatedPiForkSessionFile(forked)).rejects.toThrow(
+      'not owned by this process',
+    );
+    await fs.rm(dir, { force: true, recursive: true });
   });
 
   it('includes active id-less tool results when creating linear Pi fork files', async () => {

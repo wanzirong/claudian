@@ -15,14 +15,14 @@ function getStoredConversationProviderId(
     }
   }
 
-  if (tab.lifecycleState === 'blank' && tab.draftModel) {
+  if (tab.conversationId === null && tab.draftModel) {
     return getEnabledProviderForModel(
       tab.draftModel,
       plugin.settings,
     );
   }
 
-  return tab.service?.providerId ?? tab.providerId;
+  return tab.providerId;
 }
 
 export function getTabProviderId(

@@ -4,8 +4,7 @@ import { isAbsolute, sep } from 'path';
 
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import type { ProviderTaskResultInterpreter } from '../../../core/providers/types';
-import type { AsyncSubagentCompletion } from '../../../core/runtime/types';
-import { TOOL_TASK } from '../../../core/tools/toolNames';
+import { TOOL_SUBAGENT } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import type {
   SubagentInfo,
@@ -27,6 +26,15 @@ import {
 import type { PendingToolCall } from '../state/types';
 
 export type SubagentStateChangeCallback = (subagent: SubagentInfo) => void;
+
+export interface AsyncSubagentCompletion {
+  type: 'async_subagent_completion';
+  providerSessionId: string;
+  taskId: string;
+  toolUseId?: string;
+  status: 'completed' | 'error';
+  result?: string;
+}
 
 interface AsyncSubagentRecord {
   info: SubagentInfo;
@@ -81,7 +89,7 @@ export class SubagentManager {
   private outputToolToTaskToolUseId: Map<string, string> = new Map();
   private asyncDomStates: Map<string, AsyncSubagentState> = new Map();
 
-  private onStateChange: SubagentStateChangeCallback;
+  private readonly onStateChange: SubagentStateChangeCallback;
   private taskResultInterpreter: ProviderTaskResultInterpreter;
 
   constructor(
@@ -90,10 +98,6 @@ export class SubagentManager {
   ) {
     this.onStateChange = onStateChange;
     this.taskResultInterpreter = taskResultInterpreter;
-  }
-
-  public setCallback(callback: SubagentStateChangeCallback): void {
-    this.onStateChange = callback;
   }
 
   public setTaskResultInterpreter(interpreter: ProviderTaskResultInterpreter): void {
@@ -161,7 +165,7 @@ export class SubagentManager {
     if (!currentContentEl) {
       const toolCall: ToolCallInfo = {
         id: taskToolId,
-        name: TOOL_TASK,
+        name: TOOL_SUBAGENT,
         input: taskInput || {},
         status: 'running',
         isExpanded: false,
@@ -174,7 +178,7 @@ export class SubagentManager {
     if (!mode) {
       const toolCall: ToolCallInfo = {
         id: taskToolId,
-        name: TOOL_TASK,
+        name: TOOL_SUBAGENT,
         input: taskInput || {},
         status: 'running',
         isExpanded: false,

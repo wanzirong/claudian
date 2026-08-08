@@ -5,6 +5,7 @@ import { TEST_CODEX_CATALOG, TEST_CODEX_MODEL } from '@test/helpers/codexModels'
 import { getProviderSettingsSnapshotWithModel } from '@/core/providers/conversationModel';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
+import type { ProviderSettingsReconciler } from '@/core/providers/types';
 import type { Conversation } from '@/core/types';
 import { DEFAULT_CLAUDE_PROVIDER_SETTINGS } from '@/providers/claude/settings';
 
@@ -34,6 +35,44 @@ describe('ProviderSettingsCoordinator', () => {
 
       expect(snapshot.effortLevel).toBe('low');
       expect(settings.effortLevel).toBe('low');
+    });
+
+    it('preserves an opted-in ultra effort across Codex provider and conversation projections', () => {
+      const ultraModel = {
+        ...TEST_CODEX_CATALOG[0],
+        model: 'gpt-5.6-sol',
+        supportedReasoningEfforts: [
+          { value: 'max', description: 'Maximum reasoning' },
+          { value: 'ultra', description: 'Automatic task delegation' },
+        ],
+        defaultReasoningEffort: 'max',
+      };
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        model: 'haiku',
+        effortLevel: 'high',
+        serviceTier: 'default',
+        savedProviderModel: { codex: ultraModel.model },
+        savedProviderEffort: { codex: 'ultra' },
+        savedProviderServiceTier: { codex: 'default' },
+        providerConfigs: {
+          codex: {
+            enabled: true,
+            enableUltraEffort: true,
+            discoveredModels: [ultraModel],
+          },
+        },
+      };
+
+      const conversationSnapshot = getProviderSettingsSnapshotWithModel(
+        settings,
+        'codex',
+        ultraModel.model,
+      );
+      ProviderSettingsCoordinator.projectProviderState(settings, 'codex');
+
+      expect(conversationSnapshot.effortLevel).toBe('ultra');
+      expect(settings.effortLevel).toBe('ultra');
     });
 
     it('uses a Pi conversation model preference before normalizing against the saved provider model', () => {
@@ -166,6 +205,50 @@ describe('ProviderSettingsCoordinator', () => {
   });
 
   describe('applyProviderEnablement', () => {
+    it('preflights the sole enabled provider without mutating settings', () => {
+      const settings: Record<string, unknown> = {
+        providerConfigs: {
+          claude: { ...DEFAULT_CLAUDE_PROVIDER_SETTINGS, enabled: true },
+          codex: { enabled: false },
+        },
+      };
+
+      expect(ProviderSettingsCoordinator.canApplyProviderEnablement(
+        settings,
+        'claude',
+        false,
+      )).toBe(false);
+      expect(ProviderSettingsCoordinator.canApplyProviderEnablement(
+        settings,
+        'claude',
+        true,
+      )).toBe(true);
+      expect(ProviderRegistry.isEnabled('claude', settings)).toBe(true);
+    });
+
+    it('keeps the sole enabled provider enabled', () => {
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        model: 'sonnet',
+        titleGenerationModel: '',
+        providerConfigs: {
+          claude: { ...DEFAULT_CLAUDE_PROVIDER_SETTINGS, enabled: true },
+          codex: { enabled: false },
+        },
+      };
+
+      const accepted = ProviderSettingsCoordinator.applyProviderEnablement(
+        settings,
+        'claude',
+        false,
+      );
+
+      expect(accepted).toBe(false);
+      expect(ProviderRegistry.isEnabled('claude', settings)).toBe(true);
+      expect(ProviderRegistry.getEnabledProviderIds(settings)).toEqual(['claude']);
+      expect(settings.settingsProvider).toBe('claude');
+    });
+
     it('atomically disables a provider and clears dependent shared selections', () => {
       const settings: Record<string, unknown> = {
         settingsProvider: 'codex',
@@ -182,6 +265,40 @@ describe('ProviderSettingsCoordinator', () => {
 
       expect(ProviderRegistry.isEnabled('codex', settings)).toBe(false);
       expect(settings.settingsProvider).toBe('claude');
+      expect(settings.titleGenerationModel).toBe('');
+    });
+
+    it('disables Claude and selects another enabled provider', () => {
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        model: 'sonnet',
+        effortLevel: 'high',
+        serviceTier: 'default',
+        thinkingBudget: 'off',
+        titleGenerationModel: 'sonnet',
+        savedProviderModel: { codex: TEST_CODEX_MODEL },
+        savedProviderEffort: { codex: 'medium' },
+        savedProviderServiceTier: { codex: 'default' },
+        savedProviderThinkingBudget: { codex: 'off' },
+        providerConfigs: {
+          claude: { ...DEFAULT_CLAUDE_PROVIDER_SETTINGS, enabled: true },
+          codex: {
+            discoveredModels: TEST_CODEX_CATALOG,
+            enabled: true,
+          },
+        },
+      };
+
+      const accepted = ProviderSettingsCoordinator.applyProviderEnablement(
+        settings,
+        'claude',
+        false,
+      );
+
+      expect(accepted).toBe(true);
+      expect(ProviderRegistry.isEnabled('claude', settings)).toBe(false);
+      expect(settings.settingsProvider).toBe('codex');
+      expect(settings.model).toBe(TEST_CODEX_MODEL);
       expect(settings.titleGenerationModel).toBe('');
     });
   });
@@ -218,6 +335,71 @@ describe('ProviderSettingsCoordinator', () => {
       );
 
       reconcileSpy.mockRestore();
+    });
+
+    it('defaults existing providers to invalidation and separates reload-policy providers', () => {
+      const defaultReconciler: ProviderSettingsReconciler = {
+        invalidateConversationSessions: jest.fn(conversations => conversations),
+        reconcileModelWithEnvironment: jest.fn((_settings, conversations) => ({
+          changed: true,
+          invalidatedConversations: conversations,
+        })),
+        normalizeModelVariantSettings: jest.fn(() => false),
+      };
+      const reloadReconciler: ProviderSettingsReconciler = {
+        environmentSessionPolicy: 'reload',
+        invalidateConversationSessions: jest.fn(conversations => conversations),
+        reconcileModelWithEnvironment: jest.fn(() => ({
+          changed: true,
+          invalidatedConversations: [],
+        })),
+        normalizeModelVariantSettings: jest.fn(() => false),
+      };
+      const originalGetSettingsReconciler = ProviderRegistry.getSettingsReconciler.bind(
+        ProviderRegistry,
+      );
+      const originalGetChatUIConfig = ProviderRegistry.getChatUIConfig.bind(ProviderRegistry);
+      const reconcilerSpy = jest.spyOn(ProviderRegistry, 'getSettingsReconciler')
+        .mockImplementation((providerId) => {
+          if (providerId === 'fake-invalidate') return defaultReconciler;
+          if (providerId === 'fake-reload') return reloadReconciler;
+          return originalGetSettingsReconciler(providerId);
+        });
+      const settingsProviderSpy = jest.spyOn(ProviderRegistry, 'resolveSettingsProviderId')
+        .mockReturnValue('fake-invalidate');
+      const uiConfigSpy = jest.spyOn(ProviderRegistry, 'getChatUIConfig')
+        .mockImplementation((providerId) => (
+          providerId === 'fake-invalidate' || providerId === 'fake-reload'
+            ? originalGetChatUIConfig('claude')
+            : originalGetChatUIConfig(providerId)
+        ));
+      const invalidatedConversation = {
+        id: 'invalidate-conversation',
+        providerId: 'fake-invalidate',
+        messages: [],
+      } as unknown as Conversation;
+      const preservedConversation = {
+        id: 'reload-conversation',
+        providerId: 'fake-reload',
+        messages: [],
+      } as unknown as Conversation;
+
+      const result = ProviderSettingsCoordinator.reconcileProviders(
+        { model: 'haiku' },
+        [invalidatedConversation, preservedConversation],
+        ['fake-invalidate', 'fake-reload'],
+      );
+      reconcilerSpy.mockRestore();
+      settingsProviderSpy.mockRestore();
+      uiConfigSpy.mockRestore();
+
+      expect(defaultReconciler.environmentSessionPolicy).toBeUndefined();
+      expect(result.environmentChangedProviderIds).toEqual([
+        'fake-invalidate',
+        'fake-reload',
+      ]);
+      expect(result.sessionInvalidationProviderIds).toEqual(['fake-invalidate']);
+      expect(result.invalidatedConversations).toEqual([invalidatedConversation]);
     });
   });
 
@@ -527,6 +709,33 @@ describe('ProviderSettingsCoordinator', () => {
       expect(snapshot.serviceTier).toBe('fast');
     });
 
+    it('rejects arrays as provider projection maps when creating a snapshot', () => {
+      const arrayProjection = Object.assign([], { codex: 'array-owned-value' });
+      const settings: Record<string, unknown> = {
+        settingsProvider: 'claude',
+        model: 'haiku',
+        effortLevel: 'high',
+        serviceTier: 'default',
+        thinkingBudget: 'off',
+        providerConfigs: {
+          codex: { enabled: true, discoveredModels: TEST_CODEX_CATALOG },
+        },
+        savedProviderModel: arrayProjection,
+        savedProviderEffort: arrayProjection,
+        savedProviderServiceTier: arrayProjection,
+        savedProviderThinkingBudget: arrayProjection,
+        savedProviderPermissionMode: arrayProjection,
+      };
+
+      const snapshot = ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, 'codex');
+
+      expect(snapshot.savedProviderModel).toEqual({});
+      expect(snapshot.savedProviderEffort).toEqual({});
+      expect(snapshot.savedProviderServiceTier).toEqual({});
+      expect(snapshot.savedProviderThinkingBudget).toEqual({});
+      expect(snapshot.savedProviderPermissionMode).toEqual({});
+    });
+
     it('defaults to claude when settingsProvider is not set', () => {
       const settings: Record<string, unknown> = {
         model: 'old-model',
@@ -600,6 +809,7 @@ describe('ProviderSettingsCoordinator', () => {
       expect(settings.model).toBe('claude-sonnet-4-5');
       expect(settings.effortLevel).toBe('high');
     });
+
   });
 
   describe('persistProjectedProviderState', () => {
@@ -640,6 +850,7 @@ describe('ProviderSettingsCoordinator', () => {
         codex: 'normal',
       });
     });
+
   });
 
   describe('projectProviderState', () => {

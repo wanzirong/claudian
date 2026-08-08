@@ -1,4 +1,4 @@
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -50,7 +50,6 @@ function createMockCallbacks() {
     }),
     getCapabilities: jest.fn().mockReturnValue({
       providerId: 'claude',
-      supportsPersistentRuntime: true,
       supportsNativeHistory: true,
       supportsPlanMode: true,
       supportsRewind: true,

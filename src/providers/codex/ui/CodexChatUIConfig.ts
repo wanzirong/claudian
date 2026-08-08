@@ -12,10 +12,13 @@ import type {
 import { OPENAI_PROVIDER_ICON } from '../../../shared/icons';
 import { getCodexModelOptions } from '../modelOptions';
 import {
+  CODEX_FALLBACK_REASONING_EFFORT_VALUES,
   findCodexModel,
   getCodexDefaultReasoningEffort,
   getCodexFastServiceTier,
+  getCodexReasoningEffortOptions,
   getDefaultCodexModel,
+  isCodexModelAvailable,
 } from '../models';
 import {
   isCodexModelSelectionId,
@@ -29,11 +32,7 @@ import {
 } from '../settings';
 
 const EFFORT_LEVELS: ProviderReasoningOption[] = [
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
+  ...CODEX_FALLBACK_REASONING_EFFORT_VALUES,
 ].map(value => ({ value, label: formatReasoningValueLabel(value) }));
 
 const CODEX_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
@@ -56,7 +55,10 @@ function getVisibleDiscoveredModels(settings: Record<string, unknown>) {
     codexSettings.visibleModels,
     codexSettings.discoveredModels,
   ));
-  return codexSettings.discoveredModels.filter(model => visibleModelIds.has(model.model));
+  return codexSettings.discoveredModels.filter(model =>
+    visibleModelIds.has(model.model)
+    && isCodexModelAvailable(model, codexSettings.enableUltraEffort)
+  );
 }
 
 export const codexChatUIConfig: ProviderChatUIConfig = {
@@ -65,7 +67,12 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
   },
 
   getDefaultModel(settings: Record<string, unknown>): string | null {
-    return getDefaultCodexModel(getVisibleDiscoveredModels(settings))?.model ?? null;
+    const codexSettings = getCodexProviderSettings(settings);
+    const firstVisibleModel = getVisibleCodexModelIds(
+      codexSettings.visibleModels,
+      codexSettings.discoveredModels,
+    ).find(modelId => getVisibleDiscoveredModels(settings).some(model => model.model === modelId));
+    return firstVisibleModel ?? getCodexModelOptions(settings)[0]?.value ?? null;
   },
 
   ownsModel(model: string, settings: Record<string, unknown>): boolean {
@@ -88,15 +95,16 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
   },
 
   getReasoningOptions(modelId: string, settings: Record<string, unknown>): ProviderReasoningOption[] {
+    const codexSettings = getCodexProviderSettings(settings);
     const model = findCodexModel(
-      getCodexProviderSettings(settings).discoveredModels,
+      codexSettings.discoveredModels,
       modelId,
     );
     if (!model) {
       return [...EFFORT_LEVELS];
     }
 
-    return model.supportedReasoningEfforts.map(option => ({
+    return getCodexReasoningEffortOptions(model, codexSettings.enableUltraEffort).map(option => ({
       value: option.value,
       label: formatReasoningValueLabel(option.value),
       ...(option.description ? { description: option.description } : {}),
@@ -104,11 +112,15 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
   },
 
   getDefaultReasoningValue(modelId: string, settings: Record<string, unknown>): string {
+    const codexSettings = getCodexProviderSettings(settings);
     const model = findCodexModel(
-      getCodexProviderSettings(settings).discoveredModels,
+      codexSettings.discoveredModels,
       modelId,
     );
-    return model ? getCodexDefaultReasoningEffort(model) : DEFAULT_REASONING_VALUE;
+    return model
+      ? getCodexDefaultReasoningEffort(model, codexSettings.enableUltraEffort)
+        ?? DEFAULT_REASONING_VALUE
+      : DEFAULT_REASONING_VALUE;
   },
 
   getContextWindowSize(): number {

@@ -1,11 +1,12 @@
 import { getProviderConfig, setProviderConfig } from '../../core/providers/providerConfig';
 import { getProviderEnvironmentVariables } from '../../core/providers/providerEnvironment';
-import type { HostnameCliPaths } from '../../core/types/settings';
+import { normalizeHostnameStringMap } from '../../core/providers/settings/HostnameStringMap';
 import {
-  getHostnameKey,
-  getLegacyHostnameKey,
-  migrateLegacyHostnameKeyedMap,
-} from '../../utils/env';
+  readStoredBoolean,
+  readStoredString,
+} from '../../core/providers/settings/storedSettings';
+import type { HostnameCliPaths } from '../../core/types/settings';
+import { getHostnameKey } from '../../utils/env';
 import { ensureProviderProjectionMap } from './internal/providerProjection';
 import {
   clampPiThinkingLevel,
@@ -48,20 +49,6 @@ export const DEFAULT_PI_PROVIDER_SETTINGS: Readonly<PersistedPiProviderSettings>
   toolMode: 'all',
   visibleModels: [],
 });
-
-function normalizeHostnameCliPaths(value: unknown): HostnameCliPaths {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const result: HostnameCliPaths = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === 'string' && entry.trim()) {
-      result[key] = entry.trim();
-    }
-  }
-  return result;
-}
 
 export function normalizePiVisibleModels(
   value: unknown,
@@ -127,55 +114,34 @@ export function normalizePiPreferredThinkingByModel(
   value: unknown,
   discoveredModels: PiDiscoveredModel[] = [],
 ): Record<string, PiThinkingLevel> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const normalized: Record<string, PiThinkingLevel> = {};
-  for (const [encodedId, thinkingLevel] of Object.entries(value as Record<string, unknown>)) {
-    const normalizedEncodedId = normalizePiEncodedId(encodedId, discoveredModels);
-    const normalizedThinkingLevel = normalizePiThinkingLevel(thinkingLevel);
-    if (!normalizedEncodedId || !normalizedThinkingLevel) {
-      continue;
-    }
-
-    const discoveredModel = discoveredModels.find(model => model.encodedId === normalizedEncodedId);
-    if (discoveredModel && !discoveredModel.thinkingLevels.includes(normalizedThinkingLevel)) {
-      continue;
-    }
-
-    normalized[normalizedEncodedId] = normalizedThinkingLevel;
-  }
-
-  return normalized;
+  return normalizePiPreferredThinkingEntries(
+    value,
+    discoveredModels,
+    encodedId => normalizePiEncodedId(encodedId, discoveredModels),
+  );
 }
 
 export function getPiProviderSettings(settings: Record<string, unknown>): PiProviderSettings {
   const config = getProviderConfig(settings, 'pi');
-  const normalizedCliPathsByHost = normalizeHostnameCliPaths(config.cliPathsByHost);
-  const cliPathsByHost = Object.keys(normalizedCliPathsByHost).length > 0
-    ? migrateLegacyHostnameKeyedMap(
-      normalizedCliPathsByHost,
-      getHostnameKey(),
-      getLegacyHostnameKey(),
-    )
-    : normalizedCliPathsByHost;
+  const cliPathsByHost = normalizeHostnameStringMap(config.cliPathsByHost);
   const discoveredModels = normalizePiDiscoveredModels(config.discoveredModels);
   const visibleModels = normalizePiVisibleModels(config.visibleModels, discoveredModels);
   const persistableIds = getPersistablePiModelIds(settings, visibleModels);
 
   return {
-    cliPath: (config.cliPath as string | undefined)
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.cliPath,
+    cliPath: readStoredString(config.cliPath, DEFAULT_PI_PROVIDER_SETTINGS.cliPath),
     cliPathsByHost,
     discoveredModels,
-    enabled: (config.enabled as boolean | undefined)
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.enabled,
-    environmentHash: (config.environmentHash as string | undefined)
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.environmentHash,
-    environmentVariables: (config.environmentVariables as string | undefined)
-      ?? getProviderEnvironmentVariables(settings, 'pi')
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.environmentVariables,
+    enabled: readStoredBoolean(config.enabled, DEFAULT_PI_PROVIDER_SETTINGS.enabled),
+    environmentHash: readStoredString(
+      config.environmentHash,
+      DEFAULT_PI_PROVIDER_SETTINGS.environmentHash,
+    ),
+    environmentVariables: readStoredString(
+      config.environmentVariables,
+      getProviderEnvironmentVariables(settings, 'pi')
+        ?? DEFAULT_PI_PROVIDER_SETTINGS.environmentVariables,
+    ),
     modelAliases: normalizePiModelAliasesForPersistableIds(
       config.modelAliases,
       discoveredModels,
@@ -222,7 +188,7 @@ export function updatePiProviderSettings(
     persistableIds,
   );
   const nextCliPathsByHost = 'cliPathsByHost' in updates
-    ? normalizeHostnameCliPaths(updates.cliPathsByHost)
+    ? normalizeHostnameStringMap(updates.cliPathsByHost)
     : { ...current.cliPathsByHost };
   let nextCliPath = 'cliPathsByHost' in updates
     ? (
@@ -316,28 +282,38 @@ function normalizePiPreferredThinkingForPersistableIds(
   discoveredModels: PiDiscoveredModel[],
   persistableIds: Set<string>,
 ): Record<string, PiThinkingLevel> {
+  return normalizePiPreferredThinkingEntries(
+    value,
+    discoveredModels,
+    encodedId => normalizePiPersistableEncodedId(
+      encodedId,
+      discoveredModels,
+      persistableIds,
+    ),
+  );
+}
+
+function normalizePiPreferredThinkingEntries(
+  value: unknown,
+  discoveredModels: PiDiscoveredModel[],
+  normalizeEncodedId: (encodedId: string) => string,
+): Record<string, PiThinkingLevel> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {};
   }
 
   const normalized: Record<string, PiThinkingLevel> = {};
   for (const [encodedId, thinkingLevel] of Object.entries(value as Record<string, unknown>)) {
-    const normalizedEncodedId = normalizePiPersistableEncodedId(
-      encodedId,
-      discoveredModels,
-      persistableIds,
-    );
+    const normalizedEncodedId = normalizeEncodedId(encodedId);
     const normalizedThinkingLevel = normalizePiThinkingLevel(thinkingLevel);
     if (!normalizedEncodedId || !normalizedThinkingLevel) {
       continue;
     }
 
     const discoveredModel = discoveredModels.find(model => model.encodedId === normalizedEncodedId);
-    if (discoveredModel && !discoveredModel.thinkingLevels.includes(normalizedThinkingLevel)) {
-      continue;
-    }
-
-    normalized[normalizedEncodedId] = normalizedThinkingLevel;
+    normalized[normalizedEncodedId] = discoveredModel
+      ? clampPiThinkingLevel(normalizedThinkingLevel, discoveredModel.thinkingLevels)
+      : normalizedThinkingLevel;
   }
 
   return normalized;
@@ -351,7 +327,10 @@ export function resolvePiModelAlias(
 }
 
 function normalizePiToolMode(value: unknown): PiToolMode {
-  return value === 'readonly' ? 'readonly' : 'all';
+  if (value === undefined) {
+    return 'all';
+  }
+  return value === 'all' || value === 'readonly' ? value : 'readonly';
 }
 
 function normalizePiEncodedId(
@@ -446,7 +425,7 @@ function retargetRemovedPiSelections(
       : PI_DEFAULT_THINKING_LEVEL);
 
   const maybeRetargetModel = (value: unknown): string | null => {
-    if (typeof value !== 'string' || !isPiModelSelectionId(value) || value === 'pi') {
+    if (typeof value !== 'string' || !isPiModelSelectionId(value)) {
       return null;
     }
 

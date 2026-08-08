@@ -23,9 +23,11 @@
   },
   "chat": {
     "rewind": {
-      "confirmMessage": "回退到此處？此訊息之後的檔案變更將被還原。回退不會影響手動或透過 bash 編輯的檔案。",
+      "confirmMessage": "回退到此處？此訊息之後的檔案變更可能被覆寫或刪除。此操作無法復原。",
+      "confirmMessageConflicts": "回退到此處？偵測到 {count} 個檔案在代理之外被修改，繼續操作將覆寫這些變更：\n{files}",
       "confirmMessageConversationOnly": "將對話回退到此處？檔案變更將保留。",
       "confirmButton": "回退",
+      "inProgress": "請等待目前的回退操作完成。",
       "ariaLabel": "回退到此處",
       "menuConversationOnly": "僅回退對話",
       "menuCodeAndConversation": "回退程式碼 + 對話",
@@ -43,7 +45,6 @@
       "chooseTarget": "分叉對話",
       "targetNewTab": "新分頁",
       "targetCurrentTab": "目前分頁",
-      "maxTabsReached": "無法分叉：已達到最大 {count} 個分頁",
       "notice": "已分叉到新分頁",
       "noticeCurrentTab": "已在目前分頁分叉",
       "failed": "分叉失敗：{error}",
@@ -103,6 +104,11 @@
       "name": "自動生成對話標題",
       "desc": "在使用者送出第一則訊息後自動生成對話標題。"
     },
+    "titleLanguage": {
+      "name": "標題生成語言",
+      "desc": "自動生成對話標題時使用的語言。",
+      "followInterface": "跟隨介面語言"
+    },
     "titleModel": {
       "name": "標題生成模型",
       "desc": "用於自動生成對話標題的模型。",
@@ -132,14 +138,14 @@
       "btnSet": "設定快捷鍵"
     },
     "newSessionHotkey": {
-      "name": "新工作階段",
+      "name": "取代目前對話",
       "descWithKey": "目前快捷鍵：{hotkey}",
       "descNoKey": "未設定快捷鍵",
       "btnChange": "變更",
       "btnSet": "設定快捷鍵"
     },
     "newTabHotkey": {
-      "name": "新分頁",
+      "name": "新增",
       "descWithKey": "目前快捷鍵：{hotkey}",
       "descNoKey": "未設定快捷鍵",
       "btnChange": "變更",
@@ -272,10 +278,23 @@
         "noNode": "在 PATH 中找不到 Node.js。請安裝 Node.js 或檢查 PATH 設定。"
       }
     },
-    "maxTabs": {
-      "name": "最大聊天標籤數",
-      "desc": "同時開啟的最大聊天標籤數（3-10）。每個標籤使用獨立的 Claude 對話。",
-      "warning": "超過 5 個標籤可能會影響效能和記憶體使用。"
+    "maxWarmAgentProcesses": {
+      "name": "最大並行執行工作階段數",
+      "desc": "同時保持就緒的代理工作階段最大數量（5-10）。較早的閒置工作階段會自動暫停，並在使用時恢復。"
+    },
+    "enableDualPane": {
+      "name": "啟用雙欄模式",
+      "desc": "當檢視寬度至少為 600 像素時，自動在聊天旁顯示工作階段管理器。"
+    },
+    "enableFilePane": {
+      "name": "啟用檔案面板",
+      "desc": "在雙欄模式的工作階段管理器中顯示「檔案」分頁。"
+    },
+    "dualPaneSide": {
+      "name": "雙欄位置",
+      "desc": "選擇工作階段管理器顯示在聊天的哪一側。",
+      "left": "左側",
+      "right": "右側"
     },
     "enableAutoScroll": {
       "name": "串流傳輸時自動捲動",
@@ -310,11 +329,13 @@
       "name": "語言",
       "desc": "更改插件介面的顯示語言"
     },
+    "providerEnablement": {
+      "name": "啟用 {provider}",
+      "desc": "讓已啟用的 {provider} 模型可用於新對話。停用後，現有工作階段仍會保留。",
+      "lastProviderWarning": "至少需要啟用一個提供者，Claudian 才能正常運作。",
+      "noModelsWarning": "未啟用任何 {provider} 模型。請前往下方的「模型」區段並至少啟用一個模型。"
+    },
     "codex": {
-      "enableProvider": {
-        "name": "啟用 Codex 提供者",
-        "desc": "啟用後，Codex 模型會出現在新對話的模型選擇器中。現有 Codex 工作階段會保留。"
-      },
       "installationMethod": {
         "name": "安裝方式",
         "desc": "Claudian 在 Windows 上啟動 Codex 的方式。原生 Windows 使用 Windows 可執行檔路徑；WSL 會在所選發行版內啟動 Linux CLI。",
@@ -351,9 +372,13 @@
         "detailed": "詳細",
         "off": "關閉"
       },
+      "ultraEffort": {
+        "name": "啟用 Ultra 推理強度",
+        "desc": "在支援 Ultra 的 Codex 模型的推理強度選擇器中顯示此選項。Ultra 使用最高推理強度並自動委派工作。"
+      },
       "skills": {
         "name": "Codex 技能",
-        "desc": "管理儲存在 .codex/skills/ 或 .agents/skills/ 中的 Vault 層級 Codex 技能。此處不包含主目錄層級技能。",
+        "desc": "Manage shared vault-level skills stored only in .agents/skills/.",
         "hiddenName": "隱藏技能",
         "hiddenDesc": "從下拉選單中隱藏特定 Codex 技能。每行輸入一個技能名稱，不帶前導 $。",
         "hiddenPlaceholder": "analyze\nexplain\nfix"
@@ -371,6 +396,11 @@
         "name": "Codex 環境",
         "desc": "僅限 Codex 擁有的執行階段變數。用於 OPENAI_* 和 CODEX_* 設定。如果 Codex 自動偵測需要協助，請把安裝目錄新增到共享 PATH，而不是此提供者環境。"
       }
+    },
+    "agentSkills": {
+      "sectionTitle": "Skills", "fixedRoot": "Managed in .agents/skills", "sharedExpectation": "Manage shared skills in .agents/skills/ for compatible providers.", "noSkills": "No shared skills configured. Click + to create one.", "skillBadge": "skill", "diagnosticsTitle": "Skills needing attention", "loadFailed": "Could not load shared skills.", "savedRefreshFailed": "Saved, but provider refresh failed.", "validationFailed": "Invalid skill: {message}", "collisionFailed": "A skill named \"{name}\" already exists.", "saveFailed": "Failed to save shared skill: {message}", "deleteFailed": "Failed to move shared skill to trash: {message}", "staleConflict": "This skill changed elsewhere; refresh before saving.", "created": "Shared skill \"{name}\" created.", "updated": "Shared skill \"{name}\" updated.", "deleted": "Shared skill \"{name}\" moved to trash.",
+      "modal": { "titleEdit": "Edit Shared Skill", "titleAdd": "Add Shared Skill", "name": "Skill name", "nameDesc": "Lowercase letters and numbers separated by single hyphens", "namePlaceholder": "code-reviewer", "description": "Description", "descriptionDesc": "Required portable description used by providers to select the skill", "descriptionPlaceholder": "Reviews code for correctness and maintainability", "instructions": "Instructions", "instructionsDesc": "Required SKILL.md instructions", "instructionsPlaceholder": "Review the supplied code and report actionable findings..." },
+      "delete": { "title": "Delete Shared Skill", "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.", "confirm": "Move to trash" }
     },
     "codexSkills": {
       "modal": {

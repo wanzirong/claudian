@@ -1,9 +1,11 @@
 import { ClaudianProviderHost } from '@/app/providers/ClaudianProviderHost';
+import type { ProviderExecutionTransitionScope } from '@/core/execution';
 import type ClaudianPlugin from '@/main';
 
 function createPlugin(overrides: Record<string, unknown> = {}): ClaudianPlugin {
   return {
     app: {},
+    executionLifecycleRegistry: {},
     settings: {},
     storage: {},
     manifest: { version: '1.2.3' },
@@ -15,7 +17,12 @@ function createPlugin(overrides: Record<string, unknown> = {}): ClaudianPlugin {
     getEnvironmentVariablesForScope: jest.fn(() => 'SHARED=value'),
     applyEnvironmentVariables: jest.fn(async () => undefined),
     applyEnvironmentVariablesBatch: jest.fn(async () => undefined),
+    applyProviderRuntimeSettings: jest.fn(async () => undefined),
     getResolvedProviderCliPath: jest.fn(() => '/usr/bin/provider'),
+    runProviderExecutionTransition: jest.fn(
+      async (_providerIds: string[], mutation: () => Promise<unknown>) => mutation(),
+    ),
+    notifyProviderChatOptionsChanged: jest.fn(),
     getAllViews: jest.fn(() => []),
     getView: jest.fn(() => null),
     ...overrides,
@@ -44,33 +51,69 @@ describe('ClaudianProviderHost', () => {
     expect('addCommand' in host).toBe(false);
   });
 
-  it('delivers provider runtime recycling to views in their existing order', async () => {
-    const trace: string[] = [];
-    const createView = (id: string) => ({
-      getTabManager: () => ({
-        recycleProviderRuntimes: async (providerId: string) => {
-          trace.push(`${id}:recycle:${providerId}`);
-        },
-      }),
-      invalidateProviderCommandCaches: (providerIds: string[]) => {
-        trace.push(`${id}:invalidate:${providerIds.join(',')}`);
-      },
-      refreshModelSelector: () => { trace.push(`${id}:refresh`); },
-    });
+  it('routes provider chat-option changes through the application reconciliation boundary', () => {
+    const notifyProviderChatOptionsChanged = jest.fn();
     const plugin = createPlugin({
-      getAllViews: jest.fn(() => [createView('first'), createView('second')]),
+      notifyProviderChatOptionsChanged,
     });
     const host = new ClaudianProviderHost(plugin);
 
-    await host.recycleProviderRuntimes('opencode');
+    host.notifyProviderChatOptionsChanged('codex');
 
-    expect(trace).toEqual([
-      'first:recycle:opencode',
-      'first:invalidate:opencode',
-      'first:refresh',
-      'second:recycle:opencode',
-      'second:invalidate:opencode',
-      'second:refresh',
-    ]);
+    expect(notifyProviderChatOptionsChanged).toHaveBeenCalledWith('codex');
   });
+
+  it('delegates execution transitions through the application lifecycle registry', async () => {
+    const executionLifecycleRegistry = {};
+    const mutation = jest.fn(async () => 'result');
+    const runProviderExecutionTransition = jest.fn(
+      async (_providerIds: string[], callback: () => Promise<string>) => callback(),
+    );
+    const plugin = createPlugin({
+      executionLifecycleRegistry,
+      runProviderExecutionTransition,
+    });
+    const host = new ClaudianProviderHost(plugin);
+
+    expect(host.executionLifecycleRegistry).toBe(executionLifecycleRegistry);
+    await expect(
+      host.runProviderExecutionTransition(['opencode', 'claude'], mutation),
+    ).resolves.toBe('result');
+
+    expect(runProviderExecutionTransition).toHaveBeenCalledWith(
+      ['opencode', 'claude'],
+      mutation,
+    );
+
+    const parentScope = {
+      providerIds: ['claude'],
+    } as unknown as ProviderExecutionTransitionScope;
+    await host.runProviderExecutionTransition(
+      ['codex'],
+      mutation,
+      parentScope,
+    );
+    expect(runProviderExecutionTransition).toHaveBeenLastCalledWith(
+      ['codex'],
+      mutation,
+      parentScope,
+    );
+  });
+
+  it('delegates atomic provider runtime settings changes', async () => {
+    const mutation = jest.fn();
+    const onApplied = jest.fn();
+    const applyProviderRuntimeSettings = jest.fn(async () => undefined);
+    const plugin = createPlugin({ applyProviderRuntimeSettings });
+    const host = new ClaudianProviderHost(plugin);
+
+    await host.applyProviderRuntimeSettings(['codex'], mutation, onApplied);
+
+    expect(applyProviderRuntimeSettings).toHaveBeenCalledWith(
+      ['codex'],
+      mutation,
+      onApplied,
+    );
+  });
+
 });

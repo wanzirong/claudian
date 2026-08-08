@@ -1,10 +1,8 @@
 const mockGetHostnameKey = jest.fn(() => 'host-a');
-const mockGetLegacyHostnameKey = jest.fn(() => 'legacy-host');
 
 jest.mock('../../../../src/utils/env', () => ({
   ...jest.requireActual('../../../../src/utils/env'),
   getHostnameKey: () => mockGetHostnameKey(),
-  getLegacyHostnameKey: () => mockGetLegacyHostnameKey(),
 }));
 
 import { piSettingsReconciler } from '@/providers/pi/env/PiSettingsReconciler';
@@ -42,7 +40,6 @@ describe('Pi settings normalization', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetHostnameKey.mockReturnValue('host-a');
-    mockGetLegacyHostnameKey.mockReturnValue('legacy-host');
   });
 
   it('defaults Pi to disabled all-tools mode', () => {
@@ -53,9 +50,8 @@ describe('Pi settings normalization', () => {
     });
   });
 
-  it('migrates current legacy hostname-scoped CLI paths', () => {
+  it('preserves hostname-scoped CLI paths without assigning them to the current device', () => {
     mockGetHostnameKey.mockReturnValue('device:current');
-    mockGetLegacyHostnameKey.mockReturnValue('host-a');
 
     expect(getPiProviderSettings({
       providerConfigs: {
@@ -67,9 +63,22 @@ describe('Pi settings normalization', () => {
         },
       },
     }).cliPathsByHost).toEqual({
-      'device:current': '/host-a/pi',
+      'host-a': '/host-a/pi',
       'host-b': '/host-b/pi',
     });
+  });
+
+  it('rejects arrays and filters mixed hostname CLI maps', () => {
+    expect(getPiProviderSettings({
+      providerConfigs: { pi: { cliPathsByHost: ['/array/pi'] } },
+    }).cliPathsByHost).toEqual({});
+    expect(getPiProviderSettings({
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: { ' host-a ': ' /host-a/pi ', invalid: null },
+        },
+      },
+    }).cliPathsByHost).toEqual({ 'host-a': '/host-a/pi' });
   });
 
   it('normalizes visible models to valid encoded ids', () => {
@@ -81,7 +90,7 @@ describe('Pi settings normalization', () => {
     ], discoveredModels)).toEqual(['pi:anthropic/claude-sonnet-4']);
   });
 
-  it('normalizes aliases and preferred thinking', () => {
+  it('normalizes aliases and clamps preferred thinking to model capabilities', () => {
     expect(normalizePiModelAliases({
       'pi:anthropic/claude-sonnet-4': '  Sonnet  ',
       'pi:missing/model': 'Missing',
@@ -89,9 +98,31 @@ describe('Pi settings normalization', () => {
       'pi:anthropic/claude-sonnet-4': 'Sonnet',
     });
     expect(normalizePiPreferredThinkingByModel({
-      'pi:anthropic/claude-sonnet-4': 'high',
+      'pi:anthropic/claude-sonnet-4': 'max',
       'pi:openai/gpt-5': 'xhigh',
     }, discoveredModels)).toEqual({
+      'pi:anthropic/claude-sonnet-4': 'high',
+      'pi:openai/gpt-5': 'medium',
+    });
+  });
+
+  it('clamps max preferences to xhigh before high', () => {
+    expect(normalizePiPreferredThinkingByModel({
+      'pi:anthropic/claude-opus-4-7': 'max',
+      'pi:anthropic/claude-sonnet-4': 'max',
+    }, [
+      {
+        encodedId: 'pi:anthropic/claude-opus-4-7',
+        id: 'claude-opus-4-7',
+        input: ['text'],
+        label: 'Claude Opus 4.7',
+        provider: 'anthropic',
+        reasoning: true,
+        thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh'],
+      },
+      discoveredModels[0],
+    ])).toEqual({
+      'pi:anthropic/claude-opus-4-7': 'xhigh',
       'pi:anthropic/claude-sonnet-4': 'high',
     });
   });
@@ -241,13 +272,5 @@ describe('Pi settings normalization', () => {
     expect(piSettingsReconciler.normalizeModelVariantSettings(nonReasoningSettings)).toBe(true);
     expect(nonReasoningSettings.effortLevel).toBe('off');
 
-    const fallbackSettings: Record<string, unknown> = {
-      effortLevel: '',
-      model: 'pi',
-      providerConfigs: { pi: {} },
-    };
-
-    expect(piSettingsReconciler.normalizeModelVariantSettings(fallbackSettings)).toBe(true);
-    expect(fallbackSettings.effortLevel).toBe('off');
   });
 });

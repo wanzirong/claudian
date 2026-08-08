@@ -5,10 +5,6 @@ describe('CODEX_PROVIDER_CAPABILITIES', () => {
     expect(CODEX_PROVIDER_CAPABILITIES.providerId).toBe('codex');
   });
 
-  it('should support persistent runtime', () => {
-    expect(CODEX_PROVIDER_CAPABILITIES.supportsPersistentRuntime).toBe(true);
-  });
-
   it('should support native history', () => {
     expect(CODEX_PROVIDER_CAPABILITIES.supportsNativeHistory).toBe(true);
   });
@@ -25,8 +21,8 @@ describe('CODEX_PROVIDER_CAPABILITIES', () => {
     expect(CODEX_PROVIDER_CAPABILITIES.supportsFork).toBe(true);
   });
 
-  it('should not support provider commands', () => {
-    expect(CODEX_PROVIDER_CAPABILITIES.supportsProviderCommands).toBe(false);
+  it('should support provider-protocol skill discovery', () => {
+    expect(CODEX_PROVIDER_CAPABILITIES.supportsProviderCommands).toBe(true);
   });
 
   it('should use effort-based reasoning control', () => {

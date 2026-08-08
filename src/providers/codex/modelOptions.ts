@@ -1,10 +1,8 @@
 import { getRuntimeEnvironmentVariables } from '../../core/providers/providerEnvironment';
 import type { ProviderUIOption } from '../../core/providers/types';
-import { getCodexModelsInPickerOrder, getDefaultCodexModel } from './models';
+import { isCodexModelAvailable } from './models';
 import {
   encodeCodexModelSelectionId,
-  isCodexModelSelectionId,
-  looksLikeCodexModel,
   toCodexRuntimeModelId,
 } from './modelSelection';
 import { getCodexProviderSettings, getVisibleCodexModelIds } from './settings';
@@ -27,7 +25,12 @@ function getConfiguredEnvModel(settings: Record<string, unknown>): string | null
 export function getConfiguredEnvCustomModel(settings: Record<string, unknown>): string | null {
   const modelId = getConfiguredEnvModel(settings);
   const discoveredModels = getCodexProviderSettings(settings).discoveredModels;
-  return modelId && !discoveredModels.some(model => model.model === modelId) ? modelId : null;
+  const runtimeModelId = modelId ? toCodexRuntimeModelId(modelId) : null;
+  return modelId
+    && runtimeModelId
+    && !discoveredModels.some(model => model.model === runtimeModelId)
+    ? modelId
+    : null;
 }
 
 export function parseConfiguredCustomModelIds(value: string): string[] {
@@ -52,58 +55,30 @@ export function getCodexModelOptions(settings: Record<string, unknown>): Provide
   const getModelLabel = (modelId: string, fallback: string): string => {
     return codexSettings.modelAliases[modelId] ?? fallback;
   };
-  const visibleModelIds = new Set(getVisibleCodexModelIds(
+  const visibleModelIds = getVisibleCodexModelIds(
     codexSettings.visibleModels,
     codexSettings.discoveredModels,
-  ));
-  const savedProviderModel = (
-    settings.savedProviderModel
-    && typeof settings.savedProviderModel === 'object'
-    && !Array.isArray(settings.savedProviderModel)
-  )
-    ? settings.savedProviderModel as Record<string, unknown>
-    : null;
-  const pinnedModelIds = new Set<string>();
-  for (const value of [
-    settings.model,
-    savedProviderModel?.codex,
-    getConfiguredEnvModel(settings),
-  ]) {
-    if (typeof value === 'string' && value.trim()) {
-      pinnedModelIds.add(toCodexRuntimeModelId(value));
-    }
-  }
-  const absentPinnedSelections: string[] = [];
-  const currentModel = typeof settings.model === 'string' ? settings.model.trim() : '';
-  if (
-    codexSettings.discoveredModels.length === 0
-    && currentModel
-    && (
-      isCodexModelSelectionId(currentModel)
-      || looksLikeCodexModel(toCodexRuntimeModelId(currentModel))
-    )
-  ) {
-    absentPinnedSelections.push(currentModel);
-  }
-  const savedCodexModel = typeof savedProviderModel?.codex === 'string'
-    ? savedProviderModel.codex.trim()
-    : '';
-  if (codexSettings.discoveredModels.length === 0 && savedCodexModel) {
-    absentPinnedSelections.push(savedCodexModel);
-  }
-
-  const pickerOrderedModels = getCodexModelsInPickerOrder(codexSettings.discoveredModels);
-  const visibleDiscoveredModels = pickerOrderedModels
-    .filter(model => visibleModelIds.has(model.model));
-  const pinnedDiscoveredModels = pickerOrderedModels.filter(model =>
-    !visibleModelIds.has(model.model) && pinnedModelIds.has(model.model)
   );
+  const visibleModelIdSet = new Set(visibleModelIds);
+  const discoveredModelsById = new Map(codexSettings.discoveredModels.map(model => [
+    model.model,
+    model,
+  ] as const));
+  const discoveredModelIds = new Set(codexSettings.discoveredModels.map(model => model.model));
+  const visibleDiscoveredModels = [...visibleModelIds]
+    .reverse()
+    .map(modelId => discoveredModelsById.get(modelId))
+    .filter((model): model is NonNullable<typeof model> => Boolean(
+      model
+      && visibleModelIdSet.has(model.model)
+      && isCodexModelAvailable(model, codexSettings.enableUltraEffort),
+    ));
   const models: ProviderUIOption[] = visibleDiscoveredModels.map(model => ({
     value: model.model,
     label: getModelLabel(model.model, model.displayName),
     description: model.description || undefined,
   }));
-  const seenModelIds = new Set(visibleDiscoveredModels.map(model => model.model));
+  const seenModelIds = new Set(discoveredModelIds);
 
   const persistedVisibleModels = codexSettings.visibleModels === null
     ? []
@@ -118,37 +93,6 @@ export function getCodexModelOptions(settings: Record<string, unknown>): Provide
       value: modelId,
       label: getModelLabel(modelId, formatCodexModelLabel(modelId)),
       description: 'Selected model',
-    });
-  }
-
-  for (const model of pinnedDiscoveredModels) {
-    seenModelIds.add(model.model);
-    models.push({
-      value: model.model,
-      label: getModelLabel(model.model, model.displayName),
-      description: model.description || undefined,
-    });
-  }
-
-  for (const selection of absentPinnedSelections) {
-    const modelId = toCodexRuntimeModelId(selection);
-    if (seenModelIds.has(modelId)) {
-      continue;
-    }
-
-    seenModelIds.add(modelId);
-    const fallbackOption = (
-      isCodexModelSelectionId(selection) || !looksLikeCodexModel(modelId)
-        ? createCustomCodexModelOption(modelId, 'Selected model')
-        : {
-          value: modelId,
-          label: formatCodexModelLabel(modelId),
-          description: 'Selected model',
-        }
-    );
-    models.push({
-      ...fallbackOption,
-      label: getModelLabel(modelId, fallbackOption.label),
     });
   }
 
@@ -182,6 +126,7 @@ export function resolveCodexModelSelection(
   settings: Record<string, unknown>,
   currentModel: string,
 ): string | null {
+  const codexSettings = getCodexProviderSettings(settings);
   const modelOptions = getCodexModelOptions(settings);
   const envModel = getConfiguredEnvModel(settings);
   if (envModel) {
@@ -190,7 +135,15 @@ export function resolveCodexModelSelection(
       option.value === envModel
       || toCodexRuntimeModelId(option.value) === envRuntimeModel
     );
-    return envOption?.value ?? envModel;
+    if (envOption) {
+      return envOption.value;
+    }
+    const envDiscoveredModel = codexSettings.discoveredModels.find(model =>
+      toCodexRuntimeModelId(model.model) === envRuntimeModel
+    );
+    if (!envDiscoveredModel) {
+      return envModel;
+    }
   }
 
   if (currentModel) {
@@ -204,13 +157,13 @@ export function resolveCodexModelSelection(
     }
   }
 
-  const codexSettings = getCodexProviderSettings(settings);
-  const visibleModelIds = new Set(getVisibleCodexModelIds(
+  const visibleModelIds = getVisibleCodexModelIds(
     codexSettings.visibleModels,
     codexSettings.discoveredModels,
-  ));
-  const defaultModel = getDefaultCodexModel(
-    codexSettings.discoveredModels.filter(model => visibleModelIds.has(model.model)),
   );
-  return defaultModel?.model ?? modelOptions[0]?.value ?? null;
+  const firstVisibleModelId = visibleModelIds.find(modelId => {
+    const model = codexSettings.discoveredModels.find(candidate => candidate.model === modelId);
+    return model && isCodexModelAvailable(model, codexSettings.enableUltraEffort);
+  });
+  return firstVisibleModelId ?? modelOptions[0]?.value ?? null;
 }

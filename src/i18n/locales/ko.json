@@ -23,9 +23,11 @@
   },
   "chat": {
     "rewind": {
-      "confirmMessage": "이 시점으로 되감으시겠습니까? 이 메시지 이후의 파일 변경 사항이 되돌려집니다. 수동으로 또는 bash를 통해 편집된 파일에는 영향을 미치지 않습니다.",
+      "confirmMessage": "이 시점으로 되감으시겠습니까? 이 메시지 이후의 파일 변경 사항이 덮어쓰이거나 삭제될 수 있습니다. 이 작업은 실행 취소할 수 없습니다.",
+      "confirmMessageConflicts": "이 시점으로 되감으시겠습니까? 에이전트 외부에서 수정된 파일 {count}개를 덮어씁니다:\n{files}",
       "confirmMessageConversationOnly": "대화를 이 시점으로 되감으시겠습니까? 파일 변경 사항은 유지됩니다.",
       "confirmButton": "되감기",
+      "inProgress": "현재 되감기가 완료될 때까지 기다려 주세요.",
       "ariaLabel": "여기로 되감기",
       "menuConversationOnly": "대화만 되감기",
       "menuCodeAndConversation": "코드 + 대화 되감기",
@@ -43,7 +45,6 @@
       "chooseTarget": "대화 분기",
       "targetNewTab": "새 탭",
       "targetCurrentTab": "현재 탭",
-      "maxTabsReached": "분기 불가: 최대 {count}개 탭에 도달했습니다",
       "notice": "새 탭으로 분기됨",
       "noticeCurrentTab": "현재 탭에서 분기됨",
       "failed": "분기 실패: {error}",
@@ -103,6 +104,11 @@
       "name": "대화 제목 자동 생성",
       "desc": "첫 번째 사용자 메시지 전송 후 자동으로 대화 제목을 생성합니다."
     },
+    "titleLanguage": {
+      "name": "제목 생성 언어",
+      "desc": "자동 생성되는 대화 제목에 사용할 언어입니다.",
+      "followInterface": "인터페이스 언어와 동일"
+    },
     "titleModel": {
       "name": "제목 생성 모델",
       "desc": "대화 제목을 자동 생성하는 데 사용되는 모델.",
@@ -132,14 +138,14 @@
       "btnSet": "단축키 설정"
     },
     "newSessionHotkey": {
-      "name": "새 세션",
+      "name": "현재 대화 바꾸기",
       "descWithKey": "현재 단축키: {hotkey}",
       "descNoKey": "단축키 미설정",
       "btnChange": "변경",
       "btnSet": "단축키 설정"
     },
     "newTabHotkey": {
-      "name": "새 탭",
+      "name": "새로 만들기",
       "descWithKey": "현재 단축키: {hotkey}",
       "descNoKey": "단축키 미설정",
       "btnChange": "변경",
@@ -272,10 +278,23 @@
         "noNode": "PATH에서 Node.js를 찾을 수 없습니다. Node.js를 설치하거나 PATH 설정을 확인하세요."
       }
     },
-    "maxTabs": {
-      "name": "최대 채팅 탭 수",
-      "desc": "동시에 열 수 있는 최대 채팅 탭 수(3-10). 각 탭은 별도의 Claude 세션을 사용합니다.",
-      "warning": "5개 탭을 초과하면 성능 및 메모리 사용량에 영향을 줄 수 있습니다."
+    "maxWarmAgentProcesses": {
+      "name": "최대 동시 실행 세션 수",
+      "desc": "동시에 준비 상태로 유지할 에이전트 세션의 최대 수(5-10). 오래된 유휴 세션은 자동으로 일시 중지되고 사용할 때 재개됩니다."
+    },
+    "enableDualPane": {
+      "name": "이중 창 모드 활성화",
+      "desc": "보기 너비가 600px 이상이면 채팅 옆에 세션 관리자를 자동으로 표시합니다."
+    },
+    "enableFilePane": {
+      "name": "파일 창 활성화",
+      "desc": "이중 창 모드의 세션 관리자에 파일 탭을 표시합니다."
+    },
+    "dualPaneSide": {
+      "name": "이중 창 위치",
+      "desc": "세션 관리자를 채팅의 어느 쪽에 표시할지 선택합니다.",
+      "left": "왼쪽",
+      "right": "오른쪽"
     },
     "enableAutoScroll": {
       "name": "스트리밍 중 자동 스크롤",
@@ -310,11 +329,13 @@
       "name": "언어",
       "desc": "플러그인 인터페이스의 표시 언어 변경"
     },
+    "providerEnablement": {
+      "name": "{provider} 활성화",
+      "desc": "활성화된 {provider} 모델을 새 대화에서 사용할 수 있게 합니다. 비활성화해도 기존 세션은 유지됩니다.",
+      "lastProviderWarning": "Claudian을 사용하려면 하나 이상의 제공자를 활성화해야 합니다.",
+      "noModelsWarning": "활성화된 {provider} 모델이 없습니다. 아래 모델 섹션에서 하나 이상의 모델을 활성화하세요."
+    },
     "codex": {
-      "enableProvider": {
-        "name": "Codex 공급자 활성화",
-        "desc": "활성화하면 새 대화의 모델 선택기에 Codex 모델이 표시됩니다. 기존 Codex 세션은 유지됩니다."
-      },
       "installationMethod": {
         "name": "설치 방식",
         "desc": "Windows에서 Claudian이 Codex를 실행하는 방식입니다. 네이티브 Windows는 Windows 실행 파일 경로를 사용하고, WSL은 선택한 배포판 안에서 Linux CLI를 실행합니다.",
@@ -351,9 +372,13 @@
         "detailed": "상세",
         "off": "끄기"
       },
+      "ultraEffort": {
+        "name": "Ultra 추론 강도 활성화",
+        "desc": "Ultra를 지원하는 Codex 모델의 추론 강도 선택기에 표시합니다. Ultra는 최대 추론과 자동 작업 위임을 사용합니다."
+      },
       "skills": {
         "name": "Codex 스킬",
-        "desc": ".codex/skills/ 또는 .agents/skills/에 저장된 vault 수준 Codex 스킬을 관리합니다. 홈 수준 스킬은 여기에서 제외됩니다.",
+        "desc": "Manage shared vault-level skills stored only in .agents/skills/.",
         "hiddenName": "숨긴 스킬",
         "hiddenDesc": "드롭다운에서 특정 Codex 스킬을 숨깁니다. 앞의 $ 없이 스킬 이름을 한 줄에 하나씩 입력하세요.",
         "hiddenPlaceholder": "analyze\nexplain\nfix"
@@ -371,6 +396,11 @@
         "name": "Codex 환경",
         "desc": "Codex 전용 런타임 변수만 입력하세요. OPENAI_* 및 CODEX_* 설정에 사용합니다. Codex 자동 감지에 도움이 필요하면 이 공급자 섹션 대신 공유 PATH에 설치 디렉터리를 추가하세요."
       }
+    },
+    "agentSkills": {
+      "sectionTitle": "Skills", "fixedRoot": "Managed in .agents/skills", "sharedExpectation": "Manage shared skills in .agents/skills/ for compatible providers.", "noSkills": "No shared skills configured. Click + to create one.", "skillBadge": "skill", "diagnosticsTitle": "Skills needing attention", "loadFailed": "Could not load shared skills.", "savedRefreshFailed": "Saved, but provider refresh failed.", "validationFailed": "Invalid skill: {message}", "collisionFailed": "A skill named \"{name}\" already exists.", "saveFailed": "Failed to save shared skill: {message}", "deleteFailed": "Failed to move shared skill to trash: {message}", "staleConflict": "This skill changed elsewhere; refresh before saving.", "created": "Shared skill \"{name}\" created.", "updated": "Shared skill \"{name}\" updated.", "deleted": "Shared skill \"{name}\" moved to trash.",
+      "modal": { "titleEdit": "Edit Shared Skill", "titleAdd": "Add Shared Skill", "name": "Skill name", "nameDesc": "Lowercase letters and numbers separated by single hyphens", "namePlaceholder": "code-reviewer", "description": "Description", "descriptionDesc": "Required portable description used by providers to select the skill", "descriptionPlaceholder": "Reviews code for correctness and maintainability", "instructions": "Instructions", "instructionsDesc": "Required SKILL.md instructions", "instructionsPlaceholder": "Review the supplied code and report actionable findings..." },
+      "delete": { "title": "Delete Shared Skill", "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.", "confirm": "Move to trash" }
     },
     "codexSkills": {
       "modal": {

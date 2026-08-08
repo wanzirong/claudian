@@ -91,6 +91,101 @@ describe('AcpSessionUpdateNormalizer', () => {
     });
   });
 
+  it('preserves native diff content through a status-only completion', () => {
+    const normalizer = new AcpSessionUpdateNormalizer();
+
+    normalizer.normalize({
+      rawInput: { content: 'new text', file_path: 'src/write.ts' },
+      sessionUpdate: 'tool_call',
+      title: 'write',
+      toolCallId: 'tool-write',
+    });
+    normalizer.normalize({
+      content: [{
+        newText: 'new text',
+        oldText: 'old text',
+        path: 'src/write.ts',
+        type: 'diff',
+      }],
+      sessionUpdate: 'tool_call_update',
+      status: 'in_progress',
+      toolCallId: 'tool-write',
+    });
+    const completed = normalizer.normalize({
+      sessionUpdate: 'tool_call_update',
+      status: 'completed',
+      toolCallId: 'tool-write',
+    });
+
+    expect(completed).toMatchObject({
+      streamChunks: [{
+        toolUseResult: {
+          filePath: 'src/write.ts',
+          newText: 'new text',
+          oldText: 'old text',
+        },
+        type: 'tool_result',
+      }],
+      toolState: {
+        toolUseResult: {
+          filePath: 'src/write.ts',
+          newText: 'new text',
+          oldText: 'old text',
+        },
+      },
+    });
+  });
+
+  it('retains raw tool payloads while preferring concise rendered content', () => {
+    const normalizer = new AcpSessionUpdateNormalizer();
+    const rawInput = ['opaque', { nested: true }];
+    const rawOutput = { future: { bytes: [1, 2, 3] } };
+
+    normalizer.normalize({
+      rawInput,
+      sessionUpdate: 'tool_call',
+      title: 'future_tool',
+      toolCallId: 'tool-future',
+    });
+    const progress = normalizer.normalize({
+      content: [{
+        content: { text: 'Concise result', type: 'text' },
+        type: 'content',
+      }],
+      rawInput,
+      rawOutput,
+      sessionUpdate: 'tool_call_update',
+      status: 'in_progress',
+      toolCallId: 'tool-future',
+    });
+    const completed = normalizer.normalize({
+      sessionUpdate: 'tool_call_update',
+      status: 'completed',
+      toolCallId: 'tool-future',
+    });
+
+    expect(progress).toMatchObject({
+      streamChunks: [{ content: 'Concise result', type: 'tool_output' }],
+      toolState: {
+        output: 'Concise result',
+        rawInput,
+        rawOutput,
+      },
+    });
+    expect(completed).toMatchObject({
+      streamChunks: [{
+        content: 'Concise result',
+        type: 'tool_result',
+      }],
+      toolState: {
+        output: 'Concise result',
+        rawInput,
+        rawOutput,
+      },
+      type: 'tool_call_update',
+    });
+  });
+
   it('maps ACP commands into slash commands', () => {
     const normalizer = new AcpSessionUpdateNormalizer();
 

@@ -5,13 +5,14 @@ import type {
   ProviderUIOption,
 } from '../../../core/providers/types';
 import { OPENCODE_PROVIDER_ICON } from '../../../shared/icons';
+import { maybeGetOpencodeWorkspaceServices } from '../app/OpencodeWorkspaceServices';
+import { OpencodeMetadataService } from '../metadata/OpencodeMetadataService';
 import {
   buildOpencodeBaseModels,
   decodeOpencodeModelId,
   encodeOpencodeModelId,
   isOpencodeModelSelectionId,
   OPENCODE_DEFAULT_THINKING_LEVEL,
-  OPENCODE_SYNTHETIC_MODEL_ID,
   resolveOpencodeBaseModelRawId,
   resolveOpencodeDefaultThinkingLevel,
 } from '../models';
@@ -19,14 +20,9 @@ import {
   resolveOpencodeModeForPermissionMode,
   resolvePermissionModeForManagedOpencodeMode,
 } from '../modes';
-import { OpencodeChatRuntime } from '../runtime/OpencodeChatRuntime';
 import { getOpencodeProviderSettings, updateOpencodeProviderSettings } from '../settings';
 
-const OPENCODE_MODELS: ProviderUIOption[] = [
-  { value: OPENCODE_SYNTHETIC_MODEL_ID, label: 'OpenCode', description: 'ACP runtime' },
-];
 const DEFAULT_CONTEXT_WINDOW = 200_000;
-const OPENCODE_METADATA_WARMUP_DB = ':memory:';
 const OPENCODE_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
   inactiveValue: 'normal',
   inactiveLabel: 'Safe',
@@ -51,14 +47,6 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
         value: encodeOpencodeModelId(model.rawId),
       }),
     ]));
-    const savedProviderModel = (
-      settings.savedProviderModel
-      && typeof settings.savedProviderModel === 'object'
-      && !Array.isArray(settings.savedProviderModel)
-    )
-      ? settings.savedProviderModel as Record<string, unknown>
-      : null;
-
     const seenValues = new Set<string>();
     const options: ProviderUIOption[] = [];
     for (const rawModelId of [...opencodeSettings.visibleModels].reverse()) {
@@ -76,40 +64,12 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
       );
     }
 
-    const selectedModelValues = [
-      typeof settings.model === 'string' ? settings.model : '',
-      typeof savedProviderModel?.opencode === 'string'
-        ? savedProviderModel.opencode
-        : '',
-    ];
+    return options;
+  },
 
-    for (const model of selectedModelValues) {
-      const rawModelId = decodeOpencodeModelId(model);
-      if (
-        !model
-        || !isOpencodeModelSelectionId(model)
-        || model === OPENCODE_SYNTHETIC_MODEL_ID
-        || !rawModelId
-      ) {
-        continue;
-      }
-
-      const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, opencodeSettings.discoveredModels);
-      const baseModelId = encodeOpencodeModelId(baseRawId);
-      pushOption(
-        options,
-        seenValues,
-        baseModelId,
-        discoveredModels.get(baseModelId)
-          ?? applyAlias(baseRawId, {
-            description: 'Selected in an existing session',
-            label: baseRawId,
-            value: baseModelId,
-          }),
-      );
-    }
-
-    return options.length > 0 ? options : [...OPENCODE_MODELS];
+  getDefaultModel(settings: Record<string, unknown>): string | null {
+    const rawModelId = getOpencodeProviderSettings(settings).visibleModels[0];
+    return rawModelId ? encodeOpencodeModelId(rawModelId) : null;
   },
 
   ownsModel(model: string): boolean {
@@ -178,17 +138,15 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
       return;
     }
 
-    const runtime = new OpencodeChatRuntime(context.plugin);
+    const workspaceService = maybeGetOpencodeWorkspaceServices()?.metadataService;
+    const metadataService = workspaceService
+      ?? new OpencodeMetadataService(context.plugin);
     try {
-      runtime.syncConversationState({
-        providerState: { databasePath: OPENCODE_METADATA_WARMUP_DB },
-        sessionId: null,
-      });
-      await runtime.warmModelMetadata(model);
+      await metadataService.warmModelMetadata(model);
     } catch {
       // Metadata warmup is opportunistic; the first real turn can still discover it.
     } finally {
-      runtime.cleanup();
+      if (!workspaceService) await metadataService.dispose();
     }
   },
 

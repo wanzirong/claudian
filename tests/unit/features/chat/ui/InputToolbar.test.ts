@@ -2,12 +2,13 @@ import {
   TEST_CODEX_MODEL,
   TEST_CODEX_MODEL_LABEL,
 } from '@test/helpers/codexModels';
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 
 import type { UsageInfo } from '@/core/types';
 import {
   ContextUsageMeter,
   createInputToolbar,
+  InputToolbarLayoutController,
   McpServerSelector,
   ModelSelector,
   ModeSelector,
@@ -77,6 +78,7 @@ function filterVisibleModels(
 
 function createMockUIConfig() {
   return {
+    getProviderIcon: jest.fn().mockReturnValue(null),
     getModelOptions: jest.fn().mockImplementation((settings: {
       enableOpus1M?: boolean;
       enableSonnet1M?: boolean;
@@ -171,7 +173,6 @@ function createMockCallbacks(overrides: Record<string, any> = {}) {
     getUIConfig: jest.fn().mockReturnValue(createMockUIConfig()),
     getCapabilities: jest.fn().mockReturnValue({
       providerId: 'claude',
-      supportsPersistentRuntime: true,
       supportsNativeHistory: true,
       supportsPlanMode: true,
       supportsRewind: true,
@@ -209,6 +210,46 @@ describe('ModelSelector', () => {
     expect(label?.textContent).toBe('Sonnet');
   });
 
+  it('should display the selected provider icon before the model label', () => {
+    const providerIcon = {
+      kind: 'path' as const,
+      viewBox: '0 0 16 16',
+      path: 'M1 1h14v14H1z',
+    };
+    const uiConfig = createMockUIConfig();
+    uiConfig.getProviderIcon.mockReturnValue(providerIcon);
+    callbacks.getUIConfig.mockReturnValue(uiConfig);
+
+    selector.updateDisplay();
+
+    const btn = parentEl.querySelector('.claudian-model-btn');
+    const icon = btn?.querySelector('.claudian-model-provider-icon');
+    const label = btn?.querySelector('.claudian-model-label');
+    expect(icon).not.toBeNull();
+    expect(icon?.getAttribute('width')).toBe('12');
+    expect(icon?.getAttribute('height')).toBe('12');
+    expect(btn?.children).toEqual([icon, label]);
+  });
+
+  it('should prefer the selected model provider icon in a mixed-provider picker', () => {
+    const selectedProviderIcon = {
+      kind: 'path' as const,
+      viewBox: '0 0 24 24',
+      path: 'M2 2h20v20H2z',
+    };
+    const uiConfig = createMockUIConfig();
+    uiConfig.getModelOptions.mockReturnValue([
+      { value: 'sonnet', label: 'Sonnet', providerIcon: selectedProviderIcon },
+    ]);
+    callbacks.getUIConfig.mockReturnValue(uiConfig);
+
+    selector.updateDisplay();
+
+    const icon = parentEl.querySelector('.claudian-model-btn')
+      ?.querySelector('.claudian-model-provider-icon');
+    expect(icon?.getAttribute('viewBox')).toBe(selectedProviderIcon.viewBox);
+  });
+
   it('should display first model when current model not found', () => {
     callbacks.getSettings.mockReturnValue({
       model: 'nonexistent',
@@ -233,6 +274,30 @@ describe('ModelSelector', () => {
     expect(options[0]?.children[0]?.textContent).toBe('Opus');
     expect(options[1]?.children[0]?.textContent).toBe('Sonnet');
     expect(options[2]?.children[0]?.textContent).toBe('Haiku');
+  });
+
+  it('should reread model options before the dropdown becomes visible', () => {
+    const uiConfig = callbacks.getUIConfig();
+    uiConfig.getModelOptions.mockReturnValue([
+      { value: 'gpt-new', label: 'GPT New' },
+      { value: 'gpt-fast', label: 'GPT Fast' },
+    ]);
+    callbacks.getSettings.mockReturnValue({
+      model: 'gpt-new',
+      thinkingBudget: 'low',
+      effortLevel: 'high',
+      serviceTier: 'default',
+      permissionMode: 'normal',
+    });
+
+    parentEl.querySelector('.claudian-model-selector')?.dispatchEvent('mouseenter');
+
+    expect(parentEl.querySelector('.claudian-model-label')?.textContent).toBe('GPT New');
+    const options = parentEl.querySelector('.claudian-model-dropdown')?.children ?? [];
+    expect(options.map((option: any) => option.children[0]?.textContent)).toEqual([
+      'GPT Fast',
+      'GPT New',
+    ]);
   });
 
   it('should mark current model as selected', () => {
@@ -472,6 +537,11 @@ describe('ThinkingBudgetSelector', () => {
     it('should display current effort level for Claude models', () => {
       const current = parentEl.querySelector('.claudian-thinking-current');
       expect(current?.textContent).toBe('High');
+    });
+
+    it('should render the effort label for responsive styling', () => {
+      const effort = parentEl.querySelector('.claudian-thinking-effort');
+      expect(effort?.querySelector('.claudian-thinking-label-text')?.textContent).toBe('Effort:');
     });
   });
 
@@ -776,6 +846,18 @@ describe('ServiceTierToggle', () => {
     const container = parentEl2.querySelector('.claudian-service-tier-toggle');
     expect(container?.style.display).toBe('none');
   });
+
+  it('does not toggle when the provider exposes no fast service tier', async () => {
+    callbacks.getUIConfig.mockReturnValue({
+      ...createMockUIConfig(),
+      getServiceTierToggle: jest.fn().mockReturnValue(null),
+    });
+    const parentEl2 = createMockEl();
+    const toggle = new ServiceTierToggle(parentEl2, callbacks);
+
+    await expect(toggle.toggle()).resolves.toBe(false);
+    expect(callbacks.onServiceTierChange).not.toHaveBeenCalled();
+  });
 });
 
 describe('McpServerSelector', () => {
@@ -1039,10 +1121,21 @@ describe('ContextUsageMeter', () => {
     expect(container?.style.display).toBe('flex');
   });
 
-  it('should display percentage', () => {
+  it('should render percentage text for responsive styling', () => {
     meter.update(makeUsage({ contextTokens: 50000, contextWindow: 200000, percentage: 25 }));
     const percent = parentEl.querySelector('.claudian-context-meter-percent');
     expect(percent?.textContent).toBe('25%');
+  });
+
+  it('should expose usage details to assistive technology', () => {
+    meter.update(makeUsage({ contextTokens: 50000, contextWindow: 200000, percentage: 25 }));
+    const container = parentEl.querySelector('.claudian-context-meter');
+    expect(container?.getAttribute('role')).toBe('progressbar');
+    expect(container?.getAttribute('aria-label')).toBe('Context usage');
+    expect(container?.getAttribute('aria-valuemin')).toBe('0');
+    expect(container?.getAttribute('aria-valuemax')).toBe('100');
+    expect(container?.getAttribute('aria-valuenow')).toBe('25');
+    expect(container?.getAttribute('aria-valuetext')).toBe('50k / 200k');
   });
 
   it('should add warning class when usage > 80%', () => {
@@ -1080,6 +1173,114 @@ describe('ContextUsageMeter', () => {
     meter.update(makeUsage({ contextTokens: 160000, contextWindow: 200000, percentage: 80 }));
     const container = parentEl.querySelector('.claudian-context-meter');
     expect(container?.getAttribute('data-tooltip')).toBe('160k / 200k');
+  });
+});
+
+describe('InputToolbarLayoutController', () => {
+  function setRect(element: any, top: number, width = 40, height = 24): void {
+    element.getBoundingClientRect = jest.fn().mockReturnValue({
+      top,
+      bottom: top + height,
+      left: 0,
+      right: width,
+      width,
+      height,
+      x: 0,
+      y: top,
+      toJSON: jest.fn(),
+    });
+  }
+
+  it('should compact optional labels when toolbar items wrap', () => {
+    const toolbarEl = createMockEl();
+    const firstItem = toolbarEl.createDiv();
+    const wrappedItem = toolbarEl.createDiv();
+    setRect(firstItem, 0);
+    setRect(wrappedItem, 36);
+
+    const controller = new InputToolbarLayoutController(toolbarEl);
+    controller.refreshLayout();
+
+    expect(toolbarEl.hasClass('claudian-input-toolbar--compact')).toBe(true);
+    controller.destroy();
+  });
+
+  it('should show optional labels when all toolbar items fit on one line', () => {
+    const toolbarEl = createMockEl();
+    const firstItem = toolbarEl.createDiv();
+    const secondItem = toolbarEl.createDiv();
+    setRect(firstItem, 0, 40, 24);
+    setRect(secondItem, 3, 40, 18);
+    toolbarEl.addClass('claudian-input-toolbar--compact');
+
+    const controller = new InputToolbarLayoutController(toolbarEl);
+    controller.refreshLayout();
+
+    expect(toolbarEl.hasClass('claudian-input-toolbar--compact')).toBe(false);
+    controller.destroy();
+  });
+
+  it('should remeasure after resize and disconnect its observer on destroy', () => {
+    const toolbarEl = createMockEl();
+    const firstItem = toolbarEl.createDiv();
+    const secondItem = toolbarEl.createDiv();
+    setRect(firstItem, 0);
+    setRect(secondItem, 0);
+
+    const observerCallbacks: {
+      resize?: ResizeObserverCallback;
+      frame?: FrameRequestCallback;
+    } = {};
+    const observe = jest.fn();
+    const disconnect = jest.fn();
+    toolbarEl.ownerDocument.defaultView.requestAnimationFrame = jest.fn((callback) => {
+      observerCallbacks.frame = callback;
+      return 1;
+    });
+    toolbarEl.ownerDocument.defaultView.ResizeObserver = class {
+      constructor(callback: ResizeObserverCallback) {
+        observerCallbacks.resize = callback;
+      }
+      observe = observe;
+      unobserve = jest.fn();
+      disconnect = disconnect;
+    };
+
+    const controller = new InputToolbarLayoutController(toolbarEl);
+    expect(observe).toHaveBeenCalledWith(toolbarEl);
+    observerCallbacks.frame?.(0);
+    expect(toolbarEl.hasClass('claudian-input-toolbar--compact')).toBe(false);
+
+    setRect(secondItem, 36);
+    observerCallbacks.resize?.([], {} as ResizeObserver);
+    observerCallbacks.frame?.(0);
+    expect(toolbarEl.hasClass('claudian-input-toolbar--compact')).toBe(true);
+
+    controller.destroy();
+    expect(disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('should release earlier observers when layout construction fails', () => {
+    const toolbarEl = createMockEl();
+    const disconnectResize = jest.fn();
+    const disconnectMutation = jest.fn();
+    const observerError = new Error('mutation observer failed');
+    toolbarEl.ownerDocument.defaultView.ResizeObserver = class {
+      observe = jest.fn();
+      unobserve = jest.fn();
+      disconnect = disconnectResize;
+    };
+    toolbarEl.ownerDocument.defaultView.MutationObserver = class {
+      observe = jest.fn(() => {
+        throw observerError;
+      });
+      disconnect = disconnectMutation;
+      takeRecords = jest.fn().mockReturnValue([]);
+    };
+
+    expect(() => new InputToolbarLayoutController(toolbarEl)).toThrow(observerError);
+    expect(disconnectResize).toHaveBeenCalledTimes(1);
+    expect(disconnectMutation).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1177,6 +1378,7 @@ describe('createInputToolbar', () => {
     expect(toolbar.modeSelector).toBeInstanceOf(ModeSelector);
     expect(toolbar.thinkingBudgetSelector).toBeInstanceOf(ThinkingBudgetSelector);
     expect(toolbar.contextUsageMeter).toBeInstanceOf(ContextUsageMeter);
+    expect(toolbar.layoutController).toBeInstanceOf(InputToolbarLayoutController);
     expect(toolbar.mcpServerSelector).toBeInstanceOf(McpServerSelector);
     expect(toolbar.permissionToggle).toBeInstanceOf(PermissionToggle);
     expect(toolbar.serviceTierToggle).toBeInstanceOf(ServiceTierToggle);

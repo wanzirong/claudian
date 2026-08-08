@@ -23,9 +23,11 @@
   },
   "chat": {
     "rewind": {
-      "confirmMessage": "Rembobiner jusqu'à ce point ? Les modifications de fichiers après ce message seront annulées. Le rembobinage n'affecte pas les fichiers modifiés manuellement ou via bash.",
+      "confirmMessage": "Rembobiner jusqu'à ce point ? Les modifications de fichiers postérieures à ce message peuvent être écrasées ou supprimées. Cette action est irréversible.",
+      "confirmMessageConflicts": "Rembobiner jusqu'à ce point ? {count} fichier(s) modifié(s) hors de l’agent seront écrasés :\n{files}",
       "confirmMessageConversationOnly": "Rembobiner la conversation jusqu'à ce point ? Les modifications de fichiers seront conservées.",
       "confirmButton": "Rembobiner",
+      "inProgress": "Veuillez attendre la fin du rembobinage en cours.",
       "ariaLabel": "Rembobiner jusqu'ici",
       "menuConversationOnly": "Rembobiner la conversation seule",
       "menuCodeAndConversation": "Rembobiner code + conversation",
@@ -43,7 +45,6 @@
       "chooseTarget": "Bifurquer la conversation",
       "targetNewTab": "Nouvel onglet",
       "targetCurrentTab": "Onglet actuel",
-      "maxTabsReached": "Impossible de bifurquer : maximum de {count} onglets atteint",
       "notice": "Bifurqué dans un nouvel onglet",
       "noticeCurrentTab": "Bifurqué dans l'onglet actuel",
       "failed": "Échec de la bifurcation : {error}",
@@ -103,6 +104,11 @@
       "name": "Générer automatiquement les titres de conversation",
       "desc": "Génère automatiquement les titres de conversation après le premier message de l'utilisateur."
     },
+    "titleLanguage": {
+      "name": "Langue de génération des titres",
+      "desc": "Langue utilisée pour les titres de conversation générés automatiquement.",
+      "followInterface": "Identique à la langue de l’interface"
+    },
     "titleModel": {
       "name": "Modèle de génération de titre",
       "desc": "Modèle utilisé pour générer automatiquement les titres de conversation.",
@@ -132,14 +138,14 @@
       "btnSet": "Définir"
     },
     "newSessionHotkey": {
-      "name": "Nouvelle session",
+      "name": "Remplacer la conversation actuelle",
       "descWithKey": "Raccourci actuel : {hotkey}",
       "descNoKey": "Aucun raccourci défini",
       "btnChange": "Modifier",
       "btnSet": "Définir"
     },
     "newTabHotkey": {
-      "name": "Nouvel onglet",
+      "name": "Nouveau",
       "descWithKey": "Raccourci actuel : {hotkey}",
       "descNoKey": "Aucun raccourci défini",
       "btnChange": "Modifier",
@@ -272,10 +278,23 @@
         "noNode": "Node.js introuvable dans PATH. Installez Node.js ou vérifiez votre configuration PATH."
       }
     },
-    "maxTabs": {
-      "name": "Maximum d'onglets de chat",
-      "desc": "Nombre maximum d'onglets de chat simultanés (3-10). Chaque onglet utilise une session Claude séparée.",
-      "warning": "Plus de 5 onglets peut affecter les performances et l'utilisation de la mémoire."
+    "maxWarmAgentProcesses": {
+      "name": "Maximum de sessions exécutées simultanément",
+      "desc": "Nombre maximal de sessions d'agent gardées prêtes à la fois (5-10). Les anciennes sessions inactives se mettent automatiquement en pause et reprennent à l'utilisation."
+    },
+    "enableDualPane": {
+      "name": "Activer le mode double volet",
+      "desc": "Afficher automatiquement le gestionnaire de sessions à côté du chat lorsque la vue mesure au moins 600 px de large."
+    },
+    "enableFilePane": {
+      "name": "Activer le volet des fichiers",
+      "desc": "Afficher un onglet Fichiers dans le gestionnaire de sessions du mode double volet."
+    },
+    "dualPaneSide": {
+      "name": "Côté du double volet",
+      "desc": "Choisir de quel côté du chat le gestionnaire de sessions apparaît.",
+      "left": "Gauche",
+      "right": "Droite"
     },
     "enableAutoScroll": {
       "name": "Défilement automatique pendant le streaming",
@@ -310,11 +329,13 @@
       "name": "Langue",
       "desc": "Changer la langue d'affichage de l'interface du plugin"
     },
+    "providerEnablement": {
+      "name": "Activer {provider}",
+      "desc": "Rendre les modèles {provider} activés disponibles pour les nouvelles conversations. Les sessions existantes sont conservées après la désactivation.",
+      "lastProviderWarning": "Au moins un fournisseur doit rester activé pour que Claudian fonctionne.",
+      "noModelsWarning": "Aucun modèle {provider} n’est activé. Dans la section Modèles ci-dessous, activez au moins un modèle."
+    },
     "codex": {
-      "enableProvider": {
-        "name": "Activer le fournisseur Codex",
-        "desc": "Lorsque cette option est activée, les modèles Codex apparaissent dans le sélecteur de modèles des nouvelles conversations. Les sessions Codex existantes sont conservées."
-      },
       "installationMethod": {
         "name": "Méthode d’installation",
         "desc": "Comment Claudian doit lancer Codex sous Windows. Windows natif utilise un chemin d’exécutable Windows. WSL lance la CLI Linux dans une distribution choisie.",
@@ -351,9 +372,13 @@
         "detailed": "Détaillée",
         "off": "Désactivé"
       },
+      "ultraEffort": {
+        "name": "Activer l’effort ultra",
+        "desc": "Affiche Ultra dans le sélecteur d’effort pour les modèles Codex compatibles. Ultra utilise le raisonnement maximal avec délégation automatique des tâches."
+      },
       "skills": {
         "name": "Compétences Codex",
-        "desc": "Gérez les compétences Codex de niveau vault stockées dans .codex/skills/ ou .agents/skills/. Les compétences de niveau home sont exclues ici.",
+        "desc": "Manage shared vault-level skills stored only in .agents/skills/.",
         "hiddenName": "Compétences masquées",
         "hiddenDesc": "Masquez certaines compétences Codex dans le menu déroulant. Entrez les noms sans le $ initial, un par ligne.",
         "hiddenPlaceholder": "analyze\nexplain\nfix"
@@ -371,6 +396,11 @@
         "name": "Environnement Codex",
         "desc": "Variables d’exécution appartenant uniquement à Codex. Utilisez ceci pour les réglages OPENAI_* et CODEX_*. Si l’auto-détection de Codex a besoin d’aide, ajoutez son répertoire d’installation au PATH partagé plutôt qu’à cette section fournisseur."
       }
+    },
+    "agentSkills": {
+      "sectionTitle": "Skills", "fixedRoot": "Managed in .agents/skills", "sharedExpectation": "Manage shared skills in .agents/skills/ for compatible providers.", "noSkills": "No shared skills configured. Click + to create one.", "skillBadge": "skill", "diagnosticsTitle": "Skills needing attention", "loadFailed": "Could not load shared skills.", "savedRefreshFailed": "Saved, but provider refresh failed.", "validationFailed": "Invalid skill: {message}", "collisionFailed": "A skill named \"{name}\" already exists.", "saveFailed": "Failed to save shared skill: {message}", "deleteFailed": "Failed to move shared skill to trash: {message}", "staleConflict": "This skill changed elsewhere; refresh before saving.", "created": "Shared skill \"{name}\" created.", "updated": "Shared skill \"{name}\" updated.", "deleted": "Shared skill \"{name}\" moved to trash.",
+      "modal": { "titleEdit": "Edit Shared Skill", "titleAdd": "Add Shared Skill", "name": "Skill name", "nameDesc": "Lowercase letters and numbers separated by single hyphens", "namePlaceholder": "code-reviewer", "description": "Description", "descriptionDesc": "Required portable description used by providers to select the skill", "descriptionPlaceholder": "Reviews code for correctness and maintainability", "instructions": "Instructions", "instructionsDesc": "Required SKILL.md instructions", "instructionsPlaceholder": "Review the supplied code and report actionable findings..." },
+      "delete": { "title": "Delete Shared Skill", "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.", "confirm": "Move to trash" }
     },
     "codexSkills": {
       "modal": {

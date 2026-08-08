@@ -1,4 +1,5 @@
 import type { ProviderHost } from '@/core/providers/ProviderHost';
+import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import type { CodexDiscoveredModel } from '@/providers/codex/models';
 import { CodexModelCatalogCoordinator } from '@/providers/codex/runtime/CodexModelCatalogCoordinator';
 import { buildCodexCatalogFingerprint } from '@/providers/codex/runtime/CodexModelCatalogFingerprint';
@@ -82,6 +83,7 @@ function createFakeHost(overrides: {
     },
     getResolvedProviderCliPath: jest.fn(() => resolvedCliPath),
     getActiveEnvironmentVariables: jest.fn(() => envText),
+    notifyProviderChatOptionsChanged: jest.fn(),
     mutateSettingsConditionally: jest.fn(async (mutation) => {
       return mutation({
         ...DEFAULT_CODEX_PROVIDER_SETTINGS,
@@ -130,10 +132,58 @@ function createHangingDiscovery(): {
   return { discovery };
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(finish => { resolve = finish; });
+  return { promise, resolve };
+}
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20 && !condition(); attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(condition()).toBe(true);
+}
+
+function deferConditionalMutations(host: ProviderHost, count: number): {
+  execute(index: number): Promise<boolean | void>;
+  queued: Promise<void>;
+} {
+  const executions: Array<() => Promise<boolean | void>> = [];
+  let resolveQueued!: () => void;
+  const queued = new Promise<void>(resolve => { resolveQueued = resolve; });
+  (host.mutateSettingsConditionally as jest.Mock).mockImplementation((mutation) => (
+    new Promise<boolean | void>((resolve, reject) => {
+      executions.push(async () => {
+        try {
+          const result = await mutation(host.settings);
+          resolve(result);
+          return result;
+        } catch (error) {
+          reject(error);
+        }
+      });
+      if (executions.length === count) resolveQueued();
+    })
+  ));
+  return {
+    async execute(index) {
+      const execution = executions[index];
+      if (!execution) throw new Error(`Conditional mutation ${index} was not queued`);
+      return execution();
+    },
+    queued,
+  };
+}
+
 describe('CodexModelCatalogCoordinator', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
   it('does not expose environment secrets in the catalog fingerprint', () => {
     expect(FAKE_FINGERPRINT).not.toContain('secret');
-    expect(FAKE_FINGERPRINT).toMatch(/^1:[a-f0-9]{64}$/);
+    expect(FAKE_FINGERPRINT).toMatch(/^2:[a-f0-9]{64}$/);
   });
 
   it('returns cached models immediately when cache is fresh', async () => {
@@ -201,6 +251,53 @@ describe('CodexModelCatalogCoordinator', () => {
     expect(result.backgroundRefresh).toBeDefined();
     await result.backgroundRefresh;
     expect(discovery.discoverModels).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes mounted model selectors after a background catalog change commits', async () => {
+    const cachedModel = makeModel('gpt-4o');
+    const discoveredModel = makeModel('gpt-4o-mini');
+    const host = createFakeHost({
+      discoveredModels: [cachedModel],
+      catalogTimestamp: 1,
+    });
+    (host.mutateSettingsConditionally as jest.Mock).mockImplementation(async (mutation) => {
+      await mutation(host.settings);
+    });
+    const coordinator = new CodexModelCatalogCoordinator(host, createDiscovery({
+      kind: 'completed',
+      models: [discoveredModel],
+    }));
+
+    const result = await coordinator.ensureFresh('layout-ready');
+
+    expect(result.models).toEqual([cachedModel]);
+    expect(host.notifyProviderChatOptionsChanged).not.toHaveBeenCalled();
+
+    await result.backgroundRefresh;
+
+    expect(getCodexProviderSettings(host.settings).discoveredModels).toEqual([discoveredModel]);
+    expect(host.notifyProviderChatOptionsChanged).toHaveBeenCalledWith('codex');
+  });
+
+  it('does not refresh mounted model selectors when only catalog freshness changes', async () => {
+    const cachedModel = makeModel('gpt-4o');
+    const host = createFakeHost({
+      discoveredModels: [cachedModel],
+      catalogTimestamp: 1,
+    });
+    (host.mutateSettingsConditionally as jest.Mock).mockImplementation(async (mutation) => {
+      await mutation(host.settings);
+    });
+    const coordinator = new CodexModelCatalogCoordinator(host, createDiscovery({
+      kind: 'completed',
+      models: [cachedModel],
+    }));
+
+    const result = await coordinator.ensureFresh('layout-ready');
+    const backgroundResult = await result.backgroundRefresh;
+
+    expect(backgroundResult?.refreshed).toBe(false);
+    expect(host.notifyProviderChatOptionsChanged).not.toHaveBeenCalled();
   });
 
   it('preserves cached models when cache fingerprint resolution fails', async () => {
@@ -274,7 +371,7 @@ describe('CodexModelCatalogCoordinator', () => {
     expect(first.models).toEqual(second.models);
   });
 
-  it('persists the fingerprint captured before model discovery starts', async () => {
+  it('rejects the fingerprint captured before discovery when its context changes', async () => {
     const host = createFakeHost();
     let signalDiscoveryStarted!: () => void;
     let resolveDiscovery!: (result: CodexModelDiscoveryResult) => void;
@@ -302,8 +399,82 @@ describe('CodexModelCatalogCoordinator', () => {
     resolveDiscovery({ kind: 'completed', models: [makeModel('gpt-4o')] });
     await refresh;
 
-    expect(getCodexProviderSettings(host.settings).catalogFingerprint).toBe(FAKE_FINGERPRINT);
-    await expect(coordinator.getStatus()).resolves.toBe('stale');
+    expect(getCodexProviderSettings(host.settings).catalogFingerprint).toBe('');
+    expect(getCodexProviderSettings(host.settings).discoveredModels).toEqual([]);
+  });
+
+  it('rejects a superseded late catalog write after the owner refresh persists', async () => {
+    const host = createFakeHost();
+    const firstDiscovery = deferred<CodexModelDiscoveryResult>();
+    const secondDiscovery = deferred<CodexModelDiscoveryResult>();
+    const discovery: CodexModelDiscoveryServiceLike = {
+      discoverModels: jest.fn()
+        .mockImplementationOnce(() => firstDiscovery.promise)
+        .mockImplementationOnce(() => secondDiscovery.promise),
+    };
+    const mutations = deferConditionalMutations(host, 2);
+    const coordinator = new CodexModelCatalogCoordinator(host, discovery);
+
+    const oldRefresh = coordinator.refresh();
+    while ((discovery.discoverModels as jest.Mock).mock.calls.length < 1) {
+      await Promise.resolve();
+    }
+    firstDiscovery.resolve({ kind: 'completed', models: [makeModel('old-model')] });
+    await new Promise(resolve => setImmediate(resolve));
+    const ownerRefresh = coordinator.refresh({ providerTransitionOwner: true });
+    while ((discovery.discoverModels as jest.Mock).mock.calls.length < 2) {
+      await Promise.resolve();
+    }
+    secondDiscovery.resolve({ kind: 'completed', models: [makeModel('new-model')] });
+    await mutations.queued;
+    await mutations.execute(1);
+    await ownerRefresh;
+
+    await expect(mutations.execute(0)).resolves.toBe(false);
+    await oldRefresh;
+
+    expect(getCodexProviderSettings(host.settings).discoveredModels).toEqual([
+      makeModel('new-model'),
+    ]);
+    expect(ProviderSettingsCoordinator.normalizeAllModelVariants).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a queued catalog write after disposal', async () => {
+    const host = createFakeHost();
+    const mutations = deferConditionalMutations(host, 1);
+    const coordinator = new CodexModelCatalogCoordinator(host, createDiscovery({
+      kind: 'completed',
+      models: [makeModel('disposed-model')],
+    }));
+
+    const refresh = coordinator.refresh();
+    await mutations.queued;
+    coordinator.dispose();
+    await expect(mutations.execute(0)).resolves.toBe(false);
+    await refresh;
+
+    expect(getCodexProviderSettings(host.settings).discoveredModels).toEqual([]);
+    expect(ProviderSettingsCoordinator.normalizeAllModelVariants).not.toHaveBeenCalled();
+  });
+
+  it('rejects a queued catalog write when its fingerprint context changes', async () => {
+    const host = createFakeHost();
+    const mutations = deferConditionalMutations(host, 1);
+    const coordinator = new CodexModelCatalogCoordinator(host, createDiscovery({
+      kind: 'completed',
+      models: [makeModel('stale-context-model')],
+    }));
+
+    const refresh = coordinator.refresh();
+    await mutations.queued;
+    const codexConfig = (host.settings.providerConfigs as Record<string, Record<string, unknown>>)
+      .codex;
+    codexConfig.environmentVariables = 'OPENAI_API_KEY=rotated';
+    await expect(mutations.execute(0)).resolves.toBe(false);
+    await refresh;
+
+    expect(getCodexProviderSettings(host.settings).discoveredModels).toEqual([]);
+    expect(ProviderSettingsCoordinator.normalizeAllModelVariants).not.toHaveBeenCalled();
   });
 
   it('retries an explicit refresh when its discovery inputs change in flight', async () => {
@@ -371,6 +542,92 @@ describe('CodexModelCatalogCoordinator', () => {
 
     const result = await refreshPromise;
     expect(result.diagnostics).toMatch(/cancelled/i);
+  });
+
+  it('aborts and awaits a held refresh while invalidating its environment cache', async () => {
+    const cachedModel = makeModel('cached-model');
+    const oldDiscovery = deferred<CodexModelDiscoveryResult>();
+    let discoverySignal: AbortSignal | undefined;
+    const discovery: CodexModelDiscoveryServiceLike = {
+      discoverModels: jest.fn((signal?: AbortSignal) => {
+        discoverySignal = signal;
+        return oldDiscovery.promise;
+      }),
+    };
+    const host = createFakeHost({ discoveredModels: [cachedModel] });
+    const coordinator = new CodexModelCatalogCoordinator(host, discovery);
+    const refresh = coordinator.refresh();
+    await waitForCondition(() => discoverySignal !== undefined);
+
+    const quiesce = coordinator.quiesceForEnvironmentChange();
+    let quiesceSettled = false;
+    void quiesce.then(() => { quiesceSettled = true; });
+    await Promise.resolve();
+
+    expect(discoverySignal).toBeDefined();
+    expect(discoverySignal!.aborted).toBe(true);
+    expect(quiesceSettled).toBe(false);
+
+    oldDiscovery.resolve({
+      kind: 'completed',
+      models: [makeModel('old-environment-model')],
+    });
+    await quiesce;
+    await refresh;
+
+    expect(coordinator.getState()).toBe('idle');
+    await expect(coordinator.getStatus()).resolves.toBe('missing');
+    expect(getCodexProviderSettings(host.settings).discoveredModels).toEqual([cachedModel]);
+    expect(host.mutateSettingsConditionally).not.toHaveBeenCalled();
+  });
+
+  it('blocks model discovery during an environment transition and uses the new state after it', async () => {
+    const host = createFakeHost();
+    const observedEnvironments: string[] = [];
+    const discovery: CodexModelDiscoveryServiceLike = {
+      discoverModels: jest.fn(async () => {
+        observedEnvironments.push(host.getActiveEnvironmentVariables('codex'));
+        return {
+          kind: 'completed' as const,
+          models: [makeModel('new-environment-model')],
+        };
+      }),
+    };
+    const coordinator = new CodexModelCatalogCoordinator(host, discovery);
+    coordinator.beginEnvironmentTransition();
+    await coordinator.quiesceForEnvironmentChange();
+
+    const refresh = coordinator.refresh();
+    try {
+      await Promise.resolve();
+      expect(discovery.discoverModels).not.toHaveBeenCalled();
+
+      (host.getActiveEnvironmentVariables as jest.Mock).mockReturnValue('NEW_API_KEY=updated');
+      coordinator.endEnvironmentTransition();
+      await expect(refresh).resolves.toMatchObject({ kind: 'completed' });
+    } finally {
+      coordinator.endEnvironmentTransition();
+      await Promise.allSettled([refresh]);
+      await coordinator.dispose();
+    }
+
+    expect(observedEnvironments).toEqual(['NEW_API_KEY=updated']);
+  });
+
+  it('releases transition-blocked model requests as skipped on disposal', async () => {
+    const host = createFakeHost();
+    const discovery = createDiscovery({
+      kind: 'completed',
+      models: [makeModel('should-not-start')],
+    });
+    const coordinator = new CodexModelCatalogCoordinator(host, discovery);
+    coordinator.beginEnvironmentTransition();
+
+    const refresh = coordinator.refresh();
+    await coordinator.dispose();
+
+    await expect(refresh).resolves.toMatchObject({ kind: 'skipped' });
+    expect(discovery.discoverModels).not.toHaveBeenCalled();
   });
 
   it('does not refresh after disposal', async () => {

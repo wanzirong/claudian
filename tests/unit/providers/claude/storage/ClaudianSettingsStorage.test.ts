@@ -14,17 +14,16 @@ import {
   getCodexProviderSettings,
   updateCodexProviderSettings,
 } from '@/providers/codex/settings';
+import { getGrokProviderSettings } from '@/providers/grok/settings';
 import { getOpencodeProviderSettings } from '@/providers/opencode/settings';
 import { getPiProviderSettings } from '@/providers/pi/settings';
 
 const mockGetHostnameKey = jest.fn(() => 'host-a');
-const mockGetLegacyHostnameKey = jest.fn(() => 'legacy-host');
 const originalPlatform = process.platform;
 
 jest.mock('@/utils/env', () => ({
   ...jest.requireActual('@/utils/env'),
   getHostnameKey: () => mockGetHostnameKey(),
-  getLegacyHostnameKey: () => mockGetLegacyHostnameKey(),
 }));
 
 const mockAdapter = {
@@ -46,7 +45,6 @@ describe('ClaudianSettingsStorage', () => {
     mockAdapter.write.mockResolvedValue(undefined);
     mockAdapter.delete.mockResolvedValue(undefined);
     mockGetHostnameKey.mockReturnValue('host-a');
-    mockGetLegacyHostnameKey.mockReturnValue('legacy-host');
     storage = new ClaudianSettingsStorage(mockAdapter);
   });
 
@@ -64,6 +62,11 @@ describe('ClaudianSettingsStorage', () => {
       expect(result.thinkingBudget).toBe(DEFAULT_SETTINGS.thinkingBudget);
       expect(result.permissionMode).toBe(DEFAULT_SETTINGS.permissionMode);
       expect(result.requireCommandOrControlEnterToSend).toBe(false);
+      expect(result.titleGenerationLocale).toBe('');
+      expect(result.lastSelectedChatModel).toBeNull();
+      expect(result.enableDualPane).toBe(true);
+      expect(result.enableFilePane).toBe(true);
+      expect(result.dualPaneSide).toBe('right');
       expect(mockAdapter.read).not.toHaveBeenCalled();
     });
 
@@ -107,6 +110,139 @@ describe('ClaudianSettingsStorage', () => {
       expect(result.thinkingBudget).toBe(DEFAULT_SETTINGS.thinkingBudget);
     });
 
+    it('preserves an explicitly stored provider-qualified chat model selection', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        lastSelectedChatModel: {
+          providerId: 'codex',
+          model: 'codex/gpt-5',
+        },
+      }));
+
+      const result = await storage.load();
+
+      expect(result.lastSelectedChatModel).toEqual({
+        providerId: 'codex',
+        model: 'codex/gpt-5',
+      });
+    });
+
+    it('preserves an explicitly stored null chat model selection', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        lastSelectedChatModel: null,
+      }));
+
+      const result = await storage.load();
+
+      expect(result.lastSelectedChatModel).toBeNull();
+      expect(mockAdapter.write).not.toHaveBeenCalled();
+    });
+
+    it('normalizes a malformed stored chat model selection to null', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        lastSelectedChatModel: {
+          providerId: 'codex',
+          model: 42,
+        },
+      }));
+
+      const result = await storage.load();
+      const writtenContent = JSON.parse(mockAdapter.write.mock.calls[0][1]);
+
+      expect(result.lastSelectedChatModel).toBeNull();
+      expect(writtenContent.lastSelectedChatModel).toBeNull();
+    });
+
+    it('migrates the live top-level model for the stored settings provider', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        settingsProvider: 'codex',
+        model: 'codex/gpt-5.7',
+        savedProviderModel: {
+          codex: 'codex/gpt-5.6',
+        },
+        providerConfigs: {
+          codex: { enabled: true },
+        },
+      }));
+
+      const result = await storage.load();
+
+      expect(result.lastSelectedChatModel).toEqual({
+        providerId: 'codex',
+        model: 'codex/gpt-5.7',
+      });
+      expect(mockAdapter.write).toHaveBeenCalled();
+    });
+
+    it('uses the saved provider model when the legacy live projection is empty', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        settingsProvider: 'codex',
+        model: '',
+        savedProviderModel: {
+          codex: 'codex/gpt-5.6',
+        },
+      }));
+
+      const result = await storage.load();
+
+      expect(result.lastSelectedChatModel).toEqual({
+        providerId: 'codex',
+        model: 'codex/gpt-5.6',
+      });
+    });
+
+    it('preserves a legacy seed for a disabled registered provider', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        settingsProvider: 'grok',
+        model: 'grok/kimi-coding',
+        providerConfigs: {
+          grok: { enabled: false },
+        },
+      }));
+
+      const result = await storage.load();
+
+      expect(result.lastSelectedChatModel).toEqual({
+        providerId: 'grok',
+        model: 'grok/kimi-coding',
+      });
+    });
+
+    it('preserves a Claude environment-tier alias during legacy migration', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        settingsProvider: 'claude',
+        model: 'opus',
+      }));
+
+      const result = await storage.load();
+
+      expect(result.lastSelectedChatModel).toEqual({
+        providerId: 'claude',
+        model: 'opus',
+      });
+    });
+
+    it('uses Claude for an unknown legacy provider only when a top-level model exists', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        settingsProvider: 'unknown-provider',
+        model: 'haiku',
+      }));
+
+      const result = await storage.load();
+
+      expect(result.lastSelectedChatModel).toEqual({
+        providerId: 'claude',
+        model: 'haiku',
+      });
+    });
+
     it('migrates legacy openInMainTab true to main-tab placement', async () => {
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
@@ -146,6 +282,25 @@ describe('ClaudianSettingsStorage', () => {
 
       expect(result.chatViewPlacement).toBe('right-sidebar');
       expect(writtenContent.chatViewPlacement).toBe('right-sidebar');
+    });
+
+    it('normalizes invalid dual-pane preferences', async () => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        enableDualPane: 'yes',
+        enableFilePane: 'yes',
+        dualPaneSide: 'top',
+      }));
+
+      const result = await storage.load();
+      const writtenContent = JSON.parse(mockAdapter.write.mock.calls[0][1]);
+
+      expect(result.enableDualPane).toBe(true);
+      expect(result.enableFilePane).toBe(true);
+      expect(result.dualPaneSide).toBe('right');
+      expect(writtenContent.enableDualPane).toBe(true);
+      expect(writtenContent.enableFilePane).toBe(true);
+      expect(writtenContent.dualPaneSide).toBe('right');
     });
 
     it('should strip legacy blocklist fields from loaded data', async () => {
@@ -208,12 +363,12 @@ describe('ClaudianSettingsStorage', () => {
       expect(getCodexProviderSettings(result).cliPathsByHost['host-b']).toBe('/custom/codex-b');
     });
 
-    it('migrates current legacy hostname-scoped provider settings to the opaque device key', async () => {
+    it('preserves hostname-scoped provider settings without assigning them to the current device', async () => {
       Object.defineProperty(process, 'platform', { value: 'win32' });
       mockGetHostnameKey.mockReturnValue('device:current');
-      mockGetLegacyHostnameKey.mockReturnValue('host-a');
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
+        lastSelectedChatModel: null,
         providerConfigs: {
           claude: {
             cliPathsByHost: {
@@ -257,58 +412,42 @@ describe('ClaudianSettingsStorage', () => {
       const piSettings = getPiProviderSettings(result);
       const persistedOpencodeConfig = result.providerConfigs.opencode as Record<string, unknown>;
       const persistedPiConfig = result.providerConfigs.pi as Record<string, unknown>;
-      const writtenContent = JSON.parse(mockAdapter.write.mock.calls[0][1]);
 
       expect(claudeSettings.cliPathsByHost).toEqual({
-        'device:current': '/custom/claude-a',
+        'host-a': '/custom/claude-a',
         'host-b': '/custom/claude-b',
       });
       expect(codexSettings.cliPathsByHost).toEqual({
-        'device:current': '/custom/codex-a',
+        'host-a': '/custom/codex-a',
         'host-b': '/custom/codex-b',
       });
-      expect(codexSettings.installationMethod).toBe('wsl');
+      expect(codexSettings.installationMethod).toBe('native-windows');
       expect(codexSettings.installationMethodsByHost).toEqual({
-        'device:current': 'wsl',
+        'host-a': 'wsl',
         'host-b': 'native-windows',
       });
-      expect(codexSettings.wslDistroOverride).toBe('Ubuntu');
+      expect(codexSettings.wslDistroOverride).toBe('');
       expect(codexSettings.wslDistroOverridesByHost).toEqual({
-        'device:current': 'Ubuntu',
+        'host-a': 'Ubuntu',
         'host-b': 'Debian',
       });
       expect(opencodeSettings.cliPathsByHost).toEqual({
-        'device:current': '/custom/opencode-a',
+        'host-a': '/custom/opencode-a',
         'host-b': '/custom/opencode-b',
       });
       expect(piSettings.cliPathsByHost).toEqual({
-        'device:current': '/custom/pi-a',
+        'host-a': '/custom/pi-a',
         'host-b': '/custom/pi-b',
       });
       expect(persistedOpencodeConfig.cliPathsByHost).toEqual({
-        'device:current': '/custom/opencode-a',
+        'host-a': '/custom/opencode-a',
         'host-b': '/custom/opencode-b',
       });
       expect(persistedPiConfig.cliPathsByHost).toEqual({
-        'device:current': '/custom/pi-a',
+        'host-a': '/custom/pi-a',
         'host-b': '/custom/pi-b',
       });
-      expect(writtenContent.providerConfigs.claude.cliPathsByHost).toEqual({
-        'device:current': '/custom/claude-a',
-        'host-b': '/custom/claude-b',
-      });
-      expect(writtenContent.providerConfigs.codex.cliPathsByHost).toEqual({
-        'device:current': '/custom/codex-a',
-        'host-b': '/custom/codex-b',
-      });
-      expect(writtenContent.providerConfigs.opencode.cliPathsByHost).toEqual({
-        'device:current': '/custom/opencode-a',
-        'host-b': '/custom/opencode-b',
-      });
-      expect(writtenContent.providerConfigs.pi.cliPathsByHost).toEqual({
-        'device:current': '/custom/pi-a',
-        'host-b': '/custom/pi-b',
-      });
+      expect(mockAdapter.write).not.toHaveBeenCalled();
     });
 
     it('clears Codex Windows installation settings on non-Windows hosts during normalization', async () => {
@@ -351,6 +490,57 @@ describe('ClaudianSettingsStorage', () => {
       expect(writtenContent.providerConfigs.codex.wslDistroOverridesByHost).toEqual({
         'host-b': 'Debian',
       });
+    });
+
+    it('preserves Grok hostname-scoped CLI and catalog maps', async () => {
+      mockGetHostnameKey.mockReturnValue('device:current');
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        providerConfigs: {
+          grok: {
+            catalogsByHost: {
+              'host-a': {
+                defaultModelId: 'grok-4.5',
+                fingerprint: 'current',
+                models: [{ displayName: 'Grok 4.5', rawId: 'grok-4.5' }],
+                refreshedAt: 1,
+              },
+              'host-b': {
+                defaultModelId: null,
+                fingerprint: 'other',
+                models: [],
+                refreshedAt: 2,
+              },
+            },
+            cliPathsByHost: {
+              'host-a': '/custom/grok-a',
+              'host-b': '/custom/grok-b',
+            },
+            enabled: true,
+          },
+        },
+      }));
+
+      const result = await storage.load();
+      const grokSettings = getGrokProviderSettings(result);
+      const writtenContent = JSON.parse(mockAdapter.write.mock.calls[0][1]);
+
+      expect(grokSettings.cliPathsByHost).toEqual({
+        'host-a': '/custom/grok-a',
+        'host-b': '/custom/grok-b',
+      });
+      expect(grokSettings.catalogsByHost).toEqual(expect.objectContaining({
+        'host-a': expect.objectContaining({ fingerprint: 'current' }),
+        'host-b': expect.objectContaining({ fingerprint: 'other' }),
+      }));
+      expect(writtenContent.providerConfigs.grok.cliPathsByHost).toEqual({
+        'host-a': '/custom/grok-a',
+        'host-b': '/custom/grok-b',
+      });
+      expect(writtenContent.providerConfigs.grok.catalogsByHost).toEqual(expect.objectContaining({
+        'host-a': expect.objectContaining({ fingerprint: 'current' }),
+        'host-b': expect.objectContaining({ fingerprint: 'other' }),
+      }));
     });
 
     it('strips legacy Codex installation scalar fields from non-Windows provider config', async () => {
@@ -791,6 +981,7 @@ describe('ClaudianSettingsStorage', () => {
     it('should merge updates with existing settings', async () => {
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
+        lastSelectedChatModel: null,
         model: 'claude-haiku-4-5',
         userName: 'ExistingUser',
       }));

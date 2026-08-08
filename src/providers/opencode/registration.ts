@@ -1,14 +1,19 @@
+import { NOOP_TASK_RESULT_INTERPRETER } from '../../core/providers/NoopTaskResultInterpreter';
+import { getProviderConfig } from '../../core/providers/providerConfig';
+import { hasStoredConfigNormalization } from '../../core/providers/settings/storedSettings';
 import type { ProviderModule } from '../../core/providers/types';
-import { opencodeWorkspaceRegistration } from './app/OpencodeWorkspaceServices';
-import { OpencodeInlineEditService } from './auxiliary/OpencodeInlineEditService';
-import { OpencodeInstructionRefineService } from './auxiliary/OpencodeInstructionRefineService';
-import { OpencodeTaskResultInterpreter } from './auxiliary/OpencodeTaskResultInterpreter';
-import { OpencodeTitleGenerationService } from './auxiliary/OpencodeTitleGenerationService';
+import {
+  getOpencodeWorkspaceServices,
+  opencodeWorkspaceRegistration,
+} from './app/OpencodeWorkspaceServices';
 import { OPENCODE_PROVIDER_CAPABILITIES } from './capabilities';
 import { opencodeSettingsReconciler } from './env/OpencodeSettingsReconciler';
+import { OpencodeExecutionBackend } from './execution/OpencodeExecutionBackend';
 import { OpencodeConversationHistoryService } from './history/OpencodeConversationHistoryService';
-import { OpencodeChatRuntime } from './runtime/OpencodeChatRuntime';
+import { decodeOpencodeModelId } from './models';
+import { OPENCODE_PLAN_MODE_ID, OPENCODE_SAFE_MODE_ID } from './modes';
 import { getOpencodeProviderSettings, updateOpencodeProviderSettings } from './settings';
+import { opencodeSubagentAdapter } from './subagentAdapter';
 import { opencodeChatUIConfig } from './ui/OpencodeChatUIConfig';
 
 export const opencodeProviderRegistration: ProviderModule = {
@@ -16,10 +21,21 @@ export const opencodeProviderRegistration: ProviderModule = {
   blankTabOrder: 10,
   capabilities: OPENCODE_PROVIDER_CAPABILITIES,
   chatUIConfig: opencodeChatUIConfig,
-  createInlineEditService: (plugin) => new OpencodeInlineEditService(plugin),
-  createInstructionRefineService: (plugin) => new OpencodeInstructionRefineService(plugin),
-  createRuntime: ({ plugin }) => new OpencodeChatRuntime(plugin),
-  createTitleGenerationService: (plugin) => new OpencodeTitleGenerationService(plugin),
+  createExecutionBackend: (plugin) => {
+    const workspace = getOpencodeWorkspaceServices();
+    return new OpencodeExecutionBackend(plugin, {
+      commandCatalog: workspace.commandCatalog,
+    });
+  },
+  resolveTitleGenerationModel: (plugin) => {
+    const settings = plugin.settings as unknown as Record<string, unknown>;
+    const titleModel = typeof settings.titleGenerationModel === 'string'
+      ? settings.titleGenerationModel
+      : '';
+    return opencodeChatUIConfig.ownsModel(titleModel, settings)
+      ? decodeOpencodeModelId(titleModel) ?? undefined
+      : undefined;
+  },
   displayName: 'OpenCode',
   environmentKeyPatterns: [/^OPENCODE_/i],
   historyService: new OpencodeConversationHistoryService(),
@@ -29,10 +45,21 @@ export const opencodeProviderRegistration: ProviderModule = {
   settingsStorage: {
     hostScopedFields: ['cliPathsByHost'],
     normalizeStored(target, stored) {
-      updateOpencodeProviderSettings(target, getOpencodeProviderSettings(stored));
-      return false;
+      const storedConfig = getProviderConfig(stored, 'opencode');
+      const normalized = getOpencodeProviderSettings(stored);
+      updateOpencodeProviderSettings(target, {
+        ...normalized,
+        selectedMode: normalized.selectedMode === OPENCODE_PLAN_MODE_ID
+          ? OPENCODE_SAFE_MODE_ID
+          : normalized.selectedMode,
+      });
+      return hasStoredConfigNormalization(
+        storedConfig,
+        getProviderConfig(target, 'opencode'),
+      );
     },
   },
-  taskResultInterpreter: new OpencodeTaskResultInterpreter(),
+  taskResultInterpreter: NOOP_TASK_RESULT_INTERPRETER,
+  subagentAdapter: opencodeSubagentAdapter,
   workspace: opencodeWorkspaceRegistration,
 };

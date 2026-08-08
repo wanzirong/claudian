@@ -10,6 +10,56 @@ import {
 
 describe('systemPrompt', () => {
   describe('buildSystemPrompt', () => {
+    it('should produce identical output for the default and explicit Claudian profiles', () => {
+      const settings = {
+        mediaFolder: 'attachments',
+        customPrompt: 'Always be concise.',
+        vaultPath: '/vault',
+        userName: 'Alice',
+      };
+
+      expect(buildSystemPrompt(settings)).toBe(
+        buildSystemPrompt(settings, { toolGuidanceProfile: 'claudian' }),
+      );
+    });
+
+    it('should retain provider-neutral context in the provider-native profile', () => {
+      const prompt = buildSystemPrompt(
+        {
+          customPrompt: 'Use curl if the user explicitly asks for it.',
+          vaultPath: '/vault',
+          userName: 'Alice',
+        },
+        { toolGuidanceProfile: 'provider-native' },
+      );
+
+      expect(prompt).toContain('## User Context');
+      expect(prompt).toContain('You are collaborating with **Alice**.');
+      expect(prompt).toContain('## Identity & Role');
+      expect(prompt).toContain('The current working directory is the user\'s vault root.');
+      expect(prompt).toContain('Vault absolute path: /vault');
+      expect(prompt).toContain('## Path Conventions');
+      expect(prompt).toContain('## User Message Format');
+      expect(prompt).toContain('## Obsidian Context');
+      expect(prompt).toContain('## Selection Context');
+      expect(prompt).toContain('## Custom Instructions');
+      expect(prompt).toContain('Use curl if the user explicitly asks for it.');
+    });
+
+    it('should omit Claudian tool recipes from the provider-native profile', () => {
+      const prompt = buildSystemPrompt(
+        { mediaFolder: 'attachments' },
+        { toolGuidanceProfile: 'provider-native' },
+      );
+
+      expect(prompt).not.toContain('Use `bash: date`');
+      expect(prompt).not.toContain('## Embedded Images in Notes');
+      expect(prompt).not.toContain('Read file_path=');
+      expect(prompt).not.toContain('WebFetch does NOT support images');
+      expect(prompt).not.toContain('curl -sfo');
+      expect(prompt).not.toContain('```bash');
+    });
+
     it('should append custom prompt section when provided', () => {
       const prompt = buildSystemPrompt({ customPrompt: 'Always be concise.' });
       expect(prompt).toContain('# Custom Instructions');
@@ -32,6 +82,17 @@ describe('systemPrompt', () => {
       expect(prompt).toContain('Claudian');
       expect(prompt).toContain('## Path Conventions');
       expect(prompt).toContain('# User Message Format');
+    });
+
+    it('should document live context shapes and legacy compatibility', () => {
+      const prompt = buildSystemPrompt();
+
+      expect(prompt).toContain('<linked_note path="path/to/note.md" />');
+      expect(prompt).toContain('<editor_cursor path="path/to/note.md" line="8">');
+      expect(prompt).toContain('<canvas_selection path="boards/project.canvas">');
+      expect(prompt).toContain('<context_file path="/external/project" />');
+      expect(prompt).toContain('Legacy messages may');
+      expect(prompt).toContain('path-only note reference');
     });
 
     it('should omit Claude-specific tool guidance from the shared prompt', () => {
@@ -136,6 +197,26 @@ describe('systemPrompt', () => {
   });
 
   describe('computeSystemPromptKey', () => {
+    it('includes the tool guidance profile in the prompt key', () => {
+      const settings = {
+        mediaFolder: 'attachments',
+        customPrompt: 'Be helpful',
+        vaultPath: '/vault',
+        userName: 'Alice',
+      };
+
+      const defaultKey = computeSystemPromptKey(settings);
+      const claudianKey = computeSystemPromptKey(settings, {
+        toolGuidanceProfile: 'claudian',
+      });
+      const providerNativeKey = computeSystemPromptKey(settings, {
+        toolGuidanceProfile: 'provider-native',
+      });
+
+      expect(defaultKey).toBe(claudianKey);
+      expect(providerNativeKey).not.toBe(claudianKey);
+    });
+
     it('computes key from all settings', () => {
       const settings = {
         mediaFolder: 'attachments',

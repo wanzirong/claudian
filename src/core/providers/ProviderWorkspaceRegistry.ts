@@ -5,11 +5,12 @@ import { ProviderInitializationBoundary } from './ProviderInitializationBoundary
 import type {
   AgentMentionProvider,
   ProviderCliResolver,
+  ProviderCommandLoader,
   ProviderId,
   ProviderModelCatalogRefreshResult,
-  ProviderRuntimeCommandLoader,
   ProviderSettingsTabRenderer,
   ProviderTabWarmupPolicy,
+  ProviderTransitionOwnerContext,
   ProviderWorkspaceRegistration,
   ProviderWorkspaceServices,
 } from './types';
@@ -107,22 +108,26 @@ export class ProviderWorkspaceRegistry {
     return this.getServices(providerId)?.agentMentionProvider ?? null;
   }
 
-  static async refreshAgentMentions(providerId: ProviderId): Promise<void> {
-    await this.getServices(providerId)?.refreshAgentMentions?.();
+  static async refreshAgentMentions(
+    providerId: ProviderId,
+    context?: ProviderTransitionOwnerContext,
+  ): Promise<void> {
+    await this.getServices(providerId)?.refreshAgentMentions?.(context);
   }
 
   static async refreshModelCatalog(
     providerId: ProviderId,
+    context?: ProviderTransitionOwnerContext,
   ): Promise<ProviderModelCatalogRefreshResult> {
-    return await this.getServices(providerId)?.refreshModelCatalog?.() ?? { changed: false };
+    return await this.getServices(providerId)?.refreshModelCatalog?.(context) ?? { changed: false };
   }
 
   static getCliResolver(providerId: ProviderId): ProviderCliResolver | null {
     return this.getServices(providerId)?.cliResolver ?? null;
   }
 
-  static getRuntimeCommandLoader(providerId: ProviderId): ProviderRuntimeCommandLoader | null {
-    return this.getServices(providerId)?.runtimeCommandLoader ?? null;
+  static getCommandLoader(providerId: ProviderId): ProviderCommandLoader | null {
+    return this.getServices(providerId)?.commandLoader ?? null;
   }
 
   static getTabWarmupPolicy(providerId: ProviderId): ProviderTabWarmupPolicy | null {

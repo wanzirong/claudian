@@ -1,6 +1,6 @@
+import type { ProviderExecutionTransitionScope } from '../../core/execution';
 import type { ProviderHost } from '../../core/providers/ProviderHost';
 import type { ProviderCliResolutionContext, ProviderId } from '../../core/providers/types';
-import type { ChatRuntime } from '../../core/runtime/ChatRuntime';
 import type { EnvironmentScope } from '../../core/types/settings';
 import type ClaudianPlugin from '../../main';
 
@@ -10,6 +10,10 @@ export class ClaudianProviderHost implements ProviderHost {
 
   get app() {
     return this.plugin.app;
+  }
+
+  get executionLifecycleRegistry() {
+    return this.plugin.executionLifecycleRegistry;
   }
 
   get settings() {
@@ -70,6 +74,14 @@ export class ClaudianProviderHost implements ProviderHost {
     return this.plugin.applyEnvironmentVariablesBatch(updates);
   }
 
+  applyProviderRuntimeSettings(
+    providerIds: ProviderId[],
+    mutation: (settings: typeof this.plugin.settings) => void | Promise<void>,
+    onApplied?: () => void | Promise<void>,
+  ): Promise<void> {
+    return this.plugin.applyProviderRuntimeSettings(providerIds, mutation, onApplied);
+  }
+
   async getResolvedProviderCliPath(
     providerId: ProviderId,
     context?: ProviderCliResolutionContext,
@@ -77,36 +89,22 @@ export class ClaudianProviderHost implements ProviderHost {
     return this.plugin.getResolvedProviderCliPath(providerId, context);
   }
 
-  refreshModelSelectors(): void {
-    for (const view of this.plugin.getAllViews()) {
-      view.refreshModelSelector();
+  runProviderExecutionTransition<T>(
+    providerIds: ProviderId[],
+    mutation: (scope: ProviderExecutionTransitionScope) => Promise<T>,
+    parentScope?: ProviderExecutionTransitionScope,
+  ): Promise<T> {
+    if (!parentScope) {
+      return this.plugin.runProviderExecutionTransition(providerIds, mutation);
     }
-  }
-
-  async broadcastToActiveViewRuntimes(
-    action: (runtime: ChatRuntime) => Promise<void> | void,
-  ): Promise<void> {
-    await this.plugin.getView()?.getTabManager()?.broadcastToAllTabs(
-      (runtime) => Promise.resolve(action(runtime)),
+    return this.plugin.runProviderExecutionTransition(
+      providerIds,
+      mutation,
+      parentScope,
     );
   }
 
-  async broadcastToAllViewRuntimes(
-    action: (runtime: ChatRuntime) => Promise<void> | void,
-  ): Promise<void> {
-    for (const view of this.plugin.getAllViews()) {
-      await view.getTabManager()?.broadcastToAllTabs(
-        (runtime) => Promise.resolve(action(runtime)),
-      );
-    }
-  }
-
-  async recycleProviderRuntimes(providerId: ProviderId): Promise<void> {
-    for (const view of this.plugin.getAllViews()) {
-      const tabManager = view.getTabManager();
-      await tabManager?.recycleProviderRuntimes(providerId);
-      view.invalidateProviderCommandCaches?.([providerId]);
-      view.refreshModelSelector?.();
-    }
+  notifyProviderChatOptionsChanged(providerId: ProviderId): void {
+    this.plugin.notifyProviderChatOptionsChanged(providerId);
   }
 }

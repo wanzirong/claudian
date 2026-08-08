@@ -5,10 +5,12 @@ import type { App, Component, Editor, MarkdownView } from 'obsidian';
 import { Notice } from 'obsidian';
 
 import { getHiddenProviderCommandSet } from '../../../core/providers/commands/hiddenCommands';
+import { normalizeProviderCommandDiscoveryItems } from '../../../core/providers/commands/ProviderCommandDiscoveryResult';
+import { ProviderCommandDiscoveryStore } from '../../../core/providers/commands/ProviderCommandDiscoveryStore';
 import { resolveConversationModel } from '../../../core/providers/conversationModel';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
-import { DEFAULT_CHAT_PROVIDER_ID, type InlineEditMode, type InlineEditService, type ProviderId } from '../../../core/providers/types';
+import { type InlineEditMode, type InlineEditService, type ProviderId } from '../../../core/providers/types';
 import { hideSelectionHighlight, showSelectionHighlight } from '../../../shared/components/SelectionHighlight';
 import { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import { MentionDropdownController } from '../../../shared/mention/MentionDropdownController';
@@ -278,14 +280,13 @@ function resolveInlineEditProviderContext(plugin: InlineEditHost): InlineEditPro
   const conversation = activeTab?.conversationId
     ? plugin.getConversationSync(activeTab.conversationId)
     : null;
-  const providerId = conversation?.providerId
-    ?? activeTab?.service?.providerId
-    ?? activeTab?.providerId
-    ?? DEFAULT_CHAT_PROVIDER_ID;
-  const modelOverride = conversation
+  const activeProviderId = conversation?.providerId ?? activeTab?.providerId;
+  const providerId = activeProviderId
+    && ProviderRegistry.isEnabled(activeProviderId, plugin.settings)
+    ? activeProviderId
+    : ProviderRegistry.resolveSettingsProviderId(plugin.settings);
+  const modelOverride = conversation?.providerId === providerId
     ? resolveConversationModel(plugin.settings, providerId, conversation).model
-    : activeTab?.service?.providerId === providerId
-    ? activeTab.service.getAuxiliaryModel?.()
     : activeTab?.providerId === providerId
     ? activeTab.draftModel
     : null;
@@ -550,10 +551,19 @@ export class InlineEditSession {
       },
       {
         fixed: true,
+        includeBuiltIns: false,
+        providerId: this.resolvedProviderId,
         hiddenCommands: getHiddenProviderCommandSet(this.plugin.settings, this.resolvedProviderId),
         ...(inlineCatalog ? {
           providerConfig: inlineCatalog.getDropdownConfig(),
-          getProviderEntries: () => inlineCatalog.listDropdownEntries({ includeBuiltIns: false }),
+          providerDiscovery: new ProviderCommandDiscoveryStore(async signal =>
+            normalizeProviderCommandDiscoveryItems(
+              await inlineCatalog.listDropdownEntries({
+                includeBuiltIns: false,
+                signal,
+              }),
+            ),
+          ),
         } : {}),
       }
     );
@@ -742,6 +752,10 @@ export class InlineEditSession {
         this.handleError('No response from agent');
       }
     } else {
+      if (result.resetRequired) {
+        this.isConversing = false;
+        this.inlineEditService.resetConversation();
+      }
       this.handleError(result.error || 'Error - try again');
     }
   }

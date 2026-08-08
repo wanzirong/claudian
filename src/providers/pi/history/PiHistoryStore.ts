@@ -6,13 +6,16 @@ import * as path from 'node:path';
 
 import { isWriteEditTool } from '../../../core/tools/toolNames';
 import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo } from '../../../core/types';
+import { extractUserQuery } from '../../../utils/context';
 import { extractDiffData } from '../../../utils/diff';
 import { buildImageAttachmentFromBase64 } from '../../../utils/imageAttachment';
+import { encodePiModelId } from '../models';
 import {
   extractPiToolTextContent,
   normalizePiToolInput,
   normalizePiToolName,
 } from '../normalizations/piToolNormalization';
+import { decodePiRecoveryPrompt } from './PiRecoveryPromptCodec';
 
 export interface PiSessionEntry {
   id?: string;
@@ -30,6 +33,7 @@ export interface ParsedPiSessionEntries {
 export interface ParsePiSessionContentOptions {
   leafEntryId?: string;
   requireLeafEntryId?: boolean;
+  syntheticIdNamespace?: string;
 }
 
 export interface CreatePiForkSessionFileOptions {
@@ -46,6 +50,17 @@ export interface CreatedPiForkSessionFile {
   sessionId: string;
 }
 
+interface PiForkRollbackOwnership {
+  flight: Promise<void> | null;
+  readonly parentSession: string;
+  readonly sessionFile: string;
+}
+
+const rollbackEligibleForkTargets = new WeakMap<
+  CreatedPiForkSessionFile,
+  PiForkRollbackOwnership
+>();
+
 export function parsePiSessionContent(
   content: string,
   options: ParsePiSessionContentOptions = {},
@@ -59,10 +74,36 @@ export function parsePiSessionContent(
     return [];
   }
 
-  return mapPiSessionEntries(resolvePiActivePath(
-    parsed.entries,
-    leafEntryId,
-  ));
+  return mapPiSessionEntries(
+    resolvePiActivePath(parsed.entries, leafEntryId),
+    options.syntheticIdNamespace,
+  );
+}
+
+export function parsePiSessionModel(
+  content: string,
+  leafEntryId?: string,
+): string | null {
+  const parsed = parsePiSessionEntries(content);
+  const persistedLeafEntryId = leafEntryId?.trim();
+  if (
+    persistedLeafEntryId
+    && !parsed.entries.some(entry => entry.id === persistedLeafEntryId)
+  ) {
+    return null;
+  }
+  const entries = resolvePiActivePath(parsed.entries, persistedLeafEntryId);
+  let selection: string | null = null;
+  for (const entry of entries) {
+    const provider = getString(entry.raw.provider)
+      ?? getString(entry.message?.provider);
+    const modelId = getString(entry.raw.modelId)
+      ?? getString(entry.message?.model);
+    if (provider && modelId) {
+      selection = encodePiModelId(provider, modelId);
+    }
+  }
+  return selection;
 }
 
 export function parsePiSessionEntries(content: string): ParsedPiSessionEntries {
@@ -104,6 +145,33 @@ export function parsePiSessionEntries(content: string): ParsedPiSessionEntries {
   }
 
   return { entries, header };
+}
+
+export async function readPiSessionHeader(
+  sessionFile: string,
+): Promise<Record<string, unknown> | null> {
+  const maxHeaderBytes = 64 * 1024;
+  let handle: fsp.FileHandle | null = null;
+  try {
+    handle = await fsp.open(sessionFile, 'r');
+    const buffer = Buffer.alloc(maxHeaderBytes);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const content = buffer.subarray(0, bytesRead).toString('utf8');
+    const newlineIndex = content.search(/\r?\n/);
+    if (newlineIndex === -1 && bytesRead === maxHeaderBytes) {
+      return null;
+    }
+    const firstLine = newlineIndex === -1 ? content : content.slice(0, newlineIndex);
+    const parsed = JSON.parse(firstLine) as unknown;
+    if (!isPlainObject(parsed) || getString(parsed.type) !== 'session') {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 export function resolvePiActivePath(entries: PiSessionEntry[], leafId?: string): PiSessionEntry[] {
@@ -268,12 +336,37 @@ export async function createPiForkSessionFile(
   await fsp.mkdir(sessionDir, { recursive: true });
   await fsp.writeFile(sessionFile, `${lines.join('\n')}\n`, { flag: 'wx' });
 
-  return {
+  const created = {
     leafEntryId: resumeAt,
     parentSession: sourceSessionFile,
     sessionFile,
     sessionId,
   };
+  rollbackEligibleForkTargets.set(created, {
+    flight: null,
+    parentSession: sourceSessionFile,
+    sessionFile,
+  });
+  return created;
+}
+
+export async function rollbackCreatedPiForkSessionFile(
+  created: CreatedPiForkSessionFile,
+): Promise<void> {
+  const ownership = rollbackEligibleForkTargets.get(created);
+  if (!ownership) {
+    throw new Error('Pi fork rollback target is not owned by this process.');
+  }
+  if (!ownership.flight) {
+    ownership.flight = (async () => {
+      if (path.resolve(ownership.sessionFile) === path.resolve(ownership.parentSession)) {
+        throw new Error('Pi fork rollback cannot remove the source session.');
+      }
+      await fsp.unlink(ownership.sessionFile);
+      rollbackEligibleForkTargets.delete(created);
+    })();
+  }
+  return ownership.flight;
 }
 
 export function findPiSessionFile(
@@ -337,11 +430,14 @@ export function derivePiSessionsRootFromSessionPath(sessionPath: string): string
   return path.dirname(normalized);
 }
 
-function mapPiSessionEntries(entries: PiSessionEntry[]): ChatMessage[] {
+function mapPiSessionEntries(
+  entries: PiSessionEntry[],
+  syntheticIdNamespace?: string,
+): ChatMessage[] {
   const messages: ChatMessage[] = [];
 
   for (const entry of entries) {
-    const mapped = mapPiSessionEntry(entry, messages);
+    const mapped = mapPiSessionEntry(entry, messages, syntheticIdNamespace);
     if (mapped) {
       const previous = messages[messages.length - 1];
       if (isAssistantMessageEntry(entry) && canMergeAssistantContinuation(previous, mapped)) {
@@ -400,16 +496,33 @@ function mergeAssistantContinuation(target: ChatMessage, source: ChatMessage): v
 function mapPiSessionEntry(
   entry: PiSessionEntry,
   messages: ChatMessage[],
+  syntheticIdNamespace?: string,
 ): ChatMessage | null {
   const message = entry.message ?? entry.raw;
   const role = getString(message.role) ?? inferRole(entry.type);
   const timestamp = getTimestamp(message.timestamp ?? entry.raw.timestamp);
 
   if (role === 'user') {
-    const images = extractUserImages(message.content ?? message.parts ?? message.blocks, entry.id ?? `pi-user-${messages.length}`);
+    const rawContent = extractTextContent(message.content ?? message.text ?? message.message);
+    const recoveryPrompt = decodePiRecoveryPrompt(rawContent);
+    const content = recoveryPrompt?.currentInput ?? (recoveryPrompt ? '' : rawContent);
+    const displayContent = extractPiSkillDisplayContent(content);
+    const messageId = entry.id ?? createSyntheticPiMessageId(
+      'user',
+      messages.length,
+      syntheticIdNamespace,
+    );
+    const images = extractUserImages(
+      message.content ?? message.parts ?? message.blocks,
+      messageId,
+    );
+    if (recoveryPrompt?.currentInput === null && images.length === 0) {
+      return null;
+    }
     return {
-      content: extractTextContent(message.content ?? message.text ?? message.message),
-      id: entry.id ?? `pi-user-${messages.length}`,
+      content,
+      ...(displayContent ? { displayContent } : {}),
+      id: messageId,
       ...(images.length > 0 ? { images } : {}),
       role: 'user',
       timestamp,
@@ -429,7 +542,11 @@ function mapPiSessionEntry(
       assistantMessageId: entry.id,
       content: text,
       ...(contentBlocks.length > 0 ? { contentBlocks } : {}),
-      id: entry.id ?? `pi-assistant-${messages.length}`,
+      id: entry.id ?? createSyntheticPiMessageId(
+        'assistant',
+        messages.length,
+        syntheticIdNamespace,
+      ),
       role: 'assistant',
       timestamp,
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
@@ -445,7 +562,11 @@ function mapPiSessionEntry(
     return {
       content: '',
       contentBlocks: [{ type: 'context_compacted' }],
-      id: entry.id ?? `pi-compaction-${messages.length}`,
+      id: entry.id ?? createSyntheticPiMessageId(
+        'compaction',
+        messages.length,
+        syntheticIdNamespace,
+      ),
       role: 'assistant',
       timestamp,
     };
@@ -462,13 +583,36 @@ function mapPiSessionEntry(
     return {
       content,
       contentBlocks: [{ type: 'text', content }],
-      id: entry.id ?? `pi-notice-${messages.length}`,
+      id: entry.id ?? createSyntheticPiMessageId(
+        'notice',
+        messages.length,
+        syntheticIdNamespace,
+      ),
       role: 'assistant',
       timestamp,
     };
   }
 
   return null;
+}
+
+function createSyntheticPiMessageId(
+  kind: string,
+  index: number,
+  namespace?: string,
+): string {
+  const localId = `pi-${kind}-${index}`;
+  return namespace ? `${namespace}:${localId}` : localId;
+}
+
+function extractPiSkillDisplayContent(content: string): string | undefined {
+  const match = content.match(
+    /^<skill name="([^"]+)" location="[^"]+">\n[\s\S]*?\n<\/skill>(?:\n\n([\s\S]+))?$/,
+  );
+  if (!match) return undefined;
+
+  const visibleArguments = match[2] ? extractUserQuery(match[2]) : '';
+  return `/skill:${match[1]}${visibleArguments ? ` ${visibleArguments}` : ''}`;
 }
 
 function extractAssistantContentBlocks(value: unknown): ContentBlock[] {

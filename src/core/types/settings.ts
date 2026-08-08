@@ -62,13 +62,37 @@ export const CHAT_VIEW_PLACEMENTS = [
 /** Workspace location used when opening the Claudian chat view. */
 export type ChatViewPlacement = typeof CHAT_VIEW_PLACEMENTS[number];
 
-/** Result from instruction refinement agent query. */
-export interface InstructionRefineResult {
+export const DUAL_PANE_SIDES = ['left', 'right'] as const;
+
+/** Side of the chat occupied by the session manager in dual-pane mode. */
+export type DualPaneSide = typeof DUAL_PANE_SIDES[number];
+
+export type SessionManagerOrganization = 'list' | 'linked-note';
+export type SessionManagerSort = 'last-updated' | 'created';
+
+/** Forced provider transition invalidated a parked auxiliary continuation. */
+export interface AuxiliaryContinuityReset {
+  success: false;
+  resetRequired: true;
+  error: string;
+  refinedInstruction?: never;
+  editedText?: never;
+  insertedText?: never;
+  clarification?: never;
+}
+
+/** Ordinary result from an instruction refinement agent query. */
+export interface InstructionRefineOutcome {
   success: boolean;
+  resetRequired?: false;
   refinedInstruction?: string;  // The refined instruction text
   clarification?: string;       // Agent's clarifying question (if any)
   error?: string;               // Error message (if failed)
 }
+
+export type InstructionRefineResult =
+  | InstructionRefineOutcome
+  | AuxiliaryContinuityReset;
 
 /** Permission mode for tool execution. */
 export type PermissionMode = 'yolo' | 'plan' | 'normal';
@@ -81,6 +105,12 @@ export type HostnameCliPaths = Record<string, string>;
 
 /** Opaque provider-owned settings bags keyed by provider id. */
 export type ProviderConfigMap = Partial<Record<string, Record<string, unknown>>>;
+
+/** Provider-qualified model explicitly selected in chat and used to seed future tabs. */
+export interface StoredChatModelSelection {
+  providerId: string;
+  model: string;
+}
 
 /**
  * Application settings stored in .claudian/claudian-settings.json.
@@ -102,6 +132,7 @@ export interface ClaudianSettings {
   effortLevel: string;
   serviceTier: string;
   enableAutoTitleGeneration: boolean;
+  titleGenerationLocale: string;
   titleGenerationModel: string;
 
   // Content settings
@@ -128,6 +159,7 @@ export interface ClaudianSettings {
 
   // Provider selection
   settingsProvider: string;  // ProviderId — which provider's model/effort/budget is projected to top-level fields
+  lastSelectedChatModel: StoredChatModelSelection | null;
   savedProviderModel: Partial<Record<string, string>>;
   savedProviderEffort: Partial<Record<string, string>>;
   savedProviderServiceTier: Partial<Record<string, string>>;
@@ -141,11 +173,17 @@ export interface ClaudianSettings {
   lastCustomModel?: string;
 
   // UI preferences
-  maxTabs: number;
+  maxWarmAgentProcesses: number;
   enableAutoScroll: boolean;
   deferMathRenderingDuringStreaming: boolean;
   expandFileEditsByDefault: boolean;
   chatViewPlacement: ChatViewPlacement;
+  enableDualPane: boolean;
+  enableFilePane: boolean;
+  dualPaneSide: DualPaneSide;
+  sessionManagerOrganization?: SessionManagerOrganization;
+  sessionManagerSort?: SessionManagerSort;
+  pinnedLinkedNotePaths?: string[];
 
   // Provider command visibility
   hiddenProviderCommands: HiddenProviderCommands;

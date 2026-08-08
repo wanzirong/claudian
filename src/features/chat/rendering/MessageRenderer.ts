@@ -1,17 +1,25 @@
 import type { App, Component } from 'obsidian';
 import { MarkdownRenderer, Menu, Notice, setIcon } from 'obsidian';
 
-import { DEFAULT_CHAT_PROVIDER_ID, type ProviderCapabilities } from '../../../core/providers/types';
-import type { ChatRewindMode } from '../../../core/runtime/types';
+import type { ChatRewindMode } from '../../../core/execution';
 import {
-  isSubagentToolName,
+  DEFAULT_CHAT_PROVIDER_ID,
+  type ProviderCapabilities,
+  type ProviderSubagentLifecycleAdapter,
+} from '../../../core/providers/types';
+import {
   isWriteEditTool,
-  TOOL_AGENT_OUTPUT,
   TOOL_APPLY_PATCH,
   TOOL_WRITE_STDIN,
 } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
-import type { ChatMessage, ImageAttachment, SubagentInfo, ToolCallInfo } from '../../../core/types';
+import type {
+  ChatMessage,
+  CitationGroup,
+  ImageAttachment,
+  SubagentInfo,
+  ToolCallInfo,
+} from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import { extractUserDisplayContent } from '../../../utils/context';
 import { formatDurationMmSs } from '../../../utils/date';
@@ -26,13 +34,19 @@ import {
 import type { FeatureHost } from '../../FeatureHost';
 import { findRewindContext } from '../rewind';
 import { formatConversationDirectoryTitle } from '../utils/conversationDirectoryTitle';
-import { resolveSubagentLifecycleAdapter } from './subagentLifecycleResolution';
+import { renderCitationGroup as renderCitationBlock } from './CitationRenderer';
+import {
+  prepareDisplayOnlyCodeFences,
+  restoreDisplayOnlyCodeFences,
+} from './DisplayOnlyCodeFences';
+import { resolveSubagentAdapter } from './subagentAdapterResolution';
 import {
   renderStoredAsyncSubagent,
   renderStoredSubagent,
 } from './SubagentRenderer';
 import { renderStoredThinkingBlock } from './ThinkingBlockRenderer';
 import { renderStoredToolCall } from './ToolCallRenderer';
+import { createWelcomeElement } from './WelcomeRenderer';
 import { renderStoredWriteEdit } from './WriteEditRenderer';
 
 export interface RenderContentOptions {
@@ -60,6 +74,9 @@ export class MessageRenderer {
   private getCapabilities: () => ProviderCapabilities;
   private forkCallback?: (messageId: string) => Promise<void>;
   private liveMessageEls = new Map<string, HTMLElement>();
+  private removeFileLinkHandler: () => void;
+  private closeImageModal: (() => void) | null = null;
+  private isDisposed = false;
 
   constructor(
     plugin: FeatureHost,
@@ -77,7 +94,6 @@ export class MessageRenderer {
     this.forkCallback = forkCallback;
     this.getCapabilities = getCapabilities ?? (() => ({
       providerId: DEFAULT_CHAT_PROVIDER_ID,
-      supportsPersistentRuntime: false,
       supportsNativeHistory: false,
       supportsPlanMode: false,
       supportsRewind: false,
@@ -91,16 +107,29 @@ export class MessageRenderer {
     }));
 
     // Register delegated click handler for file links
-    registerFileLinkHandler(this.app, this.messagesEl, this.component);
+    this.removeFileLinkHandler = registerFileLinkHandler(this.app, this.messagesEl);
   }
 
   /** Sets the messages container element. */
   setMessagesEl(el: HTMLElement): void {
+    this.removeFileLinkHandler();
     this.messagesEl = el;
+    this.removeFileLinkHandler = this.isDisposed
+      ? () => {}
+      : registerFileLinkHandler(this.app, this.messagesEl);
   }
 
-  private getSubagentLifecycleAdapter(toolName?: string) {
-    return resolveSubagentLifecycleAdapter(this.getCapabilities().providerId, toolName);
+  dispose(): void {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+    this.closeImageModal?.();
+    this.removeFileLinkHandler();
+    this.removeFileLinkHandler = () => {};
+    this.liveMessageEls.clear();
+  }
+
+  private getSubagentAdapter(toolName?: string) {
+    return resolveSubagentAdapter(this.getCapabilities().providerId, toolName);
   }
 
   private shouldExpandFileEditsByDefault(): boolean {
@@ -237,8 +266,7 @@ export class MessageRenderer {
     this.liveMessageEls.clear();
 
     // Recreate welcome element after clearing
-    const newWelcomeEl = this.messagesEl.createDiv({ cls: 'claudian-welcome' });
-    newWelcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: getGreeting() });
+    const newWelcomeEl = createWelcomeElement(this.messagesEl, getGreeting());
 
     for (let i = 0; i < messages.length; i++) {
       this.renderStoredMessage(messages[i], messages, i);
@@ -319,15 +347,16 @@ export class MessageRenderer {
       for (const block of msg.contentBlocks) {
         if (block.type === 'thinking' && block.content.trim().length > 0) return true;
         if (block.type === 'text' && block.content.trim().length > 0) return true;
+        if (block.type === 'citations' && block.citations.entries.length > 0) return true;
         if (block.type === 'context_compacted') return true;
         if (block.type === 'subagent') return true;
         if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
-          if (toolCall && this.shouldRenderToolCall(toolCall)) return true;
+          if (toolCall && this.shouldRenderToolCall(toolCall, msg)) return true;
         }
       }
     }
-    if (msg.toolCalls?.some(toolCall => this.shouldRenderToolCall(toolCall))) return true;
+    if (msg.toolCalls?.some(toolCall => this.shouldRenderToolCall(toolCall, msg))) return true;
     return false;
   }
 
@@ -385,6 +414,8 @@ export class MessageRenderer {
           const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
           void this.renderContent(textEl, normalized.content);
           this.addTextCopyButton(textEl, normalized.content);
+        } else if (block.type === 'citations') {
+          this.renderCitationGroup(contentEl, block.citations);
         } else if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
           if (toolCall) {
@@ -395,9 +426,12 @@ export class MessageRenderer {
           const boundaryEl = contentEl.createDiv({ cls: 'claudian-compact-boundary' });
           boundaryEl.createSpan({ cls: 'claudian-compact-boundary-label', text: 'Conversation compacted' });
         } else if (block.type === 'subagent') {
-          const taskToolCall = msg.toolCalls?.find(
-            tc => tc.id === block.subagentId && isSubagentToolName(tc.name)
-          );
+          const taskToolCall = msg.toolCalls?.find((toolCall) => {
+            if (toolCall.id !== block.subagentId) return false;
+            const adapter = this.getSubagentAdapter(toolCall.name);
+            return adapter?.protocol === 'managed-agent'
+              && adapter.isSpawnTool(toolCall.name);
+          });
           if (!taskToolCall) continue;
 
           this.renderTaskSubagent(contentEl, taskToolCall, block.mode);
@@ -445,21 +479,32 @@ export class MessageRenderer {
     return hadLegacyInterruptIndicator;
   }
 
+  renderCitationGroup(parentEl: HTMLElement, citations: CitationGroup): HTMLElement {
+    return renderCitationBlock(parentEl, citations);
+  }
+
   /**
    * Renders a tool call with special handling for Write/Edit, Agent (subagent),
    * and Codex collab agent lifecycle tools.
    */
   private renderToolCall(contentEl: HTMLElement, toolCall: ToolCallInfo, msg?: ChatMessage): void {
-    if (!this.shouldRenderToolCall(toolCall)) return;
-    const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(toolCall.name);
+    if (!this.shouldRenderToolCall(toolCall, msg)) return;
+    const subagentAdapter = this.getSubagentAdapter(toolCall.name);
 
     if (isWriteEditTool(toolCall.name)) {
       renderStoredWriteEdit(contentEl, toolCall, {
         initiallyExpanded: this.shouldExpandFileEditsByDefault(),
       });
-    } else if (isSubagentToolName(toolCall.name)) {
+    } else if (
+      subagentAdapter?.protocol === 'managed-agent'
+      && subagentAdapter.isSpawnTool(toolCall.name)
+    ) {
       this.renderTaskSubagent(contentEl, toolCall);
-    } else if (subagentLifecycleAdapter?.isSpawnTool(toolCall.name) && msg) {
+    } else if (
+      subagentAdapter?.protocol === 'lifecycle'
+      && subagentAdapter.isSpawnTool(toolCall.name)
+      && msg
+    ) {
       this.renderProviderLifecycleSubagent(contentEl, toolCall, msg);
     } else {
       renderStoredToolCall(contentEl, toolCall, {
@@ -468,15 +513,39 @@ export class MessageRenderer {
     }
   }
 
-  private shouldRenderToolCall(toolCall: ToolCallInfo): boolean {
-    if (toolCall.name === TOOL_AGENT_OUTPUT) return false;
+  private shouldRenderToolCall(toolCall: ToolCallInfo, msg?: ChatMessage): boolean {
     if (toolCall.name === TOOL_WRITE_STDIN && this.isSilentWriteStdinTool(toolCall)) return false;
     if (toolCall.name === 'custom_tool_call_output') return false;
 
-    const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(toolCall.name);
-    if (subagentLifecycleAdapter?.isHiddenTool(toolCall.name)) return false;
+    const subagentAdapter = this.getSubagentAdapter(toolCall.name);
+    if (
+      subagentAdapter?.protocol === 'managed-agent'
+      && subagentAdapter.isOutputTool(toolCall.name)
+    ) return false;
+    if (
+      subagentAdapter?.protocol === 'lifecycle'
+      && subagentAdapter.isHiddenTool(toolCall.name)
+      && msg
+      && this.isFullyOwnedProviderSubagentTool(toolCall, msg, subagentAdapter)
+    ) return false;
 
     return true;
+  }
+
+  private isFullyOwnedProviderSubagentTool(
+    toolCall: ToolCallInfo,
+    msg: ChatMessage,
+    adapter: ProviderSubagentLifecycleAdapter,
+  ): boolean {
+    const agentIdToSpawnId = new Map<string, string>();
+    for (const sibling of msg.toolCalls ?? []) {
+      if (!adapter.isSpawnTool(sibling.name)) continue;
+      const spawnResult = adapter.extractSpawnResult(sibling.result, sibling);
+      const agentId = spawnResult.agentId
+        ?? adapter.buildSubagentInfo(sibling, msg.toolCalls ?? []).agentId;
+      if (agentId) agentIdToSpawnId.set(agentId, sibling.id);
+    }
+    return adapter.isToolCallFullyOwned(toolCall, agentIdToSpawnId);
   }
 
   private isSilentWriteStdinTool(toolCall: ToolCallInfo): boolean {
@@ -505,16 +574,20 @@ export class MessageRenderer {
     spawnToolCall: ToolCallInfo,
     msg: ChatMessage,
   ): void {
-    const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(spawnToolCall.name);
-    if (!subagentLifecycleAdapter) {
+    const subagentAdapter = this.getSubagentAdapter(spawnToolCall.name);
+    if (!subagentAdapter || subagentAdapter.protocol !== 'lifecycle') {
       renderStoredToolCall(contentEl, spawnToolCall);
       return;
     }
 
-    const subagentInfo = subagentLifecycleAdapter.buildSubagentInfo(
+    const subagentInfo = subagentAdapter.buildSubagentInfo(
       spawnToolCall,
       msg.toolCalls ?? [],
     );
+    if (subagentInfo.mode === 'async') {
+      renderStoredAsyncSubagent(contentEl, subagentInfo);
+      return;
+    }
     renderStoredSubagent(contentEl, subagentInfo);
   }
 
@@ -623,6 +696,9 @@ export class MessageRenderer {
    * Shows full-size image in modal overlay.
    */
   showFullImage(image: ImageAttachment): void {
+    if (this.isDisposed) return;
+    this.closeImageModal?.();
+
     const dataUri = `data:${image.mediaType};base64,${image.data}`;
 
     const ownerDocument = this.messagesEl.ownerDocument ?? window.document;
@@ -645,9 +721,15 @@ export class MessageRenderer {
       }
     };
 
+    let isClosed = false;
     const close = () => {
+      if (isClosed) return;
+      isClosed = true;
       ownerDocument.removeEventListener('keydown', handleEsc);
       overlay.remove();
+      if (this.closeImageModal === close) {
+        this.closeImageModal = null;
+      }
     };
 
     closeBtn.addEventListener('click', close);
@@ -655,6 +737,7 @@ export class MessageRenderer {
       if (e.target === overlay) close();
     });
     ownerDocument.addEventListener('keydown', handleEsc);
+    this.closeImageModal = close;
   }
 
   /**
@@ -688,8 +771,9 @@ export class MessageRenderer {
       // as plain text. Trusted plugin markup (image embeds) is injected only
       // after this step, otherwise it would be escaped too.
       const safeMarkdown = escapeRawHtmlTags(renderMarkdown);
+      const displayOnlyCodeFences = prepareDisplayOnlyCodeFences(safeMarkdown);
       const processedMarkdown = replaceImageEmbedsWithHtml(
-        safeMarkdown,
+        displayOnlyCodeFences.markdown,
         this.app,
         { mediaFolder: this.plugin.settings.mediaFolder }
       );
@@ -700,6 +784,7 @@ export class MessageRenderer {
         '',
         this.component
       );
+      await restoreDisplayOnlyCodeFences(el, displayOnlyCodeFences.fences);
 
       // Wrap pre elements and move buttons outside scroll area
       el.querySelectorAll('pre').forEach((pre) => {

@@ -1,21 +1,30 @@
 import * as fs from 'fs';
 
+import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
+import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import { DEFAULT_CODEX_PROVIDER_SETTINGS } from '@/providers/codex/settings';
 import { codexSettingsTabRenderer } from '@/providers/codex/ui/CodexSettingsTab';
 
 const mockGetHostnameKey = jest.fn(() => 'host-a');
 const mockRenderEnvironmentSettingsSection = jest.fn();
 const mockSaveSettings = jest.fn().mockResolvedValue(undefined);
-const mockRecycleProviderRuntimes = jest.fn().mockResolvedValue(undefined);
-const mockRenderCodexModelPicker = jest.fn();
+const mockCodexCliResolverReset = jest.fn();
+const mockRefreshCodexModelPicker = jest.fn();
+const mockRenderCodexModelPicker = jest.fn((
+  _container: unknown,
+  _context: { notifyProviderModelOptionsChanged: (providerId: string) => void },
+  _workspace: unknown,
+) => ({ refresh: mockRefreshCodexModelPicker }));
 const mockRefreshModelCatalog = jest.fn().mockResolvedValue({ changed: false });
 
 jest.mock('fs');
 jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
   ProviderSettingsCoordinator: {
+    canApplyProviderEnablement: jest.fn(() => true),
     applyProviderEnablement: jest.fn((settings: Record<string, unknown>, _providerId: string, enabled: boolean) => {
       const providerConfigs = settings.providerConfigs as { codex: { enabled: boolean } };
       providerConfigs.codex.enabled = enabled;
+      return true;
     }),
     reconcileTitleGenerationModelSelection: jest.fn((settings: Record<string, unknown>) => {
       const titleGenerationModel = settings.titleGenerationModel;
@@ -28,6 +37,7 @@ jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
       }
       return false;
     }),
+    normalizeAllModelVariants: jest.fn(),
   },
 }));
 jest.mock('obsidian', () => {
@@ -109,15 +119,16 @@ jest.mock('@/providers/codex/app/CodexWorkspaceServices', () => ({
     subagentStorage: {},
     refreshAgentMentions: jest.fn(),
     refreshModelCatalog: mockRefreshModelCatalog,
+    cliResolver: { reset: mockCodexCliResolverReset },
   })),
 }));
 
 jest.mock('@/providers/codex/ui/CodexModelPicker', () => ({
-  renderCodexModelPicker: (...args: unknown[]) => mockRenderCodexModelPicker(...args),
-}));
-
-jest.mock('@/providers/codex/ui/CodexSkillSettings', () => ({
-  CodexSkillSettings: jest.fn(),
+  renderCodexModelPicker: (
+    container: unknown,
+    context: { notifyProviderModelOptionsChanged: (providerId: string) => void },
+    workspace: unknown,
+  ) => mockRenderCodexModelPicker(container, context, workspace),
 }));
 
 jest.mock('@/providers/codex/ui/CodexSubagentSettings', () => ({
@@ -354,7 +365,10 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
       ...overrides,
     },
     saveSettings: mockSaveSettings,
-    recycleProviderRuntimes: mockRecycleProviderRuntimes,
+    runProviderExecutionTransition: jest.fn(async (
+      _providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => mutation()),
     app: {
       vault: {
         adapter: {
@@ -367,17 +381,49 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
     await mutation(plugin.settings);
     await plugin.saveSettings();
   });
+  plugin.applyProviderRuntimeSettings = jest.fn(async (
+    providerIds: string[],
+    mutation: (settings: any) => void | Promise<void>,
+    onApplied?: () => void | Promise<void>,
+  ) => plugin.runProviderExecutionTransition(providerIds, async () => {
+    await plugin.mutateSettings(mutation);
+    await onApplied?.();
+  }));
   return plugin;
 }
 
 function createContext(plugin: any) {
   return {
     plugin,
+    renderAgentSkillSettings: jest.fn(),
     renderHiddenProviderCommandSetting: jest.fn(),
-    refreshModelSelectors: jest.fn(),
-    refreshTitleGenerationModelOptions: jest.fn(),
+    notifyProviderModelOptionsChanged: jest.fn(),
     renderCustomContextLimits: jest.fn(),
   };
+}
+
+function acquireSettingsLease(
+  registry: ProviderExecutionLifecycleRegistry,
+): jest.Mock {
+  const dispose = jest.fn().mockResolvedValue(undefined);
+  registry.acquire({
+    providerId: 'codex',
+    createSession: () => ({
+      providerId: 'codex',
+      sessionInstanceId: 'codex-settings-session',
+      execute: jest.fn(),
+      cancel: jest.fn(),
+      getSnapshot: jest.fn().mockReturnValue({
+        providerId: 'codex',
+        revision: 0,
+        status: 'idle',
+      }),
+      getStatus: jest.fn().mockReturnValue('idle'),
+      onEvent: jest.fn().mockReturnValue(() => undefined),
+      dispose,
+    }),
+  } as any, {} as any, 'chat');
+  return dispose;
 }
 
 function findSetting(name: string) {
@@ -428,16 +474,130 @@ describe('CodexSettingsTab', () => {
     expect(findOptionalSetting('WSL distro override')).toBeUndefined();
   });
 
+  it('renders Models before Safety', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+
+    codexSettingsTabRenderer.render(createContainer(), createContext(createPlugin()));
+
+    const headings = createdSettings.filter(setting => setting.heading).map(setting => setting.name);
+    expect(headings.indexOf('Models')).toBeLessThan(headings.indexOf('Safety'));
+  });
+
+  it('renders a default-off ultra effort toggle and publishes changes to chat consumers', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+
+    codexSettingsTabRenderer.render(createContainer(), context);
+
+    const setting = findSetting('Enable ultra effort');
+    const toggle = setting.toggleComponents[0];
+    expect(toggle.value).toBe(false);
+
+    await toggle.onChangeCallback?.(true);
+
+    expect(plugin.settings.providerConfigs.codex.enableUltraEffort).toBe(true);
+    expect(ProviderSettingsCoordinator.normalizeAllModelVariants).toHaveBeenCalledWith(
+      plugin.settings,
+    );
+    expect(mockRefreshCodexModelPicker).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
+  });
+
   it('refreshes title model options after Codex enablement changes', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     const plugin = createPlugin();
     const context = createContext(plugin);
 
     codexSettingsTabRenderer.render(createContainer(), context);
-    await findSetting('Enable Codex provider').toggleComponents[0].onChangeCallback?.(false);
+    const enableSetting = findSetting('Enable Codex');
+    expect(enableSetting.desc).toBe(
+      'Make enabled Codex models available for new conversations. Existing sessions are preserved when disabled.',
+    );
+    await enableSetting.toggleComponents[0].onChangeCallback?.(false);
 
-    expect(context.refreshTitleGenerationModelOptions).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
   });
+
+  it('commits enablement inside the Codex transition without launching metadata discovery', async () => {
+    const registry = new ProviderExecutionLifecycleRegistry();
+    const dispose = acquireSettingsLease(registry);
+    const plugin = createPlugin({
+      providerConfigs: {
+        codex: {
+          ...DEFAULT_CODEX_PROVIDER_SETTINGS,
+          enabled: false,
+        },
+      },
+    });
+    let transitionActive = false;
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => registry.runTransition(providerIds as ['codex'], async () => {
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    }));
+    plugin.mutateSettings.mockImplementation(async (
+      mutation: (settings: Record<string, unknown>) => void | Promise<void>,
+    ) => {
+      expect(transitionActive).toBe(true);
+      await mutation(plugin.settings);
+      await plugin.saveSettings();
+    });
+    const context = createContext(plugin);
+
+    codexSettingsTabRenderer.render(createContainer(), context);
+    const toggle = findSetting('Enable Codex').toggleComponents[0];
+    await toggle.onChangeCallback?.(true);
+
+    expect(plugin.runProviderExecutionTransition).toHaveBeenCalledWith(
+      ['codex'],
+      expect.any(Function),
+    );
+    expect(plugin.settings.providerConfigs.codex.enabled).toBe(true);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(registry.getProviderGeneration('codex')).toBe(1);
+    expect(mockRefreshModelCatalog).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
+    await registry.dispose();
+  });
+
+  it.each([
+    ['before mutation', false],
+    ['after mutation', true],
+  ] as const)(
+    'resynchronizes the enable toggle when the transition fails %s',
+    async (_phase, mutateBeforeFailure) => {
+      const plugin = createPlugin();
+      plugin.runProviderExecutionTransition.mockImplementation(async (
+        _providerIds: string[],
+        mutation: () => Promise<unknown>,
+      ) => {
+        if (mutateBeforeFailure) await mutation();
+        throw new Error('enablement transition failed');
+      });
+      const context = createContext(plugin);
+
+      codexSettingsTabRenderer.render(createContainer(), context);
+      const toggle = findSetting('Enable Codex').toggleComponents[0];
+      toggle.value = false;
+      toggle.setValue.mockClear();
+
+      await expect(toggle.onChangeCallback?.(false)).rejects.toThrow(
+        'enablement transition failed',
+      );
+
+      const persistedEnabled = plugin.settings.providerConfigs.codex.enabled;
+      expect(persistedEnabled).toBe(mutateBeforeFailure ? false : true);
+      expect(toggle.setValue).toHaveBeenCalledWith(persistedEnabled);
+      expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+    },
+  );
 
   it('renders the app-server model visibility picker', () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
@@ -449,8 +609,54 @@ describe('CodexSettingsTab', () => {
 
     expect(mockRenderCodexModelPicker).toHaveBeenCalledWith(
       container,
-      context,
+      expect.objectContaining({ plugin }),
       expect.objectContaining({ commandCatalog: null }),
+    );
+  });
+
+  it('warns when Codex is enabled without any enabled models', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const plugin = createPlugin({
+      providerConfigs: {
+        codex: {
+          ...DEFAULT_CODEX_PROVIDER_SETTINGS,
+          enabled: true,
+          visibleModels: [],
+        },
+      },
+    });
+    const context = createContext(plugin);
+    const container = createContainer();
+
+    codexSettingsTabRenderer.render(container, context);
+
+    const warningCallIndex = container.createDiv.mock.calls.findIndex(
+      ([options]: [{ text?: string }?]) => options?.text
+        === 'No Codex models are enabled. Go to Models below and enable at least one model.',
+    );
+    const warningEl = container.createDiv.mock.results[warningCallIndex]?.value;
+    expect(warningCallIndex).toBeGreaterThanOrEqual(0);
+    expect(warningEl.toggleClass).toHaveBeenLastCalledWith('claudian-hidden', false);
+
+    plugin.settings.providerConfigs.codex.customModels = 'gpt-custom';
+    const pickerContext = mockRenderCodexModelPicker.mock.calls[0][1];
+    pickerContext.notifyProviderModelOptionsChanged('codex');
+
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('codex');
+    expect(warningEl.toggleClass).toHaveBeenLastCalledWith('claudian-hidden', true);
+  });
+
+  it('renders the fixed-root shared skill manager', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    const container = createContainer();
+
+    codexSettingsTabRenderer.render(container, context);
+
+    expect(context.renderAgentSkillSettings).toHaveBeenCalledWith(
+      container,
+      'codex',
     );
   });
 
@@ -488,12 +694,30 @@ describe('CodexSettingsTab', () => {
 
     expect(plugin.settings.providerConfigs.codex.cliPathsByHost['host-a']).toBeUndefined();
     expect(mockSaveSettings).toHaveBeenCalledTimes(0);
-    expect(mockRecycleProviderRuntimes).toHaveBeenCalledTimes(0);
   });
 
   it('accepts a Linux-side CLI command when installation method is WSL', async () => {
     Object.defineProperty(process, 'platform', { value: 'win32' });
     const plugin = createPlugin();
+    let transitionActive = false;
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      _providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => {
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    });
+    plugin.mutateSettings.mockImplementation(async (
+      mutation: (settings: Record<string, unknown>) => void | Promise<void>,
+    ) => {
+      expect(transitionActive).toBe(true);
+      await mutation(plugin.settings);
+      await plugin.saveSettings();
+    });
 
     codexSettingsTabRenderer.render(createContainer(), createContext(plugin));
 
@@ -508,7 +732,12 @@ describe('CodexSettingsTab', () => {
     });
     expect(plugin.settings.providerConfigs.codex.cliPathsByHost['host-a']).toBe('codex');
     expect(mockSaveSettings).toHaveBeenCalled();
-    expect(mockRecycleProviderRuntimes).toHaveBeenCalledWith('codex');
+    expect(plugin.runProviderExecutionTransition).toHaveBeenCalledWith(
+      ['codex'],
+      expect.any(Function),
+    );
+    expect(plugin.applyProviderRuntimeSettings).toHaveBeenCalledTimes(2);
+    expect(mockCodexCliResolverReset).toHaveBeenCalledTimes(2);
     expect(mockRefreshModelCatalog).toHaveBeenCalledTimes(1);
   });
 
@@ -540,7 +769,6 @@ describe('CodexSettingsTab', () => {
     expect(plugin.settings.providerConfigs.codex.cliPathsByHost['host-a']).toBe(
       'C:\\Users\\me\\AppData\\Roaming\\npm\\codex.exe',
     );
-    expect(mockRecycleProviderRuntimes).toHaveBeenCalledTimes(0);
   });
 
   it('does not render the legacy custom models textarea', () => {

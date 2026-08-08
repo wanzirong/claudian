@@ -1,11 +1,11 @@
 import { getProviderConfig, setProviderConfig } from '../../core/providers/providerConfig';
 import { getProviderEnvironmentVariables } from '../../core/providers/providerEnvironment';
-import type { HostnameCliPaths } from '../../core/types/settings';
+import { normalizeHostnameStringMap } from '../../core/providers/settings/HostnameStringMap';
 import {
-  getHostnameKey,
-  getLegacyHostnameKey,
-  migrateLegacyHostnameKeyedMap,
-} from '../../utils/env';
+  readStoredBoolean,
+  readStoredString,
+} from '../../core/providers/settings/storedSettings';
+import type { HostnameCliPaths } from '../../core/types/settings';
 import {
   type ClaudeModelEnvironmentType,
   isClaudeModelEnvironmentType,
@@ -16,6 +16,7 @@ export type ClaudeSafeMode = typeof CLAUDE_SAFE_MODES[number];
 export type ClaudeSettingSource = 'user' | 'project' | 'local';
 
 export interface ClaudeProviderSettings {
+  enabled: boolean;
   safeMode: ClaudeSafeMode;
   cliPath: string;
   cliPathsByHost: HostnameCliPaths;
@@ -23,6 +24,7 @@ export interface ClaudeProviderSettings {
   enableChrome: boolean;
   enableBangBash: boolean;
   customModels: string;
+  defaultModel: string;
   lastModel: string;
   modelEnvironmentType: ClaudeModelEnvironmentType | '';
   titleModelEnvironmentType: ClaudeModelEnvironmentType | '';
@@ -31,6 +33,7 @@ export interface ClaudeProviderSettings {
 }
 
 export const DEFAULT_CLAUDE_PROVIDER_SETTINGS: Readonly<ClaudeProviderSettings> = Object.freeze({
+  enabled: true,
   safeMode: 'acceptEdits',
   cliPath: '',
   cliPathsByHost: {},
@@ -38,6 +41,7 @@ export const DEFAULT_CLAUDE_PROVIDER_SETTINGS: Readonly<ClaudeProviderSettings> 
   enableChrome: false,
   enableBangBash: false,
   customModels: '',
+  defaultModel: 'opus',
   lastModel: 'haiku',
   modelEnvironmentType: '',
   titleModelEnvironmentType: '',
@@ -45,24 +49,20 @@ export const DEFAULT_CLAUDE_PROVIDER_SETTINGS: Readonly<ClaudeProviderSettings> 
   environmentHash: '',
 });
 
-function normalizeHostnameCliPaths(value: unknown): HostnameCliPaths {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const result: HostnameCliPaths = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === 'string' && entry.trim()) {
-      result[key] = entry.trim();
-    }
-  }
-  return result;
-}
-
 function normalizeClaudeSafeMode(value: unknown): ClaudeSafeMode | undefined {
   return (CLAUDE_SAFE_MODES as readonly unknown[]).includes(value)
     ? value as ClaudeSafeMode
     : undefined;
+}
+
+function readStoredClaudeSafeMode(
+  value: unknown,
+  fallback: ClaudeSafeMode,
+): ClaudeSafeMode {
+  if (value === undefined) {
+    return fallback;
+  }
+  return normalizeClaudeSafeMode(value) ?? 'default';
 }
 
 function normalizeClaudeModelEnvironmentType(
@@ -77,49 +77,67 @@ export function getClaudeProviderSettings(
   settings: Record<string, unknown>,
 ): ClaudeProviderSettings {
   const config = getProviderConfig(settings, 'claude');
-  const normalizedCliPathsByHost = normalizeHostnameCliPaths(
+  const cliPathsByHost = normalizeHostnameStringMap(
     config.cliPathsByHost ?? settings.claudeCliPathsByHost,
   );
-  const cliPathsByHost = Object.keys(normalizedCliPathsByHost).length > 0
-    ? migrateLegacyHostnameKeyedMap(
-      normalizedCliPathsByHost,
-      getHostnameKey(),
-      getLegacyHostnameKey(),
-    )
-    : normalizedCliPathsByHost;
 
   return {
-    safeMode: normalizeClaudeSafeMode(config.safeMode)
-      ?? normalizeClaudeSafeMode(settings.claudeSafeMode)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.safeMode,
-    cliPath: (config.cliPath as string | undefined)
-      ?? (settings.claudeCliPath as string | undefined)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.cliPath,
+    enabled: readStoredBoolean(
+      config.enabled,
+      DEFAULT_CLAUDE_PROVIDER_SETTINGS.enabled,
+    ),
+    safeMode: readStoredClaudeSafeMode(
+      config.safeMode,
+      readStoredClaudeSafeMode(
+        settings.claudeSafeMode,
+        DEFAULT_CLAUDE_PROVIDER_SETTINGS.safeMode,
+      ),
+    ),
+    cliPath: readStoredString(
+      config.cliPath,
+      readStoredString(settings.claudeCliPath, DEFAULT_CLAUDE_PROVIDER_SETTINGS.cliPath),
+    ),
     cliPathsByHost,
-    loadUserSettings: (config.loadUserSettings as boolean | undefined)
-      ?? (settings.loadUserClaudeSettings as boolean | undefined)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.loadUserSettings,
-    enableChrome: (config.enableChrome as boolean | undefined)
-      ?? (settings.enableChrome as boolean | undefined)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.enableChrome,
-    enableBangBash: (config.enableBangBash as boolean | undefined)
-      ?? (settings.enableBangBash as boolean | undefined)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.enableBangBash,
-    customModels: (config.customModels as string | undefined)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.customModels,
-    lastModel: (config.lastModel as string | undefined)
-      ?? (settings.lastClaudeModel as string | undefined)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.lastModel,
+    loadUserSettings: readStoredBoolean(
+      config.loadUserSettings,
+      readStoredBoolean(
+        settings.loadUserClaudeSettings,
+        DEFAULT_CLAUDE_PROVIDER_SETTINGS.loadUserSettings,
+      ),
+    ),
+    enableChrome: readStoredBoolean(
+      config.enableChrome,
+      readStoredBoolean(settings.enableChrome, DEFAULT_CLAUDE_PROVIDER_SETTINGS.enableChrome),
+    ),
+    enableBangBash: readStoredBoolean(
+      config.enableBangBash,
+      readStoredBoolean(settings.enableBangBash, DEFAULT_CLAUDE_PROVIDER_SETTINGS.enableBangBash),
+    ),
+    customModels: readStoredString(
+      config.customModels,
+      DEFAULT_CLAUDE_PROVIDER_SETTINGS.customModels,
+    ),
+    defaultModel: readStoredString(
+      config.defaultModel,
+      DEFAULT_CLAUDE_PROVIDER_SETTINGS.defaultModel,
+    ),
+    lastModel: readStoredString(
+      config.lastModel,
+      readStoredString(settings.lastClaudeModel, DEFAULT_CLAUDE_PROVIDER_SETTINGS.lastModel),
+    ),
     modelEnvironmentType: normalizeClaudeModelEnvironmentType(config.modelEnvironmentType),
     titleModelEnvironmentType: normalizeClaudeModelEnvironmentType(
       config.titleModelEnvironmentType,
     ),
-    environmentVariables: (config.environmentVariables as string | undefined)
-      ?? getProviderEnvironmentVariables(settings, 'claude')
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.environmentVariables,
-    environmentHash: (config.environmentHash as string | undefined)
-      ?? (settings.lastEnvHash as string | undefined)
-      ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.environmentHash,
+    environmentVariables: readStoredString(
+      config.environmentVariables,
+      getProviderEnvironmentVariables(settings, 'claude')
+        ?? DEFAULT_CLAUDE_PROVIDER_SETTINGS.environmentVariables,
+    ),
+    environmentHash: readStoredString(
+      config.environmentHash,
+      readStoredString(settings.lastEnvHash, DEFAULT_CLAUDE_PROVIDER_SETTINGS.environmentHash),
+    ),
   };
 }
 

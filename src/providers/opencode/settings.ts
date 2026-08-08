@@ -1,11 +1,12 @@
 import { getProviderConfig, setProviderConfig } from '../../core/providers/providerConfig';
 import { getProviderEnvironmentVariables } from '../../core/providers/providerEnvironment';
-import type { HostnameCliPaths } from '../../core/types/settings';
+import { normalizeHostnameStringMap } from '../../core/providers/settings/HostnameStringMap';
 import {
-  getHostnameKey,
-  getLegacyHostnameKey,
-  migrateLegacyHostnameKeyedMap,
-} from '../../utils/env';
+  readStoredBoolean,
+  readStoredString,
+} from '../../core/providers/settings/storedSettings';
+import type { HostnameCliPaths } from '../../core/types/settings';
+import { getHostnameKey } from '../../utils/env';
 import {
   getOpencodeDiscoveryState,
   seedOpencodeDiscoveryStateFromLegacyConfig,
@@ -59,20 +60,6 @@ export const DEFAULT_OPENCODE_PROVIDER_SETTINGS: Readonly<PersistedOpencodeProvi
   thinkingOptionsByModel: {},
   visibleModels: [],
 });
-
-function normalizeHostnameCliPaths(value: unknown): HostnameCliPaths {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const result: HostnameCliPaths = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === 'string' && entry.trim()) {
-      result[key] = entry.trim();
-    }
-  }
-  return result;
-}
 
 export function normalizeOpencodeVisibleModels(
   value: unknown,
@@ -157,14 +144,7 @@ export function getOpencodeProviderSettings(
   settings: Record<string, unknown>,
 ): OpencodeProviderSettings {
   const config = getProviderConfig(settings, 'opencode');
-  const normalizedCliPathsByHost = normalizeHostnameCliPaths(config.cliPathsByHost);
-  const cliPathsByHost = Object.keys(normalizedCliPathsByHost).length > 0
-    ? migrateLegacyHostnameKeyedMap(
-      normalizedCliPathsByHost,
-      getHostnameKey(),
-      getLegacyHostnameKey(),
-    )
-    : normalizedCliPathsByHost;
+  const cliPathsByHost = normalizeHostnameStringMap(config.cliPathsByHost);
   seedOpencodeDiscoveryStateFromLegacyConfig(settings, config);
   const discoveryState = getOpencodeDiscoveryState(settings);
   const availableModes = discoveryState.availableModes;
@@ -180,17 +160,19 @@ export function getOpencodeProviderSettings(
 
   return {
     availableModes,
-    cliPath: (config.cliPath as string | undefined)
-      ?? DEFAULT_OPENCODE_PROVIDER_SETTINGS.cliPath,
+    cliPath: readStoredString(config.cliPath, DEFAULT_OPENCODE_PROVIDER_SETTINGS.cliPath),
     cliPathsByHost,
     discoveredModels,
-    enabled: (config.enabled as boolean | undefined)
-      ?? DEFAULT_OPENCODE_PROVIDER_SETTINGS.enabled,
-    environmentHash: (config.environmentHash as string | undefined)
-      ?? DEFAULT_OPENCODE_PROVIDER_SETTINGS.environmentHash,
-    environmentVariables: (config.environmentVariables as string | undefined)
-      ?? getProviderEnvironmentVariables(settings, 'opencode')
-      ?? DEFAULT_OPENCODE_PROVIDER_SETTINGS.environmentVariables,
+    enabled: readStoredBoolean(config.enabled, DEFAULT_OPENCODE_PROVIDER_SETTINGS.enabled),
+    environmentHash: readStoredString(
+      config.environmentHash,
+      DEFAULT_OPENCODE_PROVIDER_SETTINGS.environmentHash,
+    ),
+    environmentVariables: readStoredString(
+      config.environmentVariables,
+      getProviderEnvironmentVariables(settings, 'opencode')
+        ?? DEFAULT_OPENCODE_PROVIDER_SETTINGS.environmentVariables,
+    ),
     modelAliases: normalizeOpencodeModelAliases(config.modelAliases, discoveredModels),
     preferredThinkingByModel: normalizeOpencodePreferredThinkingByModel(
       config.preferredThinkingByModel,
@@ -242,7 +224,7 @@ export function updateOpencodeProviderSettings(
     nextVisibleModels,
   );
   const nextCliPathsByHost = 'cliPathsByHost' in updates
-    ? normalizeHostnameCliPaths(updates.cliPathsByHost)
+    ? normalizeHostnameStringMap(updates.cliPathsByHost)
     : { ...current.cliPathsByHost };
   let nextCliPath = 'cliPathsByHost' in updates
     ? (
@@ -402,9 +384,7 @@ function retargetRemovedOpencodeSelections(
     }
 
     const rawModelId = decodeOpencodeModelId(value);
-    if (!rawModelId) {
-      return fallbackModelId;
-    }
+    if (!rawModelId) return null;
 
     const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, next.discoveredModels);
     return visibleSet.has(baseRawId) ? null : fallbackModelId;

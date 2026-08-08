@@ -1,7 +1,7 @@
 import {
   CLAUDIAN_SETTINGS_PATH,
   LEGACY_CLAUDIAN_SETTINGS_PATH,
-} from '../../core/bootstrap/StoragePaths';
+} from '../../core/bootstrap/storagePaths';
 import {
   normalizeHiddenCommandList,
   normalizeHiddenProviderCommands,
@@ -17,10 +17,13 @@ import {
   CHAT_VIEW_PLACEMENTS,
   type ChatViewPlacement,
   type ClaudianSettings,
+  DUAL_PANE_SIDES,
+  type DualPaneSide,
   type EnvironmentScope,
   type EnvSnippet,
   type HiddenProviderCommands,
   type ProviderConfigMap,
+  type StoredChatModelSelection,
 } from '../../core/types/settings';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './defaultSettings';
 
@@ -94,6 +97,43 @@ function shouldPersistChatViewPlacementMigration(
       'chatViewPlacement' in stored
       && stored.chatViewPlacement !== normalized
     );
+}
+
+function normalizeEnableDualPane(value: unknown): boolean {
+  return typeof value === 'boolean'
+    ? value
+    : DEFAULT_CLAUDIAN_SETTINGS.enableDualPane;
+}
+
+function normalizeEnableFilePane(value: unknown): boolean {
+  return typeof value === 'boolean'
+    ? value
+    : DEFAULT_CLAUDIAN_SETTINGS.enableFilePane;
+}
+
+function normalizeDualPaneSide(value: unknown): DualPaneSide {
+  return typeof value === 'string'
+    && (DUAL_PANE_SIDES as readonly string[]).includes(value)
+    ? value as DualPaneSide
+    : DEFAULT_CLAUDIAN_SETTINGS.dualPaneSide;
+}
+
+function shouldPersistDualPaneNormalization(
+  stored: Record<string, unknown>,
+  enableDualPane: boolean,
+  enableFilePane: boolean,
+  dualPaneSide: DualPaneSide,
+): boolean {
+  return (
+    'enableDualPane' in stored
+    && stored.enableDualPane !== enableDualPane
+  ) || (
+    'enableFilePane' in stored
+    && stored.enableFilePane !== enableFilePane
+  ) || (
+    'dualPaneSide' in stored
+    && stored.dualPaneSide !== dualPaneSide
+  );
 }
 
 function normalizeProviderConfigs(value: unknown): ProviderConfigMap {
@@ -268,6 +308,54 @@ function mergeLegacyClaudeHiddenCommands(
   };
 }
 
+function trimStoredString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeStoredChatModelSelection(
+  value: unknown,
+): StoredChatModelSelection | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const providerId = trimStoredString(candidate.providerId);
+  const model = trimStoredString(candidate.model);
+  if (
+    !providerId
+    || !model
+    || !ProviderRegistry.getRegisteredProviderIds().includes(providerId)
+  ) {
+    return null;
+  }
+
+  return { providerId, model };
+}
+
+function migrateLegacyChatModelSelection(
+  stored: Record<string, unknown>,
+): StoredChatModelSelection | null {
+  const registeredProviderIds = new Set(ProviderRegistry.getRegisteredProviderIds());
+  const storedProviderId = trimStoredString(stored.settingsProvider);
+  const providerId = registeredProviderIds.has(storedProviderId)
+    ? storedProviderId
+    : 'claude';
+  if (!registeredProviderIds.has(providerId)) {
+    return null;
+  }
+
+  const projectedModel = trimStoredString(stored.model);
+  const savedProviderModels = stored.savedProviderModel;
+  const savedModel = savedProviderModels
+    && typeof savedProviderModels === 'object'
+    && !Array.isArray(savedProviderModels)
+    ? trimStoredString((savedProviderModels as Record<string, unknown>)[providerId])
+    : '';
+  const model = projectedModel || savedModel;
+  return model ? { providerId, model } : null;
+}
+
 export class ClaudianSettingsStorage {
   constructor(private adapter: VaultFileAdapter) {}
 
@@ -279,6 +367,15 @@ export class ClaudianSettingsStorage {
 
     const content = await this.adapter.read(settingsPath);
     const stored = JSON.parse(content) as Record<string, unknown>;
+    const hasStoredChatModelSelection = Object.prototype.hasOwnProperty.call(
+      stored,
+      'lastSelectedChatModel',
+    );
+    const lastSelectedChatModel = hasStoredChatModelSelection
+      ? normalizeStoredChatModelSelection(stored.lastSelectedChatModel)
+      : migrateLegacyChatModelSelection(stored);
+    const didNormalizeChatModelSelection = !hasStoredChatModelSelection
+      || JSON.stringify(lastSelectedChatModel) !== JSON.stringify(stored.lastSelectedChatModel);
     const hiddenProviderCommands = mergeLegacyClaudeHiddenCommands(
       normalizeHiddenProviderCommands(stored.hiddenProviderCommands),
       stored.hiddenSlashCommands,
@@ -293,6 +390,9 @@ export class ClaudianSettingsStorage {
       stored.chatViewPlacement,
       stored.openInMainTab,
     );
+    const enableDualPane = normalizeEnableDualPane(stored.enableDualPane);
+    const enableFilePane = normalizeEnableFilePane(stored.enableFilePane);
+    const dualPaneSide = normalizeDualPaneSide(stored.dualPaneSide);
     const legacyProviderSettings = {
       ...stored,
       hiddenProviderCommands,
@@ -310,6 +410,10 @@ export class ClaudianSettingsStorage {
       hiddenProviderCommands,
       providerConfigs,
       chatViewPlacement,
+      enableDualPane,
+      enableFilePane,
+      dualPaneSide,
+      lastSelectedChatModel,
     };
 
     const merged = {
@@ -342,6 +446,12 @@ export class ClaudianSettingsStorage {
       || 'enableBlocklist' in stored
       || 'blockedCommands' in stored
       || shouldPersistChatViewPlacementMigration(stored, chatViewPlacement)
+      || shouldPersistDualPaneNormalization(
+        stored,
+        enableDualPane,
+        enableFilePane,
+        dualPaneSide,
+      )
       || JSON.stringify(envSnippets) !== JSON.stringify(stored.envSnippets ?? [])
       || (
         'customModelAliases' in stored
@@ -350,6 +460,7 @@ export class ClaudianSettingsStorage {
       || didNormalizeProviderSettings
       || didStripRuntimeProviderConfig
       || didNormalizeHostScopedProviderConfigs
+      || didNormalizeChatModelSelection
       )
     ) {
       await this.save(merged);

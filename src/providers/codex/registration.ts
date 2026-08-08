@@ -1,14 +1,14 @@
+import { NOOP_TASK_RESULT_INTERPRETER } from '../../core/providers/NoopTaskResultInterpreter';
 import type { ProviderModule } from '../../core/providers/types';
-import { codexWorkspaceRegistration } from './app/CodexWorkspaceServices';
-import { CodexInlineEditService } from './auxiliary/CodexInlineEditService';
-import { CodexInstructionRefineService } from './auxiliary/CodexInstructionRefineService';
-import { CodexTaskResultInterpreter } from './auxiliary/CodexTaskResultInterpreter';
-import { CodexTitleGenerationService } from './auxiliary/CodexTitleGenerationService';
+import {
+  codexWorkspaceRegistration,
+} from './app/CodexWorkspaceServices';
 import { CODEX_PROVIDER_CAPABILITIES } from './capabilities';
 import { codexSettingsReconciler } from './env/CodexSettingsReconciler';
+import { CodexExecutionBackend } from './execution/CodexExecutionBackend';
 import { CodexConversationHistoryService } from './history/CodexConversationHistoryService';
+import { toCodexRuntimeModelId } from './modelSelection';
 import { codexSubagentLifecycleAdapter } from './normalization/codexSubagentNormalization';
-import { CodexChatRuntime } from './runtime/CodexChatRuntime';
 import {
   getCodexProviderSettings,
   normalizeCodexStoredConfig,
@@ -43,12 +43,18 @@ export const codexProviderRegistration: ProviderModule = {
       return normalization.changed;
     },
   },
-  createRuntime: ({ plugin }) => new CodexChatRuntime(plugin),
-  createTitleGenerationService: (plugin) => new CodexTitleGenerationService(plugin),
-  createInstructionRefineService: (plugin) => new CodexInstructionRefineService(plugin),
-  createInlineEditService: (plugin) => new CodexInlineEditService(plugin),
+  createExecutionBackend: (plugin) => new CodexExecutionBackend(plugin),
+  resolveTitleGenerationModel: (plugin) => {
+    const settings = plugin.settings as unknown as Record<string, unknown>;
+    const titleModel = typeof settings.titleGenerationModel === 'string'
+      ? settings.titleGenerationModel
+      : '';
+    return codexChatUIConfig.ownsModel(titleModel, settings)
+      ? toCodexRuntimeModelId(titleModel)
+      : undefined;
+  },
   historyService: new CodexConversationHistoryService(),
-  taskResultInterpreter: new CodexTaskResultInterpreter(),
-  subagentLifecycleAdapter: codexSubagentLifecycleAdapter,
+  taskResultInterpreter: NOOP_TASK_RESULT_INTERPRETER,
+  subagentAdapter: codexSubagentLifecycleAdapter,
   workspace: codexWorkspaceRegistration,
 };

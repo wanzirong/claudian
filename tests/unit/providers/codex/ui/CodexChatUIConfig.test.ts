@@ -127,14 +127,14 @@ describe('CodexChatUIConfig', () => {
 
       expect(options).toEqual([
         {
-          value: TEST_CODEX_MODEL,
-          label: 'GPT-5.5',
-          description: 'Latest',
-        },
-        {
           value: 'gpt-5.4-mini',
           label: 'GPT-5.4 Mini',
           description: 'Fast',
+        },
+        {
+          value: TEST_CODEX_MODEL,
+          label: 'GPT-5.5',
+          description: 'Latest',
         },
         {
           value: 'openai-codex/gpt-5.6-preview',
@@ -170,8 +170,8 @@ describe('CodexChatUIConfig', () => {
 
       expect(options.map(option => option.value)).toEqual([
         'openai-codex/my-custom-model',
-        TEST_CODEX_MODEL,
         'gpt-5.4-mini',
+        TEST_CODEX_MODEL,
         'openai-codex/second-custom-model',
       ]);
     });
@@ -199,7 +199,7 @@ describe('CodexChatUIConfig', () => {
       ]);
     });
 
-    it('keeps an existing Codex session model pinned when it is filtered out', () => {
+    it('excludes an existing Codex session model when it is filtered out', () => {
       const settings = withDiscoveredModels({
         model: TEST_CODEX_MODEL,
         providerConfigs: {
@@ -211,7 +211,6 @@ describe('CodexChatUIConfig', () => {
 
       expect(codexChatUIConfig.getModelOptions(settings).map(option => option.value)).toEqual([
         'gpt-5.4-mini',
-        TEST_CODEX_MODEL,
       ]);
     });
 
@@ -234,7 +233,7 @@ describe('CodexChatUIConfig', () => {
       }]);
     });
 
-    it('keeps saved and current Codex selections usable when discovery fails', () => {
+    it('does not expose saved and current Codex selections when no models are enabled', () => {
       const options = codexChatUIConfig.getModelOptions({
         settingsProvider: 'claude',
         model: 'gpt-current-session',
@@ -254,18 +253,7 @@ describe('CodexChatUIConfig', () => {
         },
       });
 
-      expect(options).toEqual([
-        {
-          value: 'gpt-current-session',
-          label: 'Current',
-          description: 'Selected model',
-        },
-        {
-          value: 'openai-codex/saved-custom-model',
-          label: 'Saved',
-          description: 'Selected model',
-        },
-      ]);
+      expect(options).toEqual([]);
     });
 
     it('does not treat another provider current model as a Codex fallback', () => {
@@ -314,6 +302,17 @@ describe('CodexChatUIConfig', () => {
           },
         },
       }))).toBe('gpt-5.4-mini');
+    });
+
+    it('has no default when no models are enabled', () => {
+      expect(codexChatUIConfig.getDefaultModel!({
+        providerConfigs: {
+          codex: {
+            discoveredModels: [],
+            visibleModels: [],
+          },
+        },
+      })).toBeNull();
     });
   });
 
@@ -371,6 +370,123 @@ describe('CodexChatUIConfig', () => {
         { value: 'max', label: 'Max', description: 'Maximum reasoning' },
       ]);
       expect(codexChatUIConfig.getDefaultReasoningValue('gpt-5.6-sol', settings)).toBe('low');
+    });
+
+    it('exposes ultra only when it is enabled and advertised by the selected model', () => {
+      const discoveredModels = [
+        {
+          model: 'gpt-5.6-sol',
+          displayName: 'GPT-5.6-Sol',
+          description: 'Latest',
+          supportedReasoningEfforts: [
+            { value: 'max', description: 'Maximum reasoning' },
+            { value: 'ultra', description: 'Automatic task delegation' },
+          ],
+          defaultReasoningEffort: 'max',
+          serviceTiers: [],
+          defaultServiceTier: null,
+          inputModalities: ['text', 'image'],
+          isDefault: true,
+        },
+        {
+          model: 'gpt-5.6-luna',
+          displayName: 'GPT-5.6-Luna',
+          description: 'Fast',
+          supportedReasoningEfforts: [
+            { value: 'max', description: 'Maximum reasoning' },
+          ],
+          defaultReasoningEffort: 'max',
+          serviceTiers: [],
+          defaultServiceTier: null,
+          inputModalities: ['text', 'image'],
+          isDefault: false,
+        },
+      ];
+      const disabledSettings = {
+        providerConfigs: { codex: { discoveredModels } },
+      };
+      const enabledSettings = {
+        providerConfigs: { codex: { discoveredModels, enableUltraEffort: true } },
+      };
+
+      expect(codexChatUIConfig.getReasoningOptions('gpt-5.6-sol', disabledSettings))
+        .toEqual([{ value: 'max', label: 'Max', description: 'Maximum reasoning' }]);
+      expect(codexChatUIConfig.getReasoningOptions('gpt-5.6-sol', enabledSettings))
+        .toEqual([
+          { value: 'max', label: 'Max', description: 'Maximum reasoning' },
+          { value: 'ultra', label: 'Ultra', description: 'Automatic task delegation' },
+        ]);
+      expect(codexChatUIConfig.getReasoningOptions('gpt-5.6-luna', enabledSettings))
+        .toEqual([{ value: 'max', label: 'Max', description: 'Maximum reasoning' }]);
+    });
+
+    it('uses an advertised ultra default only while ultra effort is enabled', () => {
+      const discoveredModels = [{
+        model: 'gpt-5.6-sol',
+        displayName: 'GPT-5.6-Sol',
+        description: 'Latest',
+        supportedReasoningEfforts: [
+          { value: 'max', description: 'Maximum reasoning' },
+          { value: 'ultra', description: 'Automatic task delegation' },
+        ],
+        defaultReasoningEffort: 'ultra',
+        serviceTiers: [],
+        defaultServiceTier: null,
+        inputModalities: ['text', 'image'],
+        isDefault: true,
+      }];
+
+      expect(codexChatUIConfig.getDefaultReasoningValue('gpt-5.6-sol', {
+        providerConfigs: { codex: { discoveredModels } },
+      })).toBe('max');
+      expect(codexChatUIConfig.getDefaultReasoningValue('gpt-5.6-sol', {
+        providerConfigs: { codex: { discoveredModels, enableUltraEffort: true } },
+      })).toBe('ultra');
+    });
+
+    it('makes an ultra-only model unavailable while ultra effort is disabled', () => {
+      const discoveredModels = [{
+        model: 'gpt-ultra-only',
+        displayName: 'GPT Ultra Only',
+        description: 'Ultra only',
+        supportedReasoningEfforts: [
+          { value: 'ultra', description: 'Automatic task delegation' },
+        ],
+        defaultReasoningEffort: 'ultra',
+        serviceTiers: [],
+        defaultServiceTier: null,
+        inputModalities: ['text'],
+        isDefault: true,
+      }];
+      const settings = {
+        providerConfigs: {
+          codex: {
+            customModels: 'gpt-ultra-only',
+            discoveredModels,
+            environmentVariables: 'OPENAI_MODEL=openai-codex/gpt-ultra-only',
+            visibleModels: ['gpt-ultra-only'],
+          },
+        },
+      };
+
+      expect(codexChatUIConfig.getReasoningOptions('gpt-ultra-only', settings)).toEqual([]);
+      expect(codexChatUIConfig.getModelOptions(settings)).toEqual([]);
+      expect(codexChatUIConfig.getDefaultModel?.(settings)).toBeNull();
+      expect(codexChatUIConfig.getModelOptions({
+        providerConfigs: {
+          codex: {
+            discoveredModels,
+            enableUltraEffort: true,
+            visibleModels: ['gpt-ultra-only'],
+          },
+        },
+      })).toEqual([
+        {
+          value: 'gpt-ultra-only',
+          label: 'GPT Ultra Only',
+          description: 'Ultra only',
+        },
+      ]);
     });
 
     it('prefers high over the app-server default when the model supports it', () => {
@@ -443,7 +559,7 @@ describe('CodexChatUIConfig', () => {
   });
 
   describe('isDefaultModel', () => {
-    it('should return true for built-in models', () => {
+    it('identifies Codex model names for provider routing', () => {
       expect(codexChatUIConfig.isDefaultModel(TEST_CODEX_MODEL)).toBe(true);
       expect(codexChatUIConfig.isDefaultModel('gpt-5.4-mini')).toBe(true);
     });

@@ -1,12 +1,23 @@
 // Chat types
 export {
   type ChatMessage,
+  type CitationEntry,
+  type CitationGroup,
   type ContentBlock,
   type Conversation,
   type ConversationMeta,
+  type ConversationModelRecoverySource,
+  type ExecutionInputBrowserSnapshot,
+  type ExecutionInputCanvasSnapshot,
+  type ExecutionInputContextSnapshot,
+  type ExecutionInputCurrentNoteSnapshot,
+  type ExecutionInputCursorSnapshot,
+  type ExecutionInputEditorSnapshot,
+  type ExecutionInputSnapshot,
   type ForkSource,
   type ImageAttachment,
   type ImageMediaType,
+  isCanonicalUserMessage,
   type SessionMetadata,
   type StreamChunk,
   type UsageInfo,
@@ -17,6 +28,7 @@ export { type ProviderId } from './provider';
 // Settings and command types
 export {
   type ApprovalDecision,
+  type AuxiliaryContinuityReset,
   type ClaudianSettings,
   type EnvironmentScope,
   type EnvSnippet,
@@ -24,7 +36,10 @@ export {
   type InstructionRefineResult,
   type KeyboardNavigationSettings,
   type PermissionMode,
+  type SessionManagerOrganization,
+  type SessionManagerSort,
   type SlashCommand,
+  type StoredChatModelSelection,
 } from './settings';
 
 // Diff types
@@ -43,10 +58,12 @@ export {
   type AsyncSubagentStatus,
   type ExitPlanModeCallback,
   type ExitPlanModeDecision,
+  type ExitPlanModePresentationOptions,
   type SubagentInfo,
   type SubagentMode,
   type ToolCallInfo,
   type ToolDiffData,
+  type ToolProviderPayload,
 } from './tools';
 
 // Agent types

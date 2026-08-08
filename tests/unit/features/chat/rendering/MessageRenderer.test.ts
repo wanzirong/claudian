@@ -1,17 +1,18 @@
 import '@/providers';
 
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 import { Menu } from 'obsidian';
 
 import {
   TOOL_AGENT_OUTPUT,
   TOOL_APPLY_PATCH,
   TOOL_SPAWN_AGENT,
-  TOOL_TASK,
+  TOOL_SUBAGENT,
   TOOL_WAIT_AGENT,
   TOOL_WRITE_STDIN,
 } from '@/core/tools/toolNames';
 import type { ChatMessage, ImageAttachment } from '@/core/types';
+import { renderCitationGroup } from '@/features/chat/rendering/CitationRenderer';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/rendering/SubagentRenderer';
 import { renderStoredThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
@@ -25,6 +26,9 @@ jest.mock('@/features/chat/rendering/SubagentRenderer', () => ({
 jest.mock('@/features/chat/rendering/ThinkingBlockRenderer', () => ({
   renderStoredThinkingBlock: jest.fn(),
 }));
+jest.mock('@/features/chat/rendering/CitationRenderer', () => ({
+  renderCitationGroup: jest.fn(),
+}));
 jest.mock('@/features/chat/rendering/ToolCallRenderer', () => ({
   renderStoredToolCall: jest.fn(),
 }));
@@ -36,7 +40,7 @@ jest.mock('@/utils/imageEmbed', () => ({
 }));
 jest.mock('@/utils/fileLink', () => ({
   processFileLinks: jest.fn(),
-  registerFileLinkHandler: jest.fn(),
+  registerFileLinkHandler: jest.fn().mockImplementation(() => jest.fn()),
 }));
 
 function createMockComponent() {
@@ -49,10 +53,9 @@ function createMockComponent() {
   };
 }
 
-function mockCapabilities(providerId: 'claude' | 'codex' = 'claude') {
+function mockCapabilities(providerId: 'claude' | 'codex' | 'grok' = 'claude') {
   return () => ({
     providerId,
-    supportsPersistentRuntime: true,
     supportsNativeHistory: providerId === 'claude',
     supportsPlanMode: true,
     supportsRewind: true,
@@ -67,7 +70,7 @@ function mockCapabilities(providerId: 'claude' | 'codex' = 'claude') {
 
 function createRenderer(
   messagesEl?: any,
-  providerId: 'claude' | 'codex' = 'claude',
+  providerId: 'claude' | 'codex' | 'grok' = 'claude',
   settings: Record<string, unknown> = {},
 ) {
   const el = messagesEl ?? createMockEl();
@@ -115,7 +118,9 @@ describe('MessageRenderer', () => {
     expect(emptySpy).toHaveBeenCalled();
     expect(renderStoredSpy).toHaveBeenCalledTimes(1);
     expect(welcomeEl.hasClass('claudian-welcome')).toBe(true);
-    expect(welcomeEl.children[0].textContent).toBe('Hello');
+    expect(welcomeEl.children[0].hasClass('claudian-welcome-brand')).toBe(true);
+    expect(welcomeEl.children[0].textContent).toBe('Claudian');
+    expect(welcomeEl.children[1].textContent).toBe('Hello');
   });
 
   it('renders empty messages list with just welcome element', () => {
@@ -185,6 +190,33 @@ describe('MessageRenderer', () => {
     const interruptedEl = lastChild.children[0];
     expect(interruptedEl.hasClass('claudian-interrupted')).toBe(true);
     expect(interruptedEl.textContent).toBe('Interrupted');
+  });
+
+  it('renders persisted citation content blocks', () => {
+    const messagesEl = createMockEl();
+    const { renderer } = createRenderer(messagesEl, 'codex');
+    const citations = {
+      kind: 'memory' as const,
+      entries: [{
+        path: 'MEMORY.md',
+        lineStart: 10,
+        lineEnd: 12,
+        note: 'Used project conventions',
+      }],
+    };
+
+    renderer.renderStoredMessage({
+      id: 'assistant-citations',
+      role: 'assistant',
+      content: 'Answer',
+      timestamp: Date.now(),
+      contentBlocks: [
+        { type: 'text', content: 'Answer' },
+        { type: 'citations', citations },
+      ],
+    });
+
+    expect(renderCitationGroup).toHaveBeenCalledWith(expect.anything(), citations);
   });
 
   it('upgrades a persisted legacy interruption marker to the typed indicator', async () => {
@@ -511,14 +543,14 @@ describe('MessageRenderer', () => {
         { id: 'read', name: 'Read', input: { file_path: 'notes/test.md' } } as any,
         {
           id: 'sub-1',
-          name: TOOL_TASK,
+          name: TOOL_SUBAGENT,
           input: { description: 'Async subagent' },
           status: 'running',
           subagent: { id: 'sub-1', mode: 'async', status: 'running', toolCalls: [], isExpanded: false },
         } as any,
         {
           id: 'sub-2',
-          name: TOOL_TASK,
+          name: TOOL_SUBAGENT,
           input: { description: 'Sync subagent' },
           status: 'running',
           subagent: { id: 'sub-2', mode: 'sync', status: 'running', toolCalls: [], isExpanded: false },
@@ -868,7 +900,7 @@ describe('MessageRenderer', () => {
       toolCalls: [
         {
           id: 'task-1',
-          name: TOOL_TASK,
+          name: TOOL_SUBAGENT,
           input: { description: 'Run tests' },
           status: 'completed',
           result: 'All passed',
@@ -907,7 +939,7 @@ describe('MessageRenderer', () => {
       toolCalls: [
         {
           id: 'task-async-1',
-          name: TOOL_TASK,
+          name: TOOL_SUBAGENT,
           input: { description: 'Background task', run_in_background: true },
           status: 'completed',
           result: 'Task running',
@@ -954,7 +986,7 @@ describe('MessageRenderer', () => {
       toolCalls: [
         {
           id: 'task-async-structured-1',
-          name: TOOL_TASK,
+          name: TOOL_SUBAGENT,
           input: { description: 'Background task', run_in_background: true },
           status: 'completed',
           result: [{ type: 'text', text: '{"status":"running"}' }] as any,
@@ -991,7 +1023,7 @@ describe('MessageRenderer', () => {
       toolCalls: [
         {
           id: 'task-hint-1',
-          name: TOOL_TASK,
+          name: TOOL_SUBAGENT,
           input: { description: 'Background task from block hint' },
           status: 'running',
           subagent: {
@@ -1566,13 +1598,13 @@ describe('MessageRenderer', () => {
   });
 
   // ============================================
-  // Task tool rendering - error and running status
+  // Agent tool rendering - error and running status
   // ============================================
 
-  describe('Task tool rendering - error and running status', () => {
-    it('renders Task tool with error status as subagent with status error', () => {
+  describe('Agent tool rendering - error and running status', () => {
+    it('renders Agent tool with error status as subagent with status error', () => {
       const messagesEl = createMockEl();
-      const { renderer } = createRenderer(messagesEl, 'codex');
+      const { renderer } = createRenderer(messagesEl);
 
       (renderStoredSubagent as jest.Mock).mockClear();
 
@@ -1584,7 +1616,7 @@ describe('MessageRenderer', () => {
         toolCalls: [
           {
             id: 'task-err',
-            name: TOOL_TASK,
+            name: TOOL_SUBAGENT,
             input: { description: 'Failing task' },
             status: 'error',
             result: 'Something went wrong',
@@ -1608,9 +1640,9 @@ describe('MessageRenderer', () => {
       );
     });
 
-    it('renders Task tool with running status (default case in switch)', () => {
+    it('renders Agent tool with running status (default case in switch)', () => {
       const messagesEl = createMockEl();
-      const { renderer } = createRenderer(messagesEl, 'codex');
+      const { renderer } = createRenderer(messagesEl);
 
       (renderStoredSubagent as jest.Mock).mockClear();
 
@@ -1622,7 +1654,7 @@ describe('MessageRenderer', () => {
         toolCalls: [
           {
             id: 'task-run',
-            name: TOOL_TASK,
+            name: TOOL_SUBAGENT,
             input: { description: 'Running task' },
             status: 'pending',
           } as any,
@@ -1644,7 +1676,7 @@ describe('MessageRenderer', () => {
       );
     });
 
-    it('renders Task tool with no description uses fallback Subagent task', () => {
+    it('renders Agent tool with no description using the fallback label', () => {
       const messagesEl = createMockEl();
       const { renderer } = createRenderer(messagesEl);
 
@@ -1658,7 +1690,7 @@ describe('MessageRenderer', () => {
         toolCalls: [
           {
             id: 'task-no-desc',
-            name: TOOL_TASK,
+            name: TOOL_SUBAGENT,
             input: {},
             status: 'completed',
             result: 'Done',
@@ -1729,6 +1761,134 @@ describe('MessageRenderer', () => {
         })
       );
     });
+
+    it('renders a stored Grok background task with the async subagent renderer', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl, 'grok');
+
+      const msg: ChatMessage = {
+        id: 'm-grok-subagent',
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now(),
+        toolCalls: [
+          {
+            id: 'spawn-1',
+            name: 'spawn_subagent',
+            input: {
+              description: 'Inspect tools',
+              prompt: 'Inspect every mapping.',
+              run_in_background: true,
+              task_id: 'task-1',
+            },
+            status: 'completed',
+            result: 'Spawned task-1',
+          } as any,
+          {
+            id: 'output-1',
+            name: 'get_command_or_subagent_output',
+            input: { task_ids: ['task-1'] },
+            providerPayload: {
+              rawName: 'get_command_or_subagent_output',
+              rawOutput: {
+                Result: [{ output: 'All mappings verified.', status: 'completed', task_id: 'task-1' }],
+                type: 'task_output',
+              },
+            },
+            status: 'completed',
+            result: 'All mappings verified.',
+          } as any,
+        ],
+        contentBlocks: [{ type: 'tool_use', toolId: 'spawn-1' } as any],
+      };
+
+      renderer.renderStoredMessage(msg);
+
+      expect(renderStoredAsyncSubagent).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          asyncStatus: 'completed',
+          description: 'Inspect tools',
+          mode: 'async',
+          result: 'All mappings verified.',
+          status: 'completed',
+        }),
+      );
+      expect(renderStoredSubagent).not.toHaveBeenCalled();
+      expect(renderStoredToolCall).not.toHaveBeenCalled();
+    });
+
+    it('renders Grok output calls that target background commands', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl, 'grok');
+      const outputToolCall = {
+        id: 'output-command',
+        name: 'get_command_or_subagent_output',
+        input: { task_id: 'command-1' },
+        status: 'completed',
+        result: 'Command finished.',
+      } as any;
+      const msg: ChatMessage = {
+        id: 'm-grok-command-output',
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now(),
+        toolCalls: [outputToolCall],
+        contentBlocks: [{ type: 'tool_use', toolId: 'output-command' } as any],
+      };
+
+      renderer.renderStoredMessage(msg);
+
+      expect(renderStoredToolCall).toHaveBeenCalledWith(
+        expect.anything(),
+        outputToolCall,
+        expect.anything(),
+      );
+    });
+
+    it('renders stored Grok output calls with mixed command and subagent targets', () => {
+      const messagesEl = createMockEl();
+      const { renderer } = createRenderer(messagesEl, 'grok');
+      const outputToolCall = {
+        id: 'output-mixed',
+        name: 'get_command_or_subagent_output',
+        input: { task_ids: ['task-1', 'command-1'] },
+        status: 'completed',
+        result: 'Subagent and command finished.',
+      } as any;
+      const msg: ChatMessage = {
+        id: 'm-grok-mixed-output',
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now(),
+        toolCalls: [
+          {
+            id: 'spawn-1',
+            name: 'spawn_subagent',
+            input: {
+              description: 'Inspect tools',
+              run_in_background: true,
+              task_id: 'task-1',
+            },
+            status: 'completed',
+            result: 'Spawned task-1',
+          } as any,
+          outputToolCall,
+        ],
+        contentBlocks: [
+          { type: 'tool_use', toolId: 'spawn-1' } as any,
+          { type: 'tool_use', toolId: 'output-mixed' } as any,
+        ],
+      };
+
+      renderer.renderStoredMessage(msg);
+
+      expect(renderStoredToolCall).toHaveBeenCalledWith(
+        expect.anything(),
+        outputToolCall,
+        expect.anything(),
+      );
+    });
   });
 
   // ============================================
@@ -1766,7 +1926,7 @@ describe('MessageRenderer', () => {
         }),
       };
 
-      return { overlayEl, docListeners, origDocument };
+      return { overlayEl, mockBody, docListeners, origDocument };
     }
 
     it('closeBtn click removes overlay', () => {
@@ -1829,6 +1989,37 @@ describe('MessageRenderer', () => {
         expect(removeSpy).toHaveBeenCalled();
         // After close, the keydown handler should be removed
         expect(document.removeEventListener).toHaveBeenCalledWith('keydown', expect.any(Function));
+      } finally {
+        (globalThis as any).document = origDocument;
+      }
+    });
+
+    it('dispose closes an open overlay and removes its document listener', () => {
+      const { renderer } = createRenderer();
+      const { overlayEl, docListeners, origDocument } = setupDocumentMock();
+
+      try {
+        renderer.showFullImage(image);
+        const removeSpy = jest.spyOn(overlayEl, 'remove');
+
+        renderer.dispose();
+
+        expect(removeSpy).toHaveBeenCalledTimes(1);
+        expect(docListeners.get('keydown')).toEqual([]);
+      } finally {
+        (globalThis as any).document = origDocument;
+      }
+    });
+
+    it('does not acquire another modal after disposal', () => {
+      const { renderer } = createRenderer();
+      const { mockBody, origDocument } = setupDocumentMock();
+
+      try {
+        renderer.dispose();
+        renderer.showFullImage(image);
+
+        expect(mockBody.createDiv).not.toHaveBeenCalled();
       } finally {
         (globalThis as any).document = origDocument;
       }
@@ -2045,6 +2236,35 @@ describe('MessageRenderer', () => {
   // ============================================
 
   describe('renderContent - language label and copy', () => {
+    it('renders fenced languages through inert placeholders and restores highlighting', async () => {
+      const { loadPrism, MarkdownRenderer } = await import('obsidian');
+      const { renderer } = createRenderer();
+      const el = createMockEl();
+      const highlightElement = jest.fn();
+      let code: ReturnType<typeof createMockEl> | null = null;
+      (loadPrism as jest.Mock).mockResolvedValueOnce({ highlightElement });
+
+      (MarkdownRenderer.renderMarkdown as jest.Mock).mockImplementationOnce(
+        async (renderedMarkdown: string, container: any) => {
+          const language = renderedMarkdown.match(/^```([^\n]+)/)?.[1];
+          const pre = container.createEl('pre');
+          code = pre.createEl('code', {
+            cls: `language-${language}`,
+            text: 'TABLE file.name',
+          });
+        }
+      );
+
+      await renderer.renderContent(el, '```dataview\nTABLE file.name\n```');
+
+      const renderedMarkdown = (MarkdownRenderer.renderMarkdown as jest.Mock).mock.calls[0][0];
+      expect(renderedMarkdown).toContain('```claudian-display-only-fence-0');
+      expect(renderedMarkdown).not.toContain('```dataview');
+      expect(code?.hasClass('language-dataview')).toBe(true);
+      expect(code?.hasClass('language-claudian-display-only-fence-0')).toBe(false);
+      expect(highlightElement).toHaveBeenCalledWith(code);
+    });
+
     it('should add language label when code block has language class', async () => {
       const { MarkdownRenderer } = await import('obsidian');
       const { renderer } = createRenderer();

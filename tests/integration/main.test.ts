@@ -1,10 +1,31 @@
 
+import { TFile, TFolder } from 'obsidian';
+
+import { ConversationPersistenceStore } from '@/core/bootstrap/ConversationPersistenceStore';
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
+import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import { isVersionedRuntimeInputFingerprint } from '@/core/providers/settings/RuntimeInputFingerprint';
 import { TOOL_SUBAGENT } from '@/core/tools/toolNames';
-import { VIEW_TYPE_CLAUDIAN } from '@/core/types';
+import { type Conversation, VIEW_TYPE_CLAUDIAN } from '@/core/types';
 import * as sdkSession from '@/providers/claude/history/ClaudeHistoryStore';
 import { SessionStorage } from '@/providers/claude/storage/SessionStorage';
 import { DEFAULT_SETTINGS } from '@/providers/claude/types/settings';
+import { CodexModelCatalogCoordinator } from '@/providers/codex/runtime/CodexModelCatalogCoordinator';
+import {
+  getCodexProviderSettings,
+  updateCodexProviderSettings,
+} from '@/providers/codex/settings';
+import { computeGrokEnvironmentHash } from '@/providers/grok/env/GrokSettingsReconciler';
+import { GrokCliResolver } from '@/providers/grok/runtime/GrokCliResolver';
+import { GrokModelCatalogCoordinator } from '@/providers/grok/runtime/GrokModelCatalogCoordinator';
+import { GrokModelCatalogService } from '@/providers/grok/runtime/GrokModelCatalogService';
+import {
+  getGrokProviderSettings,
+  updateCurrentGrokCatalog,
+  updateGrokProviderSettings,
+} from '@/providers/grok/settings';
+import { getHostnameKey } from '@/utils/env';
 
 // Mock fs for ClaudianService
 jest.mock('fs');
@@ -27,6 +48,36 @@ describe('ClaudianPlugin', () => {
     }
 
     return call[0];
+  }
+
+  function getConversationPersistence(
+    target: ClaudianPlugin,
+  ): ConversationPersistenceStore {
+    return (
+      target.storage as typeof target.storage & {
+        conversationPersistence: ConversationPersistenceStore;
+      }
+    ).conversationPersistence;
+  }
+
+  function mockMetadataSources(
+    ...metadata: Array<{
+      id: string;
+      providerId: 'claude' | 'codex';
+      title: string;
+      createdAt: number;
+      lastActivityAt: number;
+      [key: string]: unknown;
+    }>
+  ): jest.SpyInstance {
+    const metadataById = new Map(metadata.map(item => [item.id, item]));
+    return jest.spyOn(SessionStorage.prototype, 'load')
+      .mockImplementation(async (id) => {
+        const item = metadataById.get(id);
+        return item
+          ? { metadata: item, needsMigration: false, source: 'current' as const }
+          : null;
+      });
   }
 
   function installVaultFiles(initialFiles: Record<string, string>): Map<string, string> {
@@ -70,6 +121,7 @@ describe('ClaudianPlugin', () => {
 
     mockApp = {
       vault: {
+        on: jest.fn().mockReturnValue({ id: 'vault-event' }),
         adapter: {
           basePath: '/test/vault',
           exists: jest.fn().mockResolvedValue(false),
@@ -83,6 +135,7 @@ describe('ClaudianPlugin', () => {
         },
       },
       workspace: {
+        on: jest.fn().mockReturnValue({ id: 'workspace-event' }),
         onLayoutReady: jest.fn(),
         getLeavesOfType: jest.fn().mockReturnValue([]),
         getRightLeaf: jest.fn().mockReturnValue({
@@ -150,7 +203,17 @@ describe('ClaudianPlugin', () => {
       });
     });
 
-    it('loads restored-tab metadata without waiting for the full history scan', async () => {
+    it('registers the file explorer context menu', async () => {
+      await plugin.onload();
+
+      expect(mockApp.workspace.on).toHaveBeenCalledWith(
+        'file-menu',
+        expect.any(Function),
+      );
+      expect(plugin.registerEvent).toHaveBeenCalledWith({ id: 'workspace-event' });
+    });
+
+    it('loads only current-tab metadata before the full history scan', async () => {
       type EmptyMetadataScan = {
         metadata: [];
         complete: true;
@@ -165,12 +228,16 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Restored conversation',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
       };
       const listSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
         .mockReturnValue(historyScan);
-      const loadSpy = jest.spyOn(SessionStorage.prototype, 'loadMetadata')
-        .mockResolvedValue(restoredMetadata);
+      const loadSourceSpy = jest.spyOn(SessionStorage.prototype, 'load')
+        .mockResolvedValue({
+          metadata: restoredMetadata,
+          needsMigration: false,
+          source: 'current',
+        });
       (plugin.loadData as jest.Mock).mockResolvedValue({
         tabManagerState: {
           openTabs: [{ tabId: 'tab-1', conversationId: restoredMetadata.id }],
@@ -186,11 +253,11 @@ describe('ClaudianPlugin', () => {
       finishHistoryScan({ metadata: [], complete: true, invalidMetadataCount: 0 });
       await onloadPromise;
       const cachedConversation = plugin.getCachedConversation(restoredMetadata.id);
-      const didLoadRestoredMetadata = loadSpy.mock.calls.some(
+      const didLoadRestoredMetadata = loadSourceSpy.mock.calls.some(
         ([id]) => id === restoredMetadata.id,
       );
       listSpy.mockRestore();
-      loadSpy.mockRestore();
+      loadSourceSpy.mockRestore();
 
       expect(completedBeforeHistoryScan).toBe(true);
       expect(didLoadRestoredMetadata).toBe(true);
@@ -204,7 +271,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Background conversation',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
       };
       mockApp.workspace.onLayoutReady = jest.fn((callback: () => void) => {
         layoutReady = callback;
@@ -215,6 +282,7 @@ describe('ClaudianPlugin', () => {
           complete: true,
           invalidMetadataCount: 0,
         });
+      const loadSourceSpy = mockMetadataSources(backgroundMetadata);
 
       await plugin.onload();
       const beforeLayoutReady = plugin.getCachedConversation(backgroundMetadata.id);
@@ -226,10 +294,196 @@ describe('ClaudianPlugin', () => {
       const afterBackgroundLoad = plugin.getCachedConversation(backgroundMetadata.id);
       const listCallCount = listSpy.mock.calls.length;
       listSpy.mockRestore();
+      loadSourceSpy.mockRestore();
 
       expect(beforeLayoutReady).toBeNull();
       expect(listCallCount).toBe(1);
       expect(afterBackgroundLoad?.title).toBe(backgroundMetadata.title);
+    });
+
+    it('publishes deferred model fallbacks only after their metadata write is durable', async () => {
+      const deferredMetadata = {
+        id: 'deferred-retired-model',
+        providerId: 'claude' as const,
+        title: 'Deferred retired model',
+        createdAt: 1,
+        lastActivityAt: 2,
+        selectedModel: 'claude-code/retired-model',
+      };
+      await plugin.onload();
+      const scanSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockImplementation(async (options) => {
+          options?.onBatch?.([deferredMetadata]);
+          return {
+            metadata: [deferredMetadata],
+            complete: true,
+            invalidMetadataCount: 0,
+          };
+        });
+      const loadSourceSpy = mockMetadataSources(deferredMetadata);
+      const notifyConversationListChanged = jest.fn();
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([{
+        notifyConversationListChanged,
+      } as any]);
+      let markWriteStarted!: () => void;
+      const writeStarted = new Promise<void>(resolve => {
+        markWriteStarted = resolve;
+      });
+      let releaseWrite!: () => void;
+      const writeRelease = new Promise<void>(resolve => {
+        releaseWrite = resolve;
+      });
+      const saveSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata')
+        .mockImplementation(async (metadata) => {
+          if (metadata.id === deferredMetadata.id) {
+            markWriteStarted();
+            await writeRelease;
+          }
+        });
+
+      const load = (plugin as any).loadRemainingSessionMetadata();
+      await writeStarted;
+      expect(notifyConversationListChanged).not.toHaveBeenCalled();
+
+      releaseWrite();
+      await load;
+
+      expect(plugin.getCachedConversation(deferredMetadata.id)?.selectedModel).toBe('opus');
+      expect(notifyConversationListChanged).toHaveBeenCalledTimes(1);
+      scanSpy.mockRestore();
+      loadSourceSpy.mockRestore();
+      saveSpy.mockRestore();
+    });
+
+    it('migrates legacy metadata through the repository after a read-only scan', async () => {
+      const legacyMetadata = {
+        id: 'legacy-background-conversation',
+        providerId: 'claude' as const,
+        title: 'Legacy background conversation',
+        createdAt: 1,
+        lastActivityAt: 2,
+      };
+      const events: string[] = [];
+
+      await plugin.onload();
+      const scanSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockImplementation(async () => {
+          events.push('scan');
+          return {
+            metadata: [legacyMetadata],
+            complete: true,
+            invalidMetadataCount: 0,
+          };
+        });
+      const loadSpy = jest.spyOn(SessionStorage.prototype, 'load')
+        .mockResolvedValue({
+          metadata: legacyMetadata,
+          needsMigration: false,
+          source: 'legacy',
+        });
+      const persistence = getConversationPersistence(plugin);
+      const saveSpy = jest.spyOn(persistence, 'saveMetadata')
+        .mockImplementation(async () => {
+          events.push('save-current');
+        });
+      const deleteLegacySpy = jest.spyOn(persistence, 'deleteLegacyMetadata')
+        .mockImplementation(async () => {
+          events.push('delete-legacy');
+        });
+
+      await (plugin as any).loadRemainingSessionMetadata();
+
+      expect(events).toEqual(['scan', 'save-current', 'delete-legacy']);
+      expect(plugin.getCachedConversation(legacyMetadata.id)?.title)
+        .toBe(legacyMetadata.title);
+
+      scanSpy.mockRestore();
+      loadSpy.mockRestore();
+      saveSpy.mockRestore();
+      deleteLegacySpy.mockRestore();
+    });
+
+    it('recovers missing model metadata after the background session scan', async () => {
+      await plugin.onload();
+      const scanSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockResolvedValue({
+          metadata: [],
+          complete: true,
+          invalidMetadataCount: 0,
+        });
+      const repository = (plugin as any).conversationRepository;
+      const recoverySpy = jest.spyOn(repository, 'recoverMissingSelectedModels')
+        .mockResolvedValue([]);
+
+      await (plugin as any).loadRemainingSessionMetadata();
+
+      expect(recoverySpy).toHaveBeenCalledTimes(1);
+
+      scanSpy.mockRestore();
+      recoverySpy.mockRestore();
+    });
+
+    it('recovers models from original metadata before persisting session invalidation', async () => {
+      const metadata = {
+        id: 'codex-model-before-invalidation',
+        providerId: 'codex' as const,
+        title: 'Codex model before invalidation',
+        createdAt: 1,
+        lastActivityAt: 2,
+        sessionId: 'thread-before-invalidation',
+        providerState: { threadId: 'thread-before-invalidation' },
+      };
+      await plugin.onload();
+      (plugin as any).pendingEnvironmentInvalidationGenerations.set('codex', 1);
+      const scanSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockResolvedValue({
+          metadata: [metadata],
+          complete: true,
+          invalidMetadataCount: 0,
+        });
+      const loadSpy = mockMetadataSources(metadata);
+      const repository = (plugin as any).conversationRepository;
+      const registeredSources: Conversation[] = [];
+      const originalRegister = repository.registerHistoricalModelRecoverySources
+        .bind(repository);
+      const registerSpy = jest.spyOn(repository, 'registerHistoricalModelRecoverySources')
+        .mockImplementation((...args: unknown[]) => {
+          const sources = args[0] as readonly Conversation[];
+          registeredSources.push(...sources);
+          originalRegister(sources);
+        });
+      const events: string[] = [];
+      const persistedRecoverySources: unknown[] = [];
+      const recoverySpy = jest.spyOn(repository, 'recoverMissingSelectedModels')
+        .mockImplementation(async () => {
+          events.push('recover');
+          return [];
+        });
+      const persistSpy = jest.spyOn(repository, 'persistConversations')
+        .mockImplementation(async (...args: unknown[]) => {
+          const conversations = args[0] as readonly Conversation[];
+          events.push(`persist:${String(conversations[0]?.sessionId)}`);
+          persistedRecoverySources.push(conversations[0]?.modelRecoverySource);
+        });
+
+      await (plugin as any).loadRemainingSessionMetadata();
+
+      expect(registeredSources).toContainEqual(expect.objectContaining({
+        id: metadata.id,
+        sessionId: 'thread-before-invalidation',
+        providerState: { threadId: 'thread-before-invalidation' },
+      }));
+      expect(events).toEqual(['recover', 'persist:null']);
+      expect(persistedRecoverySources).toEqual([{
+        sessionId: 'thread-before-invalidation',
+        providerState: { threadId: 'thread-before-invalidation' },
+      }]);
+
+      scanSpy.mockRestore();
+      loadSpy.mockRestore();
+      registerSpy.mockRestore();
+      recoverySpy.mockRestore();
+      persistSpy.mockRestore();
     });
 
     it('invalidates restored and deferred sessions after a provider environment change', async () => {
@@ -238,7 +492,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Restored environment session',
         createdAt: 1,
-        updatedAt: 3,
+        lastActivityAt: 3,
         sessionId: 'restored-session-id',
         providerState: { providerSessionId: 'restored-provider-session-id' },
         resumeAtMessageId: 'restored-message-id',
@@ -248,7 +502,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Deferred environment session',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
         sessionId: 'deferred-session-id',
         providerState: { providerSessionId: 'deferred-provider-session-id' },
         resumeAtMessageId: 'deferred-message-id',
@@ -286,6 +540,10 @@ describe('ClaudianPlugin', () => {
             invalidMetadataCount: 0,
           };
         });
+      const loadSourceSpy = mockMetadataSources(
+        restoredMetadata,
+        deferredMetadata,
+      );
 
       await plugin.onload();
       await (plugin as any).loadRemainingSessionMetadata();
@@ -294,17 +552,89 @@ describe('ClaudianPlugin', () => {
       const deferred = plugin.getCachedConversation(deferredMetadata.id);
       loadSpy.mockRestore();
       listSpy.mockRestore();
+      loadSourceSpy.mockRestore();
 
       expect(restored).toEqual(expect.objectContaining({
         sessionId: null,
-        providerState: undefined,
+        providerState: {
+          previousProviderSessionIds: ['restored-provider-session-id'],
+        },
+        resumeAtMessageId: 'restored-message-id',
       }));
-      expect(restored).not.toHaveProperty('resumeAtMessageId');
       expect(deferred).toEqual(expect.objectContaining({
         sessionId: null,
-        providerState: undefined,
+        providerState: {
+          previousProviderSessionIds: ['deferred-provider-session-id'],
+        },
+        resumeAtMessageId: 'deferred-message-id',
       }));
-      expect(deferred).not.toHaveProperty('resumeAtMessageId');
+    });
+
+    it('preserves restored and deferred sessions for a reload-policy environment change', async () => {
+      const restoredMetadata = {
+        id: 'restored-reload-session',
+        providerId: 'claude' as const,
+        title: 'Restored reload session',
+        createdAt: 1,
+        lastActivityAt: 3,
+        sessionId: 'restored-session-id',
+        providerState: { providerSessionId: 'restored-provider-session-id' },
+      };
+      const deferredMetadata = {
+        id: 'deferred-reload-session',
+        providerId: 'claude' as const,
+        title: 'Deferred reload session',
+        createdAt: 1,
+        lastActivityAt: 2,
+        sessionId: 'deferred-session-id',
+        providerState: { providerSessionId: 'deferred-provider-session-id' },
+      };
+      (plugin.loadData as jest.Mock).mockResolvedValue({
+        tabManagerState: {
+          openTabs: [{ tabId: 'tab-1', conversationId: restoredMetadata.id }],
+          activeTabId: 'tab-1',
+        },
+      });
+      const loadSpy = jest.spyOn(SessionStorage.prototype, 'loadMetadata')
+        .mockResolvedValue(restoredMetadata);
+      const listSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockImplementation(async (options) => {
+          options?.onBatch?.([restoredMetadata, deferredMetadata]);
+          return {
+            metadata: [restoredMetadata, deferredMetadata],
+            complete: true,
+            invalidMetadataCount: 0,
+          };
+        });
+      const loadSourceSpy = mockMetadataSources(
+        restoredMetadata,
+        deferredMetadata,
+      );
+      const claudeReconciler = ProviderRegistry.getSettingsReconciler('claude');
+      const reconcileSpy = jest.spyOn(claudeReconciler, 'reconcileModelWithEnvironment')
+        .mockReturnValue({ changed: true, invalidatedConversations: [] });
+      claudeReconciler.environmentSessionPolicy = 'reload';
+
+      try {
+        await plugin.onload();
+        await (plugin as any).loadRemainingSessionMetadata();
+      } finally {
+        delete claudeReconciler.environmentSessionPolicy;
+        reconcileSpy.mockRestore();
+        loadSpy.mockRestore();
+        listSpy.mockRestore();
+        loadSourceSpy.mockRestore();
+      }
+
+      expect(plugin.getCachedConversation(restoredMetadata.id)).toEqual(expect.objectContaining({
+        sessionId: 'restored-session-id',
+        providerState: { providerSessionId: 'restored-provider-session-id' },
+      }));
+      expect(plugin.getCachedConversation(deferredMetadata.id)).toEqual(expect.objectContaining({
+        sessionId: 'deferred-session-id',
+        providerState: { providerSessionId: 'deferred-provider-session-id' },
+      }));
+      expect(plugin.settings.pendingProviderSessionInvalidations.claude).toBeUndefined();
     });
 
     it('invalidates later metadata batches when the environment changes during the scan', async () => {
@@ -313,7 +643,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'First scanned session',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
         sessionId: 'first-session-id',
         providerState: { providerSessionId: 'first-provider-session-id' },
       };
@@ -322,7 +652,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Later scanned session',
         createdAt: 1,
-        updatedAt: 1,
+        lastActivityAt: 1,
         sessionId: 'later-session-id',
         providerState: { providerSessionId: 'later-provider-session-id' },
       };
@@ -348,6 +678,7 @@ describe('ClaudianPlugin', () => {
             invalidMetadataCount: 0,
           };
         });
+      const loadSourceSpy = mockMetadataSources(firstMetadata, laterMetadata);
 
       const load = (plugin as any).loadRemainingSessionMetadata();
       await firstBatchPublished;
@@ -362,11 +693,16 @@ describe('ClaudianPlugin', () => {
       const first = plugin.getCachedConversation(firstMetadata.id);
       const later = plugin.getCachedConversation(laterMetadata.id);
       listSpy.mockRestore();
+      loadSourceSpy.mockRestore();
 
       expect(first?.sessionId).toBeNull();
-      expect(first?.providerState).toBeUndefined();
+      expect(first?.providerState).toEqual({
+        previousProviderSessionIds: ['first-provider-session-id'],
+      });
       expect(later?.sessionId).toBeNull();
-      expect(later?.providerState).toBeUndefined();
+      expect(later?.providerState).toEqual({
+        previousProviderSessionIds: ['later-provider-session-id'],
+      });
       expect(pendingGeneration).toEqual(expect.any(Number));
       expect(plugin.settings.pendingProviderSessionInvalidations.claude)
         .toBeUndefined();
@@ -378,7 +714,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Pending environment write session',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
         sessionId: 'pending-environment-write-session-id',
         providerState: { providerSessionId: 'pending-environment-write-provider-session-id' },
       };
@@ -387,7 +723,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Later environment write session',
         createdAt: 1,
-        updatedAt: 1,
+        lastActivityAt: 1,
         sessionId: 'later-environment-write-session-id',
         providerState: { providerSessionId: 'later-environment-write-provider-session-id' },
       };
@@ -422,7 +758,7 @@ describe('ClaudianPlugin', () => {
           };
         });
       let blockedEnvironmentWrite = false;
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata')
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata')
         .mockImplementation(async () => {
           if (!blockedEnvironmentWrite) {
             blockedEnvironmentWrite = true;
@@ -463,7 +799,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Incomplete scan session',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
         sessionId: 'incomplete-scan-session-id',
         providerState: { providerSessionId: 'incomplete-scan-provider-session-id' },
       };
@@ -515,7 +851,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Deleted background conversation',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
       };
 
       await plugin.onload();
@@ -533,11 +869,11 @@ describe('ClaudianPlugin', () => {
         ProviderSettingsCoordinator,
         'invalidateConversationSessions',
       ).mockImplementation((conversations) => [...conversations]);
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata');
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata');
 
       const load = (plugin as any).loadRemainingSessionMetadata();
       await batchPublished;
-      await plugin.deleteConversation(backgroundMetadata.id, { deleteProviderSession: false });
+      await plugin.deleteConversation(backgroundMetadata.id);
       saveMetadataSpy.mockClear();
       finishScan();
       await load;
@@ -552,6 +888,71 @@ describe('ClaudianPlugin', () => {
       expect(plugin.getCachedConversation(backgroundMetadata.id)).toBeNull();
     });
 
+    it('suppresses metadata tombstoned after scanning but before source resolution', async () => {
+      const tombstonedMetadata = {
+        id: 'tombstoned-during-source-resolution',
+        providerId: 'claude' as const,
+        title: 'Tombstoned during source resolution',
+        createdAt: 1,
+        lastActivityAt: 2,
+      };
+
+      await plugin.onload();
+      const scanSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockImplementation(async (options) => {
+          options?.onBatch?.([tombstonedMetadata]);
+          return {
+            metadata: [tombstonedMetadata],
+            complete: true,
+            invalidMetadataCount: 0,
+          };
+        });
+      const loadSpy = jest.spyOn(SessionStorage.prototype, 'load')
+        .mockResolvedValue(null);
+
+      await (plugin as any).loadRemainingSessionMetadata();
+
+      expect(loadSpy).toHaveBeenCalledWith(tombstonedMetadata.id);
+      expect(plugin.getCachedConversation(tombstonedMetadata.id)).toBeNull();
+
+      scanSpy.mockRestore();
+      loadSpy.mockRestore();
+    });
+
+    it('suppresses an already cached shell tombstoned during source resolution', async () => {
+      const tombstonedMetadata = {
+        id: 'cached-shell-tombstoned-during-source-resolution',
+        providerId: 'claude' as const,
+        title: 'Cached shell tombstoned during source resolution',
+        createdAt: 1,
+        lastActivityAt: 2,
+      };
+
+      await plugin.onload();
+      const shell = (plugin as any).createConversationMetadataShell(
+        tombstonedMetadata,
+      );
+      (plugin as any).conversationRepository.mergeMetadataConversations([shell]);
+      const scanSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockImplementation(async (options) => {
+          options?.onBatch?.([tombstonedMetadata]);
+          return {
+            metadata: [tombstonedMetadata],
+            complete: true,
+            invalidMetadataCount: 0,
+          };
+        });
+      const loadSpy = jest.spyOn(SessionStorage.prototype, 'load')
+        .mockResolvedValue(null);
+
+      await (plugin as any).loadRemainingSessionMetadata();
+
+      expect(plugin.getCachedConversation(tombstonedMetadata.id)).toBeNull();
+
+      scanSpy.mockRestore();
+      loadSpy.mockRestore();
+    });
+
     it('retries a pending provider invalidation after unload and restart', async () => {
       const settingsPath = '.claudian/claudian-settings.json';
       const deferredMetadata = {
@@ -559,7 +960,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Restart deferred session',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
         sessionId: 'restart-session-id',
         providerState: { providerSessionId: 'restart-provider-session-id' },
       };
@@ -583,6 +984,10 @@ describe('ClaudianPlugin', () => {
       plugin.onunload();
       const restartedPlugin = new ClaudianPlugin(mockApp, mockManifest);
       (restartedPlugin.loadData as jest.Mock).mockResolvedValue({});
+      const restartedSaveMetadataSpy = jest.spyOn(
+        ConversationPersistenceStore.prototype,
+        'saveMetadata',
+      );
       const listSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
         .mockImplementation(async (options) => {
           options?.onBatch?.([deferredMetadata]);
@@ -592,6 +997,7 @@ describe('ClaudianPlugin', () => {
             invalidMetadataCount: 0,
           };
         });
+      const loadSourceSpy = mockMetadataSources(deferredMetadata);
 
       await restartedPlugin.onload();
       await (restartedPlugin as any).loadRemainingSessionMetadata();
@@ -601,13 +1007,23 @@ describe('ClaudianPlugin', () => {
         files.get('.claudian/sessions/restart-deferred-session.meta.json') ?? '{}',
       );
       const restartedSettings = JSON.parse(files.get(settingsPath) ?? '{}');
+      const deferredInvalidationWrites = restartedSaveMetadataSpy.mock.calls.filter(
+        ([metadata]) => metadata.id === deferredMetadata.id,
+      );
       listSpy.mockRestore();
+      loadSourceSpy.mockRestore();
+      restartedSaveMetadataSpy.mockRestore();
 
       expect(restartedConversation?.sessionId).toBeNull();
-      expect(restartedConversation?.providerState).toBeUndefined();
+      expect(restartedConversation?.providerState).toEqual({
+        previousProviderSessionIds: ['restart-provider-session-id'],
+      });
       expect(persistedMetadata.sessionId).toBeNull();
-      expect(persistedMetadata).not.toHaveProperty('providerState');
+      expect(persistedMetadata.providerState).toEqual({
+        previousProviderSessionIds: ['restart-provider-session-id'],
+      });
       expect(restartedSettings.pendingProviderSessionInvalidations?.claude).toBeUndefined();
+      expect(deferredInvalidationWrites).toHaveLength(1);
     });
 
     it('keeps a pending provider invalidation when a metadata write fails', async () => {
@@ -618,7 +1034,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude' as const,
         title: 'Failed write session',
         createdAt: 1,
-        updatedAt: 2,
+        lastActivityAt: 2,
         sessionId: 'failed-write-session-id',
         providerState: { providerSessionId: 'failed-write-provider-session-id' },
       };
@@ -644,7 +1060,8 @@ describe('ClaudianPlugin', () => {
             invalidMetadataCount: 0,
           };
         });
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata')
+      const loadSourceSpy = mockMetadataSources(deferredMetadata);
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata')
         .mockRejectedValueOnce(new Error('metadata write failed'));
       (plugin as any).pendingSessionMetadataScan = false;
 
@@ -655,6 +1072,7 @@ describe('ClaudianPlugin', () => {
         loadError = error;
       }
       listSpy.mockRestore();
+      loadSourceSpy.mockRestore();
       saveMetadataSpy.mockRestore();
 
       expect(loadError).toEqual(new Error('metadata write failed'));
@@ -681,16 +1099,25 @@ describe('ClaudianPlugin', () => {
       expect(() => plugin.onunload()).not.toThrow();
     });
 
-    it('keeps the latest open-tab snapshot when views are not closed first', async () => {
+    it('disposes the application execution lifecycle registry', async () => {
       await plugin.onload();
-      const state = {
-        openTabs: [{ tabId: 'tab-1', conversationId: 'conversation-1' }],
-        activeTabId: 'tab-1',
-      };
-      const persistSpy = jest.spyOn(plugin, 'persistTabManagerState').mockResolvedValue(undefined);
+      const disposeSpy = jest.spyOn(
+        plugin.executionLifecycleRegistry,
+        'dispose',
+      );
+
+      plugin.onunload();
+      await Promise.resolve();
+
+      expect(disposeSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('flushes the current tab identity when views are not closed first', async () => {
+      await plugin.onload();
+      const flushCurrentTabState = jest.fn().mockResolvedValue(undefined);
       mockApp.workspace.getLeavesOfType.mockReturnValue([{
         view: {
-          getPersistedTabState: jest.fn().mockReturnValue(state),
+          flushCurrentTabState,
           getTabManager: jest.fn(),
         },
       }]);
@@ -699,7 +1126,7 @@ describe('ClaudianPlugin', () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(persistSpy).toHaveBeenCalledWith(state);
+      expect(flushCurrentTabState).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -811,6 +1238,27 @@ describe('ClaudianPlugin', () => {
 
       expect(plugin.settings.userName).toBe('TestUser');
       expect(plugin.settings.hiddenProviderCommands).toEqual(DEFAULT_SETTINGS.hiddenProviderCommands);
+    });
+
+    it('normalizes the concurrent running session limit to 5-10', async () => {
+      mockApp.vault.adapter.exists.mockImplementation(async (path: string) => (
+        path === '.claudian/claudian-settings.json'
+      ));
+      mockApp.vault.adapter.read.mockImplementation(async (path: string) => {
+        if (path === '.claudian/claudian-settings.json') {
+          return JSON.stringify({ maxWarmAgentProcesses: 3 });
+        }
+        return '';
+      });
+
+      await plugin.loadSettings();
+
+      expect(plugin.settings.maxWarmAgentProcesses).toBe(5);
+      const writeCall = (mockApp.vault.adapter.write as jest.Mock).mock.calls.filter(
+        ([path]) => path === '.claudian/claudian-settings.json',
+      ).at(-1);
+      expect(writeCall).toBeDefined();
+      expect(JSON.parse(writeCall[1]).maxWarmAgentProcesses).toBe(5);
     });
 
     it('should strip legacy blocklist fields when loading old settings', async () => {
@@ -939,7 +1387,590 @@ describe('ClaudianPlugin', () => {
     });
   });
 
+  describe('notifyProviderChatOptionsChanged', () => {
+    it('reconciles durable conversation models before refreshing views', async () => {
+      await plugin.onload();
+      const events: string[] = [];
+      const repository = (plugin as any).conversationRepository;
+      jest.spyOn(repository, 'reconcileSelectedModels').mockImplementation(async () => {
+        events.push('reconcile');
+        return [];
+      });
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([{
+        refreshModelSelector: jest.fn(() => events.push('refresh')),
+      } as any]);
+
+      plugin.notifyProviderChatOptionsChanged('claude');
+      await (plugin as any).providerChatOptionsChangeTail;
+
+      expect(events).toEqual(['reconcile', 'refresh']);
+    });
+
+    it('does not refresh model selectors when durable reconciliation fails', async () => {
+      await plugin.onload();
+      const repository = (plugin as any).conversationRepository;
+      jest.spyOn(repository, 'reconcileSelectedModels')
+        .mockRejectedValue(new Error('disk full'));
+      const refreshModelSelector = jest.fn();
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([{
+        refreshModelSelector,
+      } as any]);
+
+      plugin.notifyProviderChatOptionsChanged('claude');
+      await (plugin as any).providerChatOptionsChangeTail;
+
+      expect(refreshModelSelector).not.toHaveBeenCalled();
+    });
+  });
+
   describe('applyEnvironmentVariables', () => {
+    it('holds the execution lifecycle transition across the environment settings commit', async () => {
+      await plugin.onload();
+      const events: string[] = [];
+      const unregister = plugin.executionLifecycleRegistry.registerTransitionHook('grok', {
+        beforeTransition: () => {
+          events.push('before');
+        },
+        afterTransition: () => {
+          events.push('after');
+        },
+      });
+      mockApp.vault.adapter.write.mockImplementation(async () => {
+        events.push('write');
+      });
+
+      await plugin.applyEnvironmentVariables('provider:grok', 'GROK_PROFILE=new');
+
+      expect(events).toEqual(['before', 'write', 'after']);
+      expect(plugin.getEnvironmentVariablesForScope('provider:grok')).toBe('GROK_PROFILE=new');
+      unregister();
+    });
+
+    it('reconciles affected conversation models before refreshing after environment changes', async () => {
+      await plugin.onload();
+      const events: string[] = [];
+      const repository = (plugin as any).conversationRepository;
+      jest.spyOn(repository, 'reconcileSelectedModels').mockImplementation(async () => {
+        events.push('reconcile');
+        return [];
+      });
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([{
+        invalidateProviderCommandCaches: jest.fn(() => events.push('invalidate')),
+        refreshModelSelector: jest.fn(() => events.push('refresh')),
+      } as any]);
+
+      await plugin.applyEnvironmentVariables(
+        'provider:claude',
+        'ANTHROPIC_MODEL=claude-sonnet-enterprise',
+      );
+
+      expect(events).toEqual(['invalidate', 'reconcile', 'refresh']);
+      expect(repository.reconcileSelectedModels).toHaveBeenCalledWith('claude');
+    });
+
+    it('lets an initialized transition owner resolve CLI without reinitializing services', async () => {
+      await plugin.onload();
+      const cliResolver = {
+        reset: jest.fn(),
+        resolveFromSettings: jest.fn().mockReturnValue('/owned/codex'),
+      };
+      ProviderWorkspaceRegistry.setServices('codex', { cliResolver });
+
+      await expect(plugin.getResolvedProviderCliPath('codex', {
+        providerTransitionOwner: true,
+      })).resolves.toBe('/owned/codex');
+      expect(cliResolver.resolveFromSettings).toHaveBeenCalledWith(
+        plugin.settings,
+        { providerTransitionOwner: true },
+      );
+    });
+
+    it('does not initialize a cold provider for transition-owner CLI resolution', async () => {
+      await plugin.onload();
+      ProviderWorkspaceRegistry.setServices('grok', undefined);
+      const initialize = jest.fn(async () => ({
+        cliResolver: {
+          reset: jest.fn(),
+          resolveFromSettings: jest.fn().mockReturnValue('/cold/grok'),
+        },
+      }));
+      ProviderWorkspaceRegistry.register('grok', { initialize });
+
+      await expect(plugin.getResolvedProviderCliPath('grok', {
+        providerTransitionOwner: true,
+      })).rejects.toThrow('requires initialized workspace services');
+      expect(initialize).not.toHaveBeenCalled();
+    });
+
+    it('refreshes an initialized Grok catalog through its owned CLI path while gated', async () => {
+      await plugin.onload();
+      updateGrokProviderSettings(plugin.settings, {
+        cliPath: process.execPath,
+        enabled: true,
+      });
+      const runner = {
+        run: jest.fn(async ({ args }: { args: string[] }) => (
+          args[0] === '--version'
+            ? { exitCode: 0, stdout: 'grok 1.0' }
+            : {
+              exitCode: 0,
+              stdout: 'Default model: grok-4.5\nAvailable models:\n  grok-4.5\n',
+            }
+        )),
+      };
+      const service = new GrokModelCatalogService(plugin as any, { runner });
+      const coordinator = new GrokModelCatalogCoordinator(plugin as any, service);
+      const cliResolver = new GrokCliResolver();
+      ProviderWorkspaceRegistry.setServices('grok', {
+        cliResolver,
+        refreshModelCatalog: context => coordinator.refreshModelCatalog(context),
+      });
+
+      const refresh = ProviderWorkspaceRegistry.refreshModelCatalog('grok', {
+        providerTransitionOwner: true,
+      });
+      let refreshed = false;
+      void refresh.then(() => { refreshed = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(refreshed).toBe(true);
+      expect(runner.run).toHaveBeenCalled();
+
+      await refresh;
+    });
+
+    it('computes an initialized Codex catalog fingerprint through owned CLI while gated', async () => {
+      await plugin.onload();
+      const discoveredModel = {
+        defaultReasoningEffort: 'medium',
+        defaultServiceTier: null,
+        description: 'Owned model',
+        displayName: 'Owned model',
+        inputModalities: ['text'] as const,
+        isDefault: true,
+        model: 'owned-model',
+        serviceTiers: [],
+        supportedReasoningEfforts: [],
+      };
+      const discovery = {
+        discoverModels: jest.fn().mockResolvedValue({
+          kind: 'completed',
+          models: [discoveredModel],
+        }),
+      };
+      const coordinator = new CodexModelCatalogCoordinator(plugin as any, discovery);
+      const cliResolver = {
+        reset: jest.fn(),
+        resolveFromSettings: jest.fn().mockReturnValue('/owned/codex'),
+      };
+      ProviderWorkspaceRegistry.setServices('codex', {
+        cliResolver,
+        refreshModelCatalog: context => coordinator.refreshModelCatalog(context),
+      });
+
+      const refresh = ProviderWorkspaceRegistry.refreshModelCatalog('codex', {
+        providerTransitionOwner: true,
+      });
+      let refreshed = false;
+      void refresh.then(() => { refreshed = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(refreshed).toBe(true);
+      expect(discovery.discoverModels).toHaveBeenCalledWith(
+        expect.any(AbortSignal),
+        { providerTransitionOwner: true },
+      );
+      expect(cliResolver.resolveFromSettings).toHaveBeenCalled();
+
+      await refresh;
+    });
+
+    it('recovers the committed environment before surfacing a post-commit publication failure', async () => {
+      await plugin.onload();
+      updateGrokProviderSettings(plugin.settings, {
+        enabled: true,
+        environmentVariables: 'GROK_PROFILE=old',
+      });
+      const publicationError = new Error('post-commit publication failed');
+      const invalidateSpy = jest.spyOn(
+        ProviderSettingsCoordinator,
+        'invalidateConversationSessions',
+      ).mockImplementationOnce(() => {
+        throw publicationError;
+      });
+      const refreshModelCatalog = jest.fn().mockResolvedValue({ changed: false });
+      const refreshAgentMentions = jest.fn().mockResolvedValue(undefined);
+      ProviderWorkspaceRegistry.setServices('grok', {
+        refreshAgentMentions,
+        refreshModelCatalog,
+      });
+      const invalidateProviderCommandCaches = jest.fn();
+      const refreshModelSelector = jest.fn();
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([{
+        invalidateProviderCommandCaches,
+        refreshModelSelector,
+      } as any]);
+      const initialGeneration = plugin.executionLifecycleRegistry
+        .getProviderGeneration('grok');
+
+      try {
+        const firstError = await plugin.applyEnvironmentVariables(
+          'provider:grok',
+          'GROK_PROFILE=committed',
+        ).catch(error => error);
+
+        expect(plugin.getEnvironmentVariablesForScope('provider:grok'))
+          .toBe('GROK_PROFILE=committed');
+        expect(refreshModelCatalog).toHaveBeenCalledTimes(1);
+        expect(refreshModelCatalog).toHaveBeenCalledWith({
+          providerTransitionOwner: true,
+        });
+        expect(refreshAgentMentions).toHaveBeenCalledTimes(1);
+        expect(refreshAgentMentions).toHaveBeenCalledWith({
+          providerTransitionOwner: true,
+        });
+        expect(invalidateProviderCommandCaches).toHaveBeenCalledWith(['grok']);
+        expect(refreshModelSelector).toHaveBeenCalledTimes(1);
+        expect(plugin.executionLifecycleRegistry.getProviderGeneration('grok'))
+          .toBe(initialGeneration + 1);
+        expect(invalidateSpy).toHaveBeenCalledTimes(1);
+        expect(firstError).toBe(publicationError);
+
+        await plugin.applyEnvironmentVariables('provider:grok', 'GROK_PROFILE=next');
+
+        expect(plugin.getEnvironmentVariablesForScope('provider:grok')).toBe('GROK_PROFILE=next');
+        expect(refreshModelCatalog).toHaveBeenCalledTimes(2);
+        expect(plugin.executionLifecycleRegistry.getProviderGeneration('grok'))
+          .toBe(initialGeneration + 2);
+        expect(invalidateSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        invalidateSpy.mockRestore();
+      }
+    });
+
+    it('retains a committed invalidation generation when publication fails before invalidation', async () => {
+      await plugin.onload();
+      (plugin as any).hasLoadedAllSessionMetadata = true;
+      const conversation = await plugin.createConversation({
+        providerId: 'claude',
+        sessionId: 'pre-invalidation-session',
+      });
+      const publicationError = new Error('invalidation publication failed');
+      const invalidateSpy = jest.spyOn(
+        ProviderSettingsCoordinator,
+        'invalidateConversationSessions',
+      ).mockImplementationOnce(() => {
+        throw publicationError;
+      });
+      const initialGeneration = plugin.executionLifecycleRegistry
+        .getProviderGeneration('claude');
+
+      try {
+        await expect(plugin.applyEnvironmentVariables(
+          'provider:claude',
+          'ANTHROPIC_BASE_URL=https://publication-failed.example.com',
+        )).rejects.toBe(publicationError);
+
+        const generation = plugin.settings.pendingProviderSessionInvalidations.claude;
+        expect(generation).toEqual(expect.any(Number));
+        expect((plugin as any).pendingEnvironmentInvalidationGenerations.get('claude'))
+          .toBe(generation);
+        expect((plugin as any).blockedEnvironmentInvalidationGenerations.get('claude'))
+          .toBe(generation);
+        expect(conversation.sessionId).toBe('pre-invalidation-session');
+        const persistedFailureSettings = JSON.parse(
+          [...mockApp.vault.adapter.write.mock.calls]
+            .reverse()
+            .find(([path]: [string]) => path === '.claudian/claudian-settings.json')?.[1]
+            ?? '{}',
+        );
+        expect(persistedFailureSettings.pendingProviderSessionInvalidations?.claude)
+          .toBe(generation);
+        expect(plugin.executionLifecycleRegistry.getProviderGeneration('claude'))
+          .toBe(initialGeneration + 1);
+
+        await plugin.applyEnvironmentVariables(
+          'provider:claude',
+          'ANTHROPIC_BASE_URL=https://publication-retry.example.com',
+        );
+
+        expect(conversation.sessionId).toBeNull();
+        expect(plugin.settings.pendingProviderSessionInvalidations.claude).toBeUndefined();
+        expect((plugin as any).pendingEnvironmentInvalidationGenerations.has('claude')).toBe(false);
+        expect((plugin as any).blockedEnvironmentInvalidationGenerations.has('claude')).toBe(false);
+        expect(invalidateSpy).toHaveBeenCalledTimes(2);
+        expect(plugin.executionLifecycleRegistry.getProviderGeneration('claude'))
+          .toBe(initialGeneration + 2);
+      } finally {
+        invalidateSpy.mockRestore();
+      }
+    });
+
+    it('keeps invalidation pending until every invalidated metadata write succeeds', async () => {
+      await plugin.onload();
+      (plugin as any).hasLoadedAllSessionMetadata = true;
+      const first = await plugin.createConversation({
+        providerId: 'claude',
+        sessionId: 'partial-write-first',
+      });
+      const second = await plugin.createConversation({
+        providerId: 'claude',
+        sessionId: 'partial-write-second',
+      });
+      const metadataError = new Error('partial invalidation metadata write failed');
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata')
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(metadataError);
+
+      try {
+        await expect(plugin.applyEnvironmentVariables(
+          'provider:claude',
+          'ANTHROPIC_BASE_URL=https://partial-write.example.com',
+        )).rejects.toBe(metadataError);
+
+        const generation = plugin.settings.pendingProviderSessionInvalidations.claude;
+        expect(first.sessionId).toBeNull();
+        expect(second.sessionId).toBeNull();
+        expect(generation).toEqual(expect.any(Number));
+        expect((plugin as any).pendingEnvironmentInvalidationGenerations.get('claude'))
+          .toBe(generation);
+        expect((plugin as any).blockedEnvironmentInvalidationGenerations.get('claude'))
+          .toBe(generation);
+        const persistedFailureSettings = JSON.parse(
+          [...mockApp.vault.adapter.write.mock.calls]
+            .reverse()
+            .find(([path]: [string]) => path === '.claudian/claudian-settings.json')?.[1]
+            ?? '{}',
+        );
+        expect(persistedFailureSettings.pendingProviderSessionInvalidations?.claude)
+          .toBe(generation);
+
+        await plugin.applyEnvironmentVariables(
+          'provider:claude',
+          'ANTHROPIC_BASE_URL=https://partial-write-retry.example.com',
+        );
+
+        const retriedMetadata = saveMetadataSpy.mock.calls.slice(2).map(([metadata]) => metadata);
+        expect(retriedMetadata).toEqual(expect.arrayContaining([
+          expect.objectContaining({ id: first.id, sessionId: null }),
+          expect.objectContaining({ id: second.id, sessionId: null }),
+        ]));
+        expect(plugin.settings.pendingProviderSessionInvalidations.claude).toBeUndefined();
+        expect((plugin as any).pendingEnvironmentInvalidationGenerations.has('claude')).toBe(false);
+        expect((plugin as any).blockedEnvironmentInvalidationGenerations.has('claude')).toBe(false);
+      } finally {
+        saveMetadataSpy.mockRestore();
+      }
+    });
+
+    it('restores the committed Grok context before releasing a failed settings transition', async () => {
+      await plugin.onload();
+      updateGrokProviderSettings(plugin.settings, {
+        enabled: true,
+        environmentVariables: 'GROK_PROFILE=old',
+      });
+      updateCurrentGrokCatalog(plugin.settings, {
+        defaultModelId: 'old-model',
+        fingerprint: 'old-catalog',
+        models: [{
+          displayName: 'Old model',
+          rawId: 'old-model',
+          reasoningEfforts: [],
+          supportsReasoning: false,
+        }],
+        refreshedAt: 1,
+      });
+      updateGrokProviderSettings(plugin.settings, {
+        environmentHash: computeGrokEnvironmentHash(plugin.settings),
+      });
+      const committed = structuredClone(getGrokProviderSettings(plugin.settings));
+      let contextAtRelease: ReturnType<typeof getGrokProviderSettings> | null = null;
+      const unregister = plugin.executionLifecycleRegistry.registerTransitionHook('grok', {
+        afterTransition() {
+          contextAtRelease = structuredClone(getGrokProviderSettings(plugin.settings));
+        },
+      });
+      const writeError = new Error('settings write failed');
+      mockApp.vault.adapter.write.mockRejectedValueOnce(writeError);
+
+      await expect(plugin.applyEnvironmentVariables(
+        'provider:grok',
+        'GROK_PROFILE=new',
+      )).rejects.toBe(writeError);
+
+      expect(mockApp.vault.adapter.write).toHaveBeenCalledTimes(1);
+      expect(contextAtRelease).toEqual(committed);
+      expect(getGrokProviderSettings(plugin.settings)).toEqual(committed);
+      expect(plugin.getEnvironmentVariablesForScope('provider:grok')).toBe('GROK_PROFILE=old');
+      expect(getGrokProviderSettings(plugin.settings).currentCatalog).toEqual(
+        committed.currentCatalog,
+      );
+
+      expect(plugin.getEnvironmentVariablesForScope('provider:grok')).toBe('GROK_PROFILE=old');
+
+      await plugin.applyEnvironmentVariables('provider:grok', 'GROK_PROFILE=new');
+
+      expect(mockApp.vault.adapter.write).toHaveBeenCalledTimes(2);
+      expect(plugin.getEnvironmentVariablesForScope('provider:grok')).toBe('GROK_PROFILE=new');
+      expect(getGrokProviderSettings(plugin.settings).environmentHash)
+        .not.toBe(committed.environmentHash);
+      expect(getGrokProviderSettings(plugin.settings).currentCatalog).toBeNull();
+      unregister();
+    });
+
+    it('does not leak failed Claude invalidation into live or deferred conversations', async () => {
+      await plugin.onload();
+      const live = await plugin.createConversation({
+        providerId: 'claude',
+        sessionId: 'live-session',
+      });
+      live.providerState = {
+        providerSessionId: 'live-provider-session',
+        previousProviderSessionIds: ['live-previous-session'],
+      };
+      live.resumeAtMessageId = 'live-resume-message';
+      const deferredMetadata = {
+        id: 'deferred-failed-environment',
+        providerId: 'claude' as const,
+        title: 'Deferred failed environment',
+        createdAt: 1,
+        lastActivityAt: 2,
+        sessionId: 'deferred-session',
+        providerState: {
+          providerSessionId: 'deferred-provider-session',
+          previousProviderSessionIds: ['deferred-previous-session'],
+        },
+        resumeAtMessageId: 'deferred-resume-message',
+      };
+      let markBatchPublished!: () => void;
+      const batchPublished = new Promise<void>(resolve => { markBatchPublished = resolve; });
+      let finishScan!: () => void;
+      const scanRelease = new Promise<void>(resolve => { finishScan = resolve; });
+      const scanSpy = jest.spyOn(plugin.storage.sessions, 'scanMetadata')
+        .mockImplementation(async (options) => {
+          options?.onBatch?.([deferredMetadata]);
+          markBatchPublished();
+          await scanRelease;
+          return {
+            complete: false,
+            invalidMetadataCount: 0,
+            metadata: [deferredMetadata],
+          };
+        });
+      const loadSourceSpy = mockMetadataSources(deferredMetadata);
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata');
+      let markWriteStarted!: () => void;
+      const writeStarted = new Promise<void>(resolve => { markWriteStarted = resolve; });
+      let rejectWrite!: (error: Error) => void;
+      const failedWrite = new Promise<void>((_resolve, reject) => { rejectWrite = reject; });
+      let shouldFailSettingsWrite = true;
+      mockApp.vault.adapter.write.mockImplementation(async (path: string) => {
+        if (path === '.claudian/claudian-settings.json' && shouldFailSettingsWrite) {
+          shouldFailSettingsWrite = false;
+          markWriteStarted();
+          await failedWrite;
+        }
+      });
+      let stateAtRelease: {
+        blocked: boolean;
+        deferredSessionId: string | null | undefined;
+        liveSessionId: string | null;
+        pending: unknown;
+      } | null = null;
+      const afterTransition = jest.fn(() => {
+        stateAtRelease = {
+          blocked: (plugin as any).blockedEnvironmentInvalidationGenerations.has('claude'),
+          deferredSessionId: plugin.getCachedConversation(deferredMetadata.id)?.sessionId,
+          liveSessionId: live.sessionId,
+          pending: plugin.settings.pendingProviderSessionInvalidations.claude,
+        };
+      });
+      const unregister = plugin.executionLifecycleRegistry.registerTransitionHook('claude', {
+        afterTransition,
+      });
+
+      const writeError = new Error('environment settings write failed');
+      const apply = plugin.applyEnvironmentVariables(
+        'provider:claude',
+        'ANTHROPIC_BASE_URL=https://failed.example.com',
+      ).catch(error => error);
+      await writeStarted;
+      const scan = (plugin as any).loadRemainingSessionMetadata();
+      await batchPublished;
+      rejectWrite(writeError);
+      expect(await apply).toBe(writeError);
+      finishScan();
+      await scan;
+
+      const deferred = plugin.getCachedConversation(deferredMetadata.id);
+      expect(afterTransition).toHaveBeenCalledTimes(1);
+      expect(stateAtRelease).toEqual({
+        blocked: false,
+        deferredSessionId: 'deferred-session',
+        liveSessionId: 'live-session',
+        pending: undefined,
+      });
+      expect(live).toEqual(expect.objectContaining({
+        sessionId: 'live-session',
+        providerState: {
+          providerSessionId: 'live-provider-session',
+          previousProviderSessionIds: ['live-previous-session'],
+        },
+        resumeAtMessageId: 'live-resume-message',
+      }));
+      expect(deferred).toEqual(expect.objectContaining({
+        sessionId: 'deferred-session',
+        providerState: deferredMetadata.providerState,
+        resumeAtMessageId: 'deferred-resume-message',
+      }));
+      expect(plugin.settings.pendingProviderSessionInvalidations.claude).toBeUndefined();
+      expect((plugin as any).pendingEnvironmentInvalidationGenerations.has('claude')).toBe(false);
+      expect((plugin as any).blockedEnvironmentInvalidationGenerations.has('claude')).toBe(false);
+      expect(saveMetadataSpy).not.toHaveBeenCalledWith(expect.objectContaining({
+        id: deferredMetadata.id,
+        sessionId: null,
+      }));
+      expect(mockApp.vault.adapter.write.mock.calls.filter(
+        ([path]: [string]) => path === '.claudian/claudian-settings.json',
+      )).toHaveLength(1);
+
+      const invalidateSpy = jest.spyOn(
+        ProviderSettingsCoordinator,
+        'invalidateConversationSessions',
+      );
+      saveMetadataSpy.mockClear();
+      await plugin.applyEnvironmentVariables(
+        'provider:claude',
+        'ANTHROPIC_BASE_URL=https://retry.example.com',
+      );
+
+      expect(invalidateSpy).toHaveBeenCalledTimes(1);
+      expect(live.sessionId).toBeNull();
+      expect(live.providerState).toEqual({
+        previousProviderSessionIds: [
+          'live-previous-session',
+          'live-provider-session',
+        ],
+      });
+      expect(live.resumeAtMessageId).toBe('live-resume-message');
+      expect(deferred?.sessionId).toBeNull();
+      expect(deferred?.providerState).toEqual({
+        previousProviderSessionIds: [
+          'deferred-previous-session',
+          'deferred-provider-session',
+        ],
+      });
+      expect(deferred?.resumeAtMessageId).toBe('deferred-resume-message');
+      expect(saveMetadataSpy.mock.calls.map(([metadata]) => metadata.id).sort()).toEqual([
+        deferredMetadata.id,
+        live.id,
+      ].sort());
+
+      invalidateSpy.mockRestore();
+      saveMetadataSpy.mockRestore();
+      scanSpy.mockRestore();
+      loadSourceSpy.mockRestore();
+      unregister();
+    });
+
     it('updates runtime env vars when changed', async () => {
       await plugin.onload();
 
@@ -959,7 +1990,7 @@ describe('ClaudianPlugin', () => {
       await plugin.onload();
 
       const conv = await plugin.createConversation({ sessionId: 'session-123' });
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata');
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata');
       saveMetadataSpy.mockClear();
 
       await plugin.applyEnvironmentVariables('provider:claude', 'ANTHROPIC_MODEL=claude-sonnet-4-5');
@@ -982,7 +2013,7 @@ describe('ClaudianPlugin', () => {
         markFirstWriteStarted = resolve;
       });
       let blockedFirstWrite = false;
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata')
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata')
         .mockImplementation(async () => {
           if (!blockedFirstWrite) {
             blockedFirstWrite = true;
@@ -1022,7 +2053,7 @@ describe('ClaudianPlugin', () => {
       await plugin.onload();
       (plugin as any).hasLoadedAllSessionMetadata = true;
       await plugin.createConversation({ sessionId: 'failed-overlap-session' });
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata')
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata')
         .mockRejectedValueOnce(new Error('metadata write failed'));
 
       await expect(plugin.applyEnvironmentVariables(
@@ -1045,27 +2076,13 @@ describe('ClaudianPlugin', () => {
         .toBeUndefined();
     });
 
-    it('broadcasts ensureReady with force when env changes without model change', async () => {
+    it('invalidates provider executions through the lifecycle registry when env changes', async () => {
       await plugin.onload();
+      const initialGeneration = plugin.executionLifecycleRegistry
+        .getProviderGeneration('claude');
 
-      // Mock one open view with an initialized Claude runtime.
-      const mockSyncConversationState = jest.fn();
-      const mockEnsureReady = jest.fn().mockResolvedValue(true);
-      const mockTabManager = {
-        getAllTabs: jest.fn().mockReturnValue([{
-          providerId: 'claude',
-          conversationId: null,
-          state: { isStreaming: false },
-          serviceInitialized: true,
-          service: {
-            ensureReady: mockEnsureReady,
-            syncConversationState: mockSyncConversationState,
-          },
-          ui: { externalContextSelector: { getExternalContexts: jest.fn().mockReturnValue([]) } },
-        }]),
-      };
       const mockView = {
-        getTabManager: jest.fn().mockReturnValue(mockTabManager),
+        getTabManager: jest.fn(),
         invalidateProviderCommandCaches: jest.fn(),
         refreshModelSelector: jest.fn(),
       };
@@ -1074,32 +2091,20 @@ describe('ClaudianPlugin', () => {
       // Change env but not in a way that affects model
       await plugin.applyEnvironmentVariables('shared', 'SOME_VAR=value');
 
-      expect(mockSyncConversationState).toHaveBeenCalledWith(null, []);
-      expect(mockEnsureReady).toHaveBeenCalledWith({ force: true });
+      expect(plugin.executionLifecycleRegistry.getProviderGeneration('claude'))
+        .toBe(initialGeneration + 1);
+      expect(mockView.getTabManager).not.toHaveBeenCalled();
     });
 
-    it('restarts affected runtimes in every open Claudian view', async () => {
+    it('does not inspect open tab execution state during provider transitions', async () => {
       await plugin.onload();
 
       const createView = () => {
-        const ensureReady = jest.fn().mockResolvedValue(true);
-        const tabManager = {
-          getAllTabs: jest.fn().mockReturnValue([{
-            providerId: 'claude',
-            conversationId: null,
-            state: { isStreaming: false },
-            serviceInitialized: true,
-            service: {
-              ensureReady,
-              syncConversationState: jest.fn(),
-            },
-            ui: { externalContextSelector: { getExternalContexts: jest.fn().mockReturnValue([]) } },
-          }]),
-        };
+        const getTabManager = jest.fn();
         return {
-          ensureReady,
+          getTabManager,
           view: {
-            getTabManager: jest.fn().mockReturnValue(tabManager),
+            getTabManager,
             invalidateProviderCommandCaches: jest.fn(),
             refreshModelSelector: jest.fn(),
           },
@@ -1114,11 +2119,11 @@ describe('ClaudianPlugin', () => {
 
       await plugin.applyEnvironmentVariables('shared', 'SOME_VAR=value');
 
-      expect(first.ensureReady).toHaveBeenCalledWith({ force: true });
-      expect(second.ensureReady).toHaveBeenCalledWith({ force: true });
+      expect(first.getTabManager).not.toHaveBeenCalled();
+      expect(second.getTabManager).not.toHaveBeenCalled();
     });
 
-    it('syncs live external contexts before restarting invalidated Claude runtimes', async () => {
+    it('invalidates Claude conversation metadata without inspecting tab execution state', async () => {
       await plugin.onload();
 
       const conversation = await plugin.createConversation({
@@ -1136,25 +2141,8 @@ describe('ClaudianPlugin', () => {
         }],
       });
 
-      const mockSyncConversationState = jest.fn();
-      const mockResetSession = jest.fn();
-      const mockEnsureReady = jest.fn().mockResolvedValue(true);
-      const mockTabManager = {
-        getAllTabs: jest.fn().mockReturnValue([{
-          conversationId: conversation.id,
-          providerId: 'claude',
-          state: { isStreaming: false },
-          serviceInitialized: true,
-          service: {
-            ensureReady: mockEnsureReady,
-            resetSession: mockResetSession,
-            syncConversationState: mockSyncConversationState,
-          },
-          ui: { externalContextSelector: { getExternalContexts: jest.fn().mockReturnValue(['/live/context']) } },
-        }]),
-      };
       const mockView = {
-        getTabManager: jest.fn().mockReturnValue(mockTabManager),
+        getTabManager: jest.fn(),
         invalidateProviderCommandCaches: jest.fn(),
         refreshModelSelector: jest.fn(),
       };
@@ -1162,12 +2150,275 @@ describe('ClaudianPlugin', () => {
 
       await plugin.applyEnvironmentVariables('provider:claude', 'ANTHROPIC_MODEL=claude-sonnet-4-5');
 
-      expect(mockSyncConversationState).toHaveBeenCalledWith(
-        expect.objectContaining({ id: conversation.id }),
-        ['/live/context'],
+      expect(plugin.getConversationSync(conversation.id)?.sessionId).toBeNull();
+      expect(mockView.getTabManager).not.toHaveBeenCalled();
+    });
+
+    it('reloads preserved sessions while resetting only invalidation-policy providers', async () => {
+      await plugin.onload();
+
+      const reloadConversation = await plugin.createConversation({
+        providerId: 'claude',
+        sessionId: 'preserved-session',
+      });
+      await plugin.updateConversation(reloadConversation.id, {
+        providerState: { providerSessionId: 'preserved-provider-session' },
+      });
+      const invalidatedConversation = await plugin.createConversation({
+        providerId: 'codex',
+        sessionId: 'invalidated-session',
+      });
+      await plugin.updateConversation(invalidatedConversation.id, {
+        providerState: { threadId: 'invalidated-thread' },
+      });
+
+      const claudeReconciler = ProviderRegistry.getSettingsReconciler('claude');
+      const reconcileSpy = jest.spyOn(claudeReconciler, 'reconcileModelWithEnvironment')
+        .mockReturnValue({ changed: true, invalidatedConversations: [] });
+      claudeReconciler.environmentSessionPolicy = 'reload';
+      const stagePendingSpy = jest.spyOn(plugin as any, 'stagePendingSessionInvalidations');
+      const getTabManager = jest.fn();
+      const mockView = {
+        getTabManager,
+        invalidateProviderCommandCaches: jest.fn(),
+        refreshModelSelector: jest.fn(),
+      };
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([mockView as any]);
+
+      try {
+        await plugin.applyEnvironmentVariables(
+          'shared',
+          [
+            'ANTHROPIC_BASE_URL=https://reload.example.com',
+            'OPENAI_BASE_URL=https://invalidate.example.com',
+          ].join('\n'),
+        );
+      } finally {
+        delete claudeReconciler.environmentSessionPolicy;
+        reconcileSpy.mockRestore();
+      }
+
+      const preserved = await plugin.getConversationById(reloadConversation.id);
+      const invalidated = await plugin.getConversationById(invalidatedConversation.id);
+      expect(stagePendingSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        ['codex'],
       );
-      expect(mockResetSession).toHaveBeenCalledTimes(1);
-      expect(mockEnsureReady).toHaveBeenCalledWith();
+      expect(stagePendingSpy).toHaveBeenCalledTimes(1);
+      expect(preserved).toEqual(expect.objectContaining({
+        sessionId: 'preserved-session',
+        providerState: { providerSessionId: 'preserved-provider-session' },
+      }));
+      expect(invalidated).toEqual(expect.objectContaining({
+        sessionId: null,
+        providerState: undefined,
+      }));
+      expect(getTabManager).not.toHaveBeenCalled();
+    });
+
+    it('does not touch an initialized blank Grok tab during an environment transition', async () => {
+      await plugin.onload();
+      const initialGeneration = plugin.executionLifecycleRegistry
+        .getProviderGeneration('grok');
+
+      const mockView = {
+        getTabManager: jest.fn(),
+        invalidateProviderCommandCaches: jest.fn(),
+        refreshModelSelector: jest.fn(),
+      };
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([mockView as any]);
+
+      await plugin.applyEnvironmentVariables(
+        'provider:grok',
+        'GROK_PROFILE=first-turn-reload',
+      );
+
+      expect(plugin.executionLifecycleRegistry.getProviderGeneration('grok'))
+        .toBe(initialGeneration + 1);
+      expect(mockView.getTabManager).not.toHaveBeenCalled();
+    });
+
+    it('does not coordinate environment changes through open Grok tabs', async () => {
+      await plugin.onload();
+      const conversation = await plugin.createConversation({ providerId: 'grok' });
+      const initialGeneration = plugin.executionLifecycleRegistry
+        .getProviderGeneration('grok');
+      const mockView = {
+        getTabManager: jest.fn(),
+        invalidateProviderCommandCaches: jest.fn(),
+        refreshModelSelector: jest.fn(),
+      };
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([mockView as any]);
+
+      await plugin.applyEnvironmentVariables(
+        'provider:grok',
+        'GROK_PROFILE=streaming-first-turn',
+      );
+
+      expect(plugin.executionLifecycleRegistry.getProviderGeneration('grok'))
+        .toBe(initialGeneration + 1);
+      expect(mockView.getTabManager).not.toHaveBeenCalled();
+      expect(plugin.getConversationSync(conversation.id)?.sessionId).toBeNull();
+    });
+  });
+
+  describe('applyProviderRuntimeSettings', () => {
+    it('persists a CLI fingerprint and restart-safe session invalidation atomically', async () => {
+      const settingsPath = '.claudian/claudian-settings.json';
+      const deferredMetadata = {
+        id: 'runtime-settings-restart-session',
+        providerId: 'codex' as const,
+        title: 'Runtime settings restart session',
+        createdAt: 1,
+        lastActivityAt: 2,
+        sessionId: 'codex-thread-id',
+        providerState: { threadId: 'codex-thread-id' },
+      };
+      const files = installVaultFiles({
+        [settingsPath]: JSON.stringify({
+          model: '',
+          providerConfigs: {
+            codex: {
+              enabled: true,
+              environmentHash: '',
+              environmentVariables: '',
+            },
+          },
+          settingsProvider: 'codex',
+        }),
+      });
+
+      await plugin.onload();
+      (plugin as any).hasLoadedAllSessionMetadata = false;
+      const hostnameKey = getHostnameKey();
+      await plugin.applyProviderRuntimeSettings(['codex'], (settings) => {
+        updateCodexProviderSettings(settings, {
+          cliPathsByHost: { [hostnameKey]: '/custom/codex' },
+        });
+      });
+
+      const firstRunSettings = JSON.parse(files.get(settingsPath) ?? '{}');
+      const fingerprint = firstRunSettings.providerConfigs.codex.environmentHash;
+      expect(firstRunSettings.providerConfigs.codex.cliPathsByHost).toEqual({
+        [hostnameKey]: '/custom/codex',
+      });
+      expect(isVersionedRuntimeInputFingerprint(fingerprint)).toBe(true);
+      expect(firstRunSettings.pendingProviderSessionInvalidations?.codex)
+        .toEqual(expect.any(Number));
+
+      plugin.onunload();
+      const restartedPlugin = new ClaudianPlugin(mockApp, mockManifest);
+      (restartedPlugin.loadData as jest.Mock).mockResolvedValue({});
+      const saveMetadataSpy = jest.spyOn(
+        ConversationPersistenceStore.prototype,
+        'saveMetadata',
+      );
+      const listSpy = jest.spyOn(SessionStorage.prototype, 'scanMetadata')
+        .mockImplementation(async (options) => {
+          options?.onBatch?.([deferredMetadata]);
+          return {
+            metadata: [deferredMetadata],
+            complete: true,
+            invalidMetadataCount: 0,
+          };
+        });
+      const loadSourceSpy = mockMetadataSources(deferredMetadata);
+
+      await restartedPlugin.onload();
+      await (restartedPlugin as any).loadRemainingSessionMetadata();
+
+      const restartedConversation = restartedPlugin.getCachedConversation(deferredMetadata.id);
+      const persistedMetadata = JSON.parse(
+        files.get('.claudian/sessions/runtime-settings-restart-session.meta.json') ?? '{}',
+      );
+      const restartedSettings = JSON.parse(files.get(settingsPath) ?? '{}');
+      const invalidationWrites = saveMetadataSpy.mock.calls.filter(
+        ([metadata]) => metadata.id === deferredMetadata.id,
+      );
+      listSpy.mockRestore();
+      loadSourceSpy.mockRestore();
+      saveMetadataSpy.mockRestore();
+
+      expect(restartedConversation).toEqual(expect.objectContaining({
+        sessionId: null,
+        providerState: undefined,
+      }));
+      expect(persistedMetadata).toEqual(expect.objectContaining({
+        sessionId: null,
+      }));
+      expect(persistedMetadata).not.toHaveProperty('providerState');
+      expect(restartedSettings.providerConfigs.codex.environmentHash).toBe(fingerprint);
+      expect(restartedSettings.pendingProviderSessionInvalidations?.codex).toBeUndefined();
+      expect(invalidationWrites).toHaveLength(1);
+    });
+
+    it('advances the Grok fingerprint while preserving reload-policy sessions', async () => {
+      await plugin.onload();
+      const conversation = await plugin.createConversation({
+        providerId: 'grok',
+        sessionId: 'grok-session-id',
+      });
+      await plugin.updateConversation(conversation.id, {
+        providerState: { sessionDirectory: '/tmp/grok/session-id' },
+      });
+      const hostnameKey = getHostnameKey();
+
+      await plugin.applyProviderRuntimeSettings(['grok'], (settings) => {
+        updateGrokProviderSettings(settings, {
+          cliPathsByHost: { [hostnameKey]: '/custom/grok' },
+          enabled: true,
+        });
+      });
+
+      const grokSettings = getGrokProviderSettings(plugin.settings);
+      expect(grokSettings.environmentHash).toBe(computeGrokEnvironmentHash(plugin.settings));
+      expect(plugin.getConversationSync(conversation.id)).toEqual(expect.objectContaining({
+        sessionId: 'grok-session-id',
+        providerState: { sessionDirectory: '/tmp/grok/session-id' },
+      }));
+      expect(ProviderSettingsCoordinator.reconcileProviders(
+        plugin.settings,
+        [conversation],
+        ['grok'],
+      ).changed).toBe(false);
+    });
+
+    it('finishes durable invalidation when a post-commit apply hook fails', async () => {
+      await plugin.onload();
+      (plugin as any).hasLoadedAllSessionMetadata = true;
+      const conversation = await plugin.createConversation({
+        providerId: 'codex',
+        sessionId: 'post-commit-thread',
+      });
+      await plugin.updateConversation(conversation.id, {
+        providerState: { threadId: 'post-commit-thread' },
+      });
+      const hostnameKey = getHostnameKey();
+
+      await expect(plugin.applyProviderRuntimeSettings(
+        ['codex'],
+        (settings) => {
+          updateCodexProviderSettings(settings, {
+            cliPathsByHost: { [hostnameKey]: '/custom/post-commit-codex' },
+          });
+        },
+        () => {
+          throw new Error('resolver reset failed');
+        },
+      )).rejects.toThrow('resolver reset failed');
+
+      const codexSettings = getCodexProviderSettings(plugin.settings);
+      expect(codexSettings.cliPathsByHost).toEqual({
+        [hostnameKey]: '/custom/post-commit-codex',
+      });
+      expect(isVersionedRuntimeInputFingerprint(
+        codexSettings.environmentHash,
+      )).toBe(true);
+      expect(plugin.getConversationSync(conversation.id)).toEqual(expect.objectContaining({
+        sessionId: null,
+        providerState: undefined,
+      }));
+      expect(plugin.settings.pendingProviderSessionInvalidations.codex).toBeUndefined();
     });
   });
 
@@ -1198,12 +2449,56 @@ describe('ClaudianPlugin', () => {
   });
 
   describe('new-tab command', () => {
+    it('uses the layout-neutral New label', async () => {
+      await plugin.onload();
+
+      expect(getRegisteredCommand('new-tab').name).toBe('New');
+    });
+
+    it('delegates New to the active dual-pane navigation policy', async () => {
+      await plugin.onload();
+
+      const handleNewConversationCommand = jest.fn().mockResolvedValue(true);
+      const createNewTab = jest.fn().mockResolvedValue(undefined);
+      jest.spyOn(plugin, 'getView').mockReturnValue({
+        createNewTab,
+        getTabManager: jest.fn().mockReturnValue({}),
+        handleNewConversationCommand,
+      } as any);
+
+      const command = getRegisteredCommand('new-tab');
+      expect(command.checkCallback(false)).toBe(true);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(handleNewConversationCommand).toHaveBeenCalledTimes(1);
+      expect(createNewTab).not.toHaveBeenCalled();
+    });
+
+    it('keeps replace and close tab commands out of dual mode', async () => {
+      await plugin.onload();
+
+      jest.spyOn(plugin, 'getView').mockReturnValue({
+        isDualPaneMode: () => true,
+        getTabManager: jest.fn().mockReturnValue({
+          getActiveTab: jest.fn().mockReturnValue({ state: { isStreaming: false } }),
+        }),
+      } as any);
+
+      const replaceCommand = getRegisteredCommand('new-session');
+      const closeCommand = getRegisteredCommand('close-current-tab');
+      expect(replaceCommand.name).toBe('Replace current conversation');
+      expect(replaceCommand.checkCallback(true)).toBe(false);
+      expect(closeCommand.checkCallback(true)).toBe(false);
+    });
+
     it('opens the view without creating a duplicate tab when no tab layout is persisted', async () => {
       await plugin.onload();
 
       const createNewTab = jest.fn().mockResolvedValue(undefined);
+      const focusActiveInput = jest.fn();
       const mockView = {
         createNewTab,
+        focusActiveInput,
       };
 
       let viewOpened = false;
@@ -1223,9 +2518,10 @@ describe('ClaudianPlugin', () => {
 
       expect(plugin.activateView).toHaveBeenCalledTimes(1);
       expect(createNewTab).not.toHaveBeenCalled();
+      expect(focusActiveInput).toHaveBeenCalledTimes(1);
     });
 
-    it('creates a new tab after reopening a persisted tab layout', async () => {
+    it('starts from the fresh runtime tab after reopening a persisted layout', async () => {
       (plugin.loadData as jest.Mock).mockResolvedValue({
         tabManagerState: {
           openTabs: [
@@ -1238,8 +2534,10 @@ describe('ClaudianPlugin', () => {
       await plugin.onload();
 
       const createNewTab = jest.fn().mockResolvedValue(undefined);
+      const focusActiveInput = jest.fn();
       const mockView = {
         createNewTab,
+        focusActiveInput,
       };
 
       let viewOpened = false;
@@ -1258,10 +2556,11 @@ describe('ClaudianPlugin', () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
 
       expect(plugin.activateView).toHaveBeenCalledTimes(1);
-      expect(createNewTab).toHaveBeenCalledTimes(1);
+      expect(createNewTab).not.toHaveBeenCalled();
+      expect(focusActiveInput).toHaveBeenCalledTimes(1);
     });
 
-    it('stays unavailable when the open view is already at the tab limit', async () => {
+    it('stays available regardless of the former tab limit', async () => {
       await plugin.onload();
 
       const mockView = {
@@ -1274,7 +2573,7 @@ describe('ClaudianPlugin', () => {
 
       const command = getRegisteredCommand('new-tab');
 
-      expect(command.checkCallback(true)).toBe(false);
+      expect(command.checkCallback(true)).toBe(true);
     });
 
     it('keeps tab commands unavailable while a Claudian leaf view is not initialized', async () => {
@@ -1290,7 +2589,7 @@ describe('ClaudianPlugin', () => {
       }
     });
 
-    it('stays unavailable when reopening the persisted layout would already hit the tab limit', async () => {
+    it('ignores the persisted runtime layout when checking new-tab availability', async () => {
       (plugin.loadData as jest.Mock).mockResolvedValue({
         tabManagerState: {
           openTabs: [
@@ -1308,7 +2607,7 @@ describe('ClaudianPlugin', () => {
 
       const command = getRegisteredCommand('new-tab');
 
-      expect(command.checkCallback(true)).toBe(false);
+      expect(command.checkCallback(true)).toBe(true);
     });
   });
 
@@ -1367,7 +2666,7 @@ describe('ClaudianPlugin', () => {
         contextWindow: 200000,
         percentage: 1,
       };
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata');
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata');
       saveMetadataSpy.mockClear();
 
       const fetched = await plugin.getConversationById(conv.id);
@@ -1383,7 +2682,7 @@ describe('ClaudianPlugin', () => {
 
       const conv = await plugin.createConversation();
       delete (conv as { selectedModel?: string }).selectedModel;
-      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata');
+      const saveMetadataSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata');
       saveMetadataSpy.mockClear();
 
       const fetched = await plugin.getConversationById(conv.id);
@@ -1485,7 +2784,7 @@ describe('ClaudianPlugin', () => {
         });
       const loadSpy = jest.spyOn(sdkSession, 'loadSDKSessionMessages')
         .mockResolvedValue({ messages: [], skippedLines: 0 });
-      const saveSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata')
+      const saveSpy = jest.spyOn(getConversationPersistence(plugin), 'saveMetadata')
         .mockRejectedValueOnce(new Error('Write failed'));
 
       const result = await plugin.switchConversation(conversation.id);
@@ -1525,16 +2824,14 @@ describe('ClaudianPlugin', () => {
       expect(list.find(c => c.id === conv.id)).toBeUndefined();
     });
 
-    it('should preserve the provider-native session when requested', async () => {
+    it('does not expose or invoke provider-native session deletion', async () => {
       await plugin.onload();
       const conv = await plugin.createConversation({ sessionId: 'provider-session-1' });
-      const deleteNativeSpy = jest.spyOn(sdkSession, 'deleteSDKSession');
 
-      await plugin.deleteConversation(conv.id, { deleteProviderSession: false });
+      await plugin.deleteConversation(conv.id);
 
-      expect(deleteNativeSpy).not.toHaveBeenCalled();
+      expect('deleteSDKSession' in sdkSession).toBe(false);
       expect(plugin.getConversationList().find(item => item.id === conv.id)).toBeUndefined();
-      deleteNativeSpy.mockRestore();
     });
 
     it('should reset every open tab that references the deleted conversation', async () => {
@@ -1544,6 +2841,7 @@ describe('ClaudianPlugin', () => {
       const createNew = jest.fn().mockResolvedValue(undefined);
       mockApp.workspace.getLeavesOfType.mockReturnValue([{
         view: {
+          notifyConversationListChanged: jest.fn(),
           getTabManager: () => ({
             getAllTabs: () => [{
               conversationId: conv.id,
@@ -1556,10 +2854,60 @@ describe('ClaudianPlugin', () => {
         },
       }]);
 
-      await plugin.deleteConversation(conv.id, { deleteProviderSession: false });
+      await plugin.deleteConversation(conv.id);
 
       expect(cancelStreaming).toHaveBeenCalledTimes(1);
       expect(createNew).toHaveBeenCalledWith({ force: true });
+    });
+
+    it('attempts every matching tab and retries only failed deletion associations', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation();
+      const firstTab = {
+        conversationId: conv.id as string | null,
+        controllers: {
+          inputController: { cancelStreaming: jest.fn() },
+          conversationController: {
+            createNew: jest.fn()
+              .mockRejectedValueOnce(new Error('first tab failed'))
+              .mockImplementation(async () => {
+                firstTab.conversationId = null;
+              }),
+          },
+        },
+      };
+      const secondTab = {
+        conversationId: conv.id as string | null,
+        controllers: {
+          inputController: { cancelStreaming: jest.fn() },
+          conversationController: {
+            createNew: jest.fn().mockImplementation(async () => {
+              secondTab.conversationId = null;
+            }),
+          },
+        },
+      };
+      mockApp.workspace.getLeavesOfType.mockReturnValue([{
+        view: {
+          notifyConversationListChanged: jest.fn(),
+          getTabManager: () => ({
+            getAllTabs: () => [firstTab, secondTab],
+          }),
+        },
+      }]);
+
+      await expect(plugin.deleteConversation(conv.id)).rejects.toThrow('first tab failed');
+
+      expect(firstTab.controllers.conversationController.createNew).toHaveBeenCalledTimes(1);
+      expect(secondTab.controllers.conversationController.createNew).toHaveBeenCalledTimes(1);
+      expect(plugin.getConversationList().find(item => item.id === conv.id)).toBeUndefined();
+
+      await expect(plugin.deleteConversation(conv.id)).resolves.toBeUndefined();
+
+      expect(firstTab.controllers.conversationController.createNew).toHaveBeenCalledTimes(2);
+      expect(secondTab.controllers.conversationController.createNew).toHaveBeenCalledTimes(1);
+      expect(firstTab.conversationId).toBeNull();
+      expect(secondTab.conversationId).toBeNull();
     });
   });
 
@@ -1573,7 +2921,7 @@ describe('ClaudianPlugin', () => {
 
       await expect(plugin.handleMissingProviderSession(
         conv.id,
-        'unverified-provider-session',
+        'different-reported-session',
       )).resolves.toBe('preserved');
       expect(plugin.getConversationSync(conv.id)).toBe(conv);
     });
@@ -1653,9 +3001,129 @@ describe('ClaudianPlugin', () => {
       const updated = await plugin.getConversationById(conv.id);
       expect(updated?.title).toBeTruthy();
     });
+
+    it('notifies every open view after conversation list mutations', async () => {
+      await plugin.onload();
+      const firstView = {
+        getTabManager: jest.fn().mockReturnValue(null),
+        notifyConversationListChanged: jest.fn(),
+      };
+      const secondView = {
+        getTabManager: jest.fn().mockReturnValue(null),
+        notifyConversationListChanged: jest.fn(),
+      };
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([
+        firstView as any,
+        secondView as any,
+      ]);
+
+      const conversation = await plugin.createConversation();
+      await plugin.renameConversation(conversation.id, 'Renamed');
+      await plugin.deleteConversation(conversation.id);
+
+      expect(firstView.notifyConversationListChanged).toHaveBeenCalledTimes(3);
+      expect(secondView.notifyConversationListChanged).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('linked note renames', () => {
+    it('registers Vault rename and delete listeners', async () => {
+      await plugin.onload();
+
+      expect(mockApp.vault.on).toHaveBeenCalledWith('rename', expect.any(Function));
+      expect(mockApp.vault.on).toHaveBeenCalledWith('delete', expect.any(Function));
+    });
+
+    it('rewrites linked file and folder paths without changing activity timestamps', async () => {
+      await plugin.onload();
+      const fileConversation = await plugin.createConversation();
+      const folderConversation = await plugin.createConversation();
+      await plugin.updateConversation(fileConversation.id, { currentNote: 'Notes/Old.md' });
+      await plugin.updateConversation(folderConversation.id, {
+        currentNote: 'Projects/Old/Plan.md',
+      });
+      const fileUpdatedAt = fileConversation.lastActivityAt;
+      const folderUpdatedAt = folderConversation.lastActivityAt;
+      await plugin.setLinkedNotePinned('Notes/Old.md', true);
+      await plugin.setLinkedNotePinned('Projects/Old/Plan.md', true);
+
+      await (plugin as any).handleLinkedNoteRename(
+        new (TFile as any)('Notes/New.md'),
+        'Notes/Old.md',
+      );
+      await (plugin as any).handleLinkedNoteRename(
+        new (TFolder as any)('Projects/New'),
+        'Projects/Old',
+      );
+
+      expect(fileConversation).toMatchObject({
+        currentNote: 'Notes/New.md',
+        lastActivityAt: fileUpdatedAt,
+      });
+      expect(folderConversation).toMatchObject({
+        currentNote: 'Projects/New/Plan.md',
+        lastActivityAt: folderUpdatedAt,
+      });
+      expect(plugin.settings.pinnedLinkedNotePaths).toEqual([
+        'Notes/New.md',
+        'Projects/New/Plan.md',
+      ]);
+    });
+
+    it('removes deleted file and folder paths from pinned linked notes', async () => {
+      await plugin.onload();
+      await plugin.setLinkedNotePinned('Notes/Plan.md', true);
+      await plugin.setLinkedNotePinned('Projects/Archive/One.md', true);
+      await plugin.setLinkedNotePinned('Projects/Archive/Two.md', true);
+
+      await (plugin as any).handlePinnedLinkedNoteDeleted(
+        new (TFile as any)('Notes/Plan.md'),
+      );
+      await (plugin as any).handlePinnedLinkedNoteDeleted(
+        new (TFolder as any)('Projects/Archive'),
+      );
+
+      expect(plugin.settings.pinnedLinkedNotePaths).toEqual([]);
+    });
   });
 
   describe('updateConversation', () => {
+    it('creates linked-note metadata atomically and publishes later note changes', async () => {
+      await plugin.onload();
+      const notifyConversationListChanged = jest.fn();
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([{
+        notifyConversationListChanged,
+      } as any]);
+
+      const conv = await plugin.createConversation({
+        currentNote: 'Projects/Initial.md',
+      });
+
+      expect(plugin.getConversationList().find(({ id }) => id === conv.id)?.currentNote)
+        .toBe('Projects/Initial.md');
+      notifyConversationListChanged.mockClear();
+
+      await plugin.updateConversation(conv.id, {
+        currentNote: 'Projects/Updated.md',
+      });
+
+      expect(plugin.getConversationList().find(({ id }) => id === conv.id)?.currentNote)
+        .toBe('Projects/Updated.md');
+      expect(notifyConversationListChanged).toHaveBeenCalledTimes(1);
+
+      notifyConversationListChanged.mockClear();
+      await plugin.updateConversation(conv.id, {
+        lastActivityAt: 1234,
+        titleGenerationStatus: 'failed',
+      });
+
+      expect(plugin.getConversationList().find(({ id }) => id === conv.id)).toMatchObject({
+        lastActivityAt: 1234,
+        titleGenerationStatus: 'failed',
+      });
+      expect(notifyConversationListChanged).toHaveBeenCalledTimes(1);
+    });
+
     it('should update conversation messages', async () => {
       await plugin.onload();
 
@@ -1710,19 +3178,16 @@ describe('ClaudianPlugin', () => {
       expect(updated?.sessionId).toBe('new-session-id');
     });
 
-    it('should update updatedAt timestamp', async () => {
+    it('should preserve lastActivityAt for metadata-only updates', async () => {
       await plugin.onload();
 
       const conv = await plugin.createConversation();
-      const originalUpdatedAt = conv.updatedAt;
-
-      // Small delay to ensure timestamp differs
-      await new Promise(resolve => setTimeout(resolve, 10));
+      const originalLastActivityAt = conv.lastActivityAt;
 
       await plugin.updateConversation(conv.id, { title: 'Changed' });
 
       const updated = await plugin.getConversationById(conv.id);
-      expect(updated?.updatedAt).toBeGreaterThan(originalUpdatedAt);
+      expect(updated?.lastActivityAt).toBe(originalLastActivityAt);
     });
   });
 
@@ -1759,6 +3224,67 @@ describe('ClaudianPlugin', () => {
   });
 
   describe('loadSettings with conversations', () => {
+    it('migrates a legacy Codex fingerprint before reconciling persisted sessions', async () => {
+      const timestamp = Date.now();
+      const metadataPath = '.claudian/sessions/conv-codex-legacy.meta.json';
+      const sessionMetadata = {
+        id: 'conv-codex-legacy',
+        providerId: 'codex',
+        title: 'Legacy Codex Chat',
+        createdAt: timestamp,
+        lastActivityAt: timestamp,
+        sessionId: 'codex-thread-123',
+        selectedModel: 'openai-codex/gpt-5',
+        providerState: {
+          threadId: 'codex-thread-123',
+          sessionFilePath: 'C:\\Users\\tester\\.codex\\sessions\\codex-thread-123.jsonl',
+        },
+      };
+
+      mockApp.vault.adapter.exists.mockImplementation(async (path: string) => (
+        path === '.claudian/claudian-settings.json'
+        || path === '.claudian/sessions'
+        || path === metadataPath
+      ));
+      mockApp.vault.adapter.list.mockImplementation(async (path: string) => (
+        path === '.claudian/sessions'
+          ? { files: [metadataPath], folders: [] }
+          : { files: [], folders: [] }
+      ));
+      mockApp.vault.adapter.read.mockImplementation(async (path: string) => {
+        if (path === '.claudian/claudian-settings.json') {
+          return JSON.stringify({
+            providerConfigs: {
+              codex: {
+                cliPath: 'C:\\Users\\tester\\codex.exe',
+                enabled: true,
+                environmentHash: '',
+                environmentVariables: '',
+              },
+            },
+          });
+        }
+        if (path === metadataPath) {
+          return JSON.stringify(sessionMetadata);
+        }
+        return '';
+      });
+
+      await plugin.loadSettings();
+
+      expect(plugin.getCachedConversation(sessionMetadata.id)).toMatchObject({
+        sessionId: sessionMetadata.sessionId,
+        providerState: sessionMetadata.providerState,
+      });
+      expect(isVersionedRuntimeInputFingerprint(
+        getCodexProviderSettings(plugin.settings).environmentHash,
+      )).toBe(true);
+      expect(mockApp.vault.adapter.write).not.toHaveBeenCalledWith(
+        metadataPath,
+        expect.any(String),
+      );
+    });
+
     it('should preserve Claude metadata during startup when local native history is missing', async () => {
       const timestamp = Date.now();
       const sessionMeta = JSON.stringify({
@@ -1766,7 +3292,7 @@ describe('ClaudianPlugin', () => {
         providerId: 'claude',
         title: 'Stale Chat',
         createdAt: timestamp,
-        updatedAt: timestamp,
+        lastActivityAt: timestamp,
         sessionId: 'missing-session',
       });
 
@@ -1806,7 +3332,7 @@ describe('ClaudianPlugin', () => {
         id: 'conv-saved-1',
         title: 'Saved Chat',
         createdAt: timestamp,
-        updatedAt: timestamp,
+        lastActivityAt: timestamp,
         sessionId: 'saved-session',
       });
 
@@ -1855,7 +3381,7 @@ describe('ClaudianPlugin', () => {
         id: 'conv-saved-1',
         title: 'Saved Chat',
         createdAt: timestamp,
-        updatedAt: timestamp,
+        lastActivityAt: timestamp,
         sessionId: 'saved-session',
       });
 
@@ -1927,7 +3453,7 @@ describe('ClaudianPlugin', () => {
         id: 'conv-multi-session',
         title: 'Multi Session Chat',
         createdAt: timestamp,
-        updatedAt: timestamp,
+        lastActivityAt: timestamp,
         providerState: {
           providerSessionId: 'session-B',
           previousProviderSessionIds: ['session-A'],

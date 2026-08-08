@@ -5,6 +5,7 @@
  * initialization promise so concurrent callers cannot repeat work.
  */
 
+import type { ProviderExecutionTransitionScope } from '../execution';
 import type { ProviderHost } from './ProviderHost';
 import type {
   ProviderId,
@@ -13,10 +14,14 @@ import type {
   ProviderWorkspaceServices,
 } from './types';
 
+interface ProviderInitializationAttempt {
+  promise: Promise<void>;
+}
+
 export class ProviderInitializationBoundary {
   private registrations: Partial<Record<ProviderId, ProviderWorkspaceRegistration>> = {};
   private services: Partial<Record<ProviderId, ProviderWorkspaceServices>> = {};
-  private initPromises: Partial<Record<ProviderId, Promise<void>>> = {};
+  private initAttempts: Partial<Record<ProviderId, ProviderInitializationAttempt>> = {};
   private generation = 0;
 
   getRegisteredProviderIds(): ProviderId[] {
@@ -31,7 +36,7 @@ export class ProviderInitializationBoundary {
       this.services[providerId] = services;
     } else {
       delete this.services[providerId];
-      delete this.initPromises[providerId];
+      delete this.initAttempts[providerId];
     }
   }
 
@@ -51,18 +56,31 @@ export class ProviderInitializationBoundary {
       return;
     }
 
-    const existing = this.initPromises[providerId];
+    const existing = this.initAttempts[providerId];
     if (existing) {
-      return existing;
+      await existing.promise;
+      return;
     }
 
-    const promise = this.runInitialize(plugin, providerId, this.generation);
-    this.initPromises[providerId] = promise;
+    const generation = this.generation;
+    const promise = plugin.runProviderExecutionTransition(
+      [providerId],
+      (transitionScope) => this.runInitialize(
+        plugin,
+        providerId,
+        generation,
+        transitionScope,
+      ),
+    );
+    const attempt: ProviderInitializationAttempt = {
+      promise,
+    };
+    this.initAttempts[providerId] = attempt;
     try {
       await promise;
     } finally {
-      if (this.initPromises[providerId] === promise) {
-        delete this.initPromises[providerId];
+      if (this.initAttempts[providerId] === attempt) {
+        delete this.initAttempts[providerId];
       }
     }
   }
@@ -82,7 +100,7 @@ export class ProviderInitializationBoundary {
       }
       delete this.services[providerId];
     }
-    this.initPromises = {};
+    this.initAttempts = {};
     await Promise.allSettled(promises);
   }
 
@@ -90,6 +108,7 @@ export class ProviderInitializationBoundary {
     plugin: ProviderHost,
     providerId: ProviderId,
     generation: number,
+    transitionScope: ProviderExecutionTransitionScope,
   ): Promise<void> {
     const registration = this.registrations[providerId];
     if (!registration) {
@@ -98,14 +117,12 @@ export class ProviderInitializationBoundary {
 
     const storage = plugin.storage;
     const vaultAdapter = storage.getAdapter();
-    const { HomeFileAdapter } = await import('../storage/HomeFileAdapter');
-    const homeAdapter = new HomeFileAdapter();
 
     const context: ProviderWorkspaceInitContext = {
       plugin,
       storage,
       vaultAdapter,
-      homeAdapter,
+      transitionScope,
     };
 
     const services = await registration.initialize(context);

@@ -52,6 +52,13 @@ describe('i18n', () => {
       expect(result).toBe('Your name for personalized greetings (leave empty for generic greetings)');
     });
 
+    it('keeps shared skill management help concise', () => {
+      expect(t('settings.agentSkills.sharedExpectation' as TranslationKey))
+        .toBe(
+          'Manage shared skills in .agents/skills/ for compatible providers.',
+        );
+    });
+
     it('returns key when value is not a string', () => {
       // Try to access a non-leaf key (object instead of string)
       const result = t('settings' as TranslationKey);

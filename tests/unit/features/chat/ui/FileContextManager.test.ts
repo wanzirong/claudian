@@ -1,5 +1,5 @@
-import { createMockEl, type MockElement } from '@test/helpers/mockElement';
-import { TFile } from 'obsidian';
+import { createMockEl, type MockElement } from '@test/helpers/MockElement';
+import { TFile, TFolder } from 'obsidian';
 
 import type { FileContextCallbacks } from '@/features/chat/ui/FileContext';
 import { FileContextManager } from '@/features/chat/ui/FileContext';
@@ -599,6 +599,24 @@ describe('FileContextManager', () => {
       manager.destroy();
     });
 
+    it('should update current and attached note paths when a folder is renamed', () => {
+      const app = createMockApp({ files: ['projects/old/plan.md'] });
+      const manager = new FileContextManager(
+        app, containerEl as any, inputEl, createMockCallbacks()
+      );
+
+      manager.setCurrentNote('projects/old/plan.md');
+      const renameHandler = (app.vault.on as jest.Mock).mock.calls
+        .find((c: any[]) => c[0] === 'rename')?.[1];
+
+      renameHandler(new (TFolder as any)('projects/new'), 'projects/old');
+
+      expect(manager.getCurrentNotePath()).toBe('projects/new/plan.md');
+      expect(manager.getAttachedFiles().has('projects/new/plan.md')).toBe(true);
+      expect(manager.getAttachedFiles().has('projects/old/plan.md')).toBe(false);
+      manager.destroy();
+    });
+
     it('should not update if renamed file is not attached', () => {
       const app = createMockApp({ files: ['notes/a.md', 'notes/unrelated.md'] });
       const manager = new FileContextManager(
@@ -845,6 +863,28 @@ describe('FileContextManager', () => {
   });
 
   describe('destroy', () => {
+    it('rolls back an acquired vault listener when construction fails', () => {
+      const app = createMockApp();
+      const deleteEventRef = { id: 'delete-ref' };
+      const initializationError = new Error('Rename listener failed');
+      app.vault.on
+        .mockReturnValueOnce(deleteEventRef)
+        .mockImplementationOnce(() => {
+          throw initializationError;
+        });
+
+      expect(() => new FileContextManager(
+        app,
+        containerEl as any,
+        inputEl,
+        createMockCallbacks(),
+      )).toThrow(initializationError);
+
+      expect(app.vault.offref).toHaveBeenCalledTimes(1);
+      expect(app.vault.offref).toHaveBeenCalledWith(deleteEventRef);
+      expect(containerEl.children).toHaveLength(0);
+    });
+
     it('should clean up event listeners', () => {
       const app = createMockApp();
       const manager = new FileContextManager(

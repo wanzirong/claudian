@@ -1,10 +1,8 @@
 const mockGetHostnameKey = jest.fn(() => 'host-a');
-const mockGetLegacyHostnameKey = jest.fn(() => 'legacy-host');
 
 jest.mock('../../../../src/utils/env', () => ({
   ...jest.requireActual('../../../../src/utils/env'),
   getHostnameKey: () => mockGetHostnameKey(),
-  getLegacyHostnameKey: () => mockGetLegacyHostnameKey(),
 }));
 
 import {
@@ -26,7 +24,6 @@ describe('OpenCode settings normalization', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetHostnameKey.mockReturnValue('host-a');
-    mockGetLegacyHostnameKey.mockReturnValue('legacy-host');
   });
 
   it('enables Exa-backed web search in the default provider env', () => {
@@ -89,9 +86,8 @@ describe('OpenCode settings normalization', () => {
     });
   });
 
-  it('migrates current legacy hostname-scoped CLI paths to the opaque device key', () => {
+  it('preserves hostname-scoped CLI paths without assigning them to the current device', () => {
     mockGetHostnameKey.mockReturnValue('device:current');
-    mockGetLegacyHostnameKey.mockReturnValue('host-a');
 
     const settings = getOpencodeProviderSettings({
       providerConfigs: {
@@ -105,9 +101,22 @@ describe('OpenCode settings normalization', () => {
     });
 
     expect(settings.cliPathsByHost).toEqual({
-      'device:current': '/host-a/opencode',
+      'host-a': '/host-a/opencode',
       'host-b': '/host-b/opencode',
     });
+  });
+
+  it('rejects arrays and filters mixed hostname CLI maps', () => {
+    expect(getOpencodeProviderSettings({
+      providerConfigs: { opencode: { cliPathsByHost: ['/array/opencode'] } },
+    }).cliPathsByHost).toEqual({});
+    expect(getOpencodeProviderSettings({
+      providerConfigs: {
+        opencode: {
+          cliPathsByHost: { ' host-a ': ' /host-a/opencode ', invalid: false },
+        },
+      },
+    }).cliPathsByHost).toEqual({ 'host-a': '/host-a/opencode' });
   });
 
   it('normalizes model aliases to base model ids and trims values', () => {
@@ -350,7 +359,7 @@ describe('OpenCode settings normalization', () => {
     });
   });
 
-  it('normalizes saved custom OpenCode modes back to the managed YOLO mode', () => {
+  it('normalizes saved custom OpenCode modes back to the managed safe mode', () => {
     expect(getOpencodeProviderSettings({
       providerConfigs: {
         opencode: {
@@ -358,7 +367,7 @@ describe('OpenCode settings normalization', () => {
           selectedMode: 'compaction',
         },
       },
-    }).selectedMode).toBe('claudian-yolo');
+    }).selectedMode).toBe('claudian-safe');
   });
 
   it('normalizes the legacy build alias back to the managed YOLO mode', () => {

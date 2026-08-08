@@ -1,6 +1,6 @@
 {
   "name": "claudian",
-  "version": "2.0.39",
+  "version": "2.1.2",
   "description": "Claudian - Claude Code embedded in Obsidian sidebar",
   "main": "main.js",
   "engines": {
@@ -11,6 +11,7 @@
     "build:css": "node scripts/build-css.mjs",
     "dev": "npm run build:css && node esbuild.config.mjs",
     "build": "node scripts/build.mjs production",
+    "check:lockfile": "bun install --frozen-lockfile --ignore-scripts",
     "check:performance": "node scripts/check-startup-performance.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"{src,tests}/**/*.ts\"",
@@ -38,7 +39,7 @@
     "@types/node": "^25.5.2",
     "@typescript-eslint/eslint-plugin": "^8.58.0",
     "@typescript-eslint/parser": "^8.58.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.1",
     "eslint": "^10.2.0",
     "eslint-plugin-jest": "^29.15.1",
     "eslint-plugin-obsidianmd": "^0.4.1",
@@ -47,20 +48,26 @@
     "jest-environment-jsdom": "^30.3.0",
     "obsidian": "latest",
     "ts-jest": "^29.4.9",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.1",
     "typescript": "^6.0.2"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.209",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
     "@codemirror/state": "^6.5.0",
     "@codemirror/view": "^6.38.6",
-    "@modelcontextprotocol/sdk": "~1.29.0",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/sdk": "~1.30.0",
+    "@pierre/trees": "1.0.0-beta.6",
     "smol-toml": "^1.6.1",
     "tslib": "^2.8.1"
   },
   "overrides": {
     "@babel/core": "7.29.7",
-    "hono": "4.12.26",
-    "js-yaml": "4.2.0"
+    "@hono/node-server": "2.0.11",
+    "body-parser": "2.3.0",
+    "fast-uri": "3.1.5",
+    "hono": "4.12.34",
+    "ip-address": "10.3.1",
+    "js-yaml": "4.3.0"
   }
 }

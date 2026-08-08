@@ -4,9 +4,9 @@ import * as os from 'os';
 
 import {
   collectAsyncSubagentResults,
-  deleteSDKSession,
   encodeVaultPathForSDK,
   filterActiveBranch,
+  getLastSDKSessionModel,
   getSDKProjectsPath,
   getSDKSessionAvailability,
   getSDKSessionPath,
@@ -37,6 +37,62 @@ describe('sdkSession', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockOs.homedir.mockReturnValue('/Users/test');
+  });
+
+  it('finds the last non-synthetic model on the active Claude branch', () => {
+    const entries: SDKNativeMessage[] = [
+      { type: 'assistant', uuid: 'a1', message: { model: 'claude-opus-4-6' } },
+      {
+        type: 'user',
+        uuid: 'u2',
+        parentUuid: 'a1',
+        message: { role: 'user', content: 'Continue' },
+      },
+      {
+        type: 'assistant',
+        uuid: 'a2',
+        parentUuid: 'u2',
+        message: { model: '<synthetic>' },
+      },
+      {
+        type: 'assistant',
+        uuid: 'a3',
+        parentUuid: 'a2',
+        message: { model: 'deepseek-v4-pro' },
+      },
+    ];
+
+    expect(getLastSDKSessionModel(entries)).toBe('deepseek-v4-pro');
+    expect(getLastSDKSessionModel(entries, 'a1')).toBe('claude-opus-4-6');
+  });
+
+  it('does not recover a Claude model from a stale rewind checkpoint', () => {
+    const entries: SDKNativeMessage[] = [
+      { type: 'user', uuid: 'u1', parentUuid: null },
+      {
+        type: 'assistant',
+        uuid: 'a1',
+        parentUuid: 'u1',
+        message: { model: 'claude-sonnet-4-5' },
+      },
+      { type: 'user', uuid: 'u2', parentUuid: 'a1' },
+      {
+        type: 'assistant',
+        uuid: 'a2',
+        parentUuid: 'u2',
+        message: { model: 'claude-opus-4-6' },
+      },
+      { type: 'user', uuid: 'u3', parentUuid: 'a1' },
+      {
+        type: 'assistant',
+        uuid: 'a3',
+        parentUuid: 'u3',
+        message: { model: 'claude-haiku-4-5' },
+      },
+    ];
+
+    expect(getLastSDKSessionModel(entries, 'missing-checkpoint')).toBeNull();
+    expect(getLastSDKSessionModel(entries, 'a2')).toBeNull();
   });
 
   describe('encodeVaultPathForSDK', () => {
@@ -375,55 +431,6 @@ describe('sdkSession', () => {
         '../invalid',
       )).resolves.toBe('unknown');
       expect(mockFsPromises.access).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('deleteSDKSession', () => {
-    it('deletes session file when it exists', async () => {
-      mockExistsSync.mockReturnValue(true);
-      mockFsPromises.unlink.mockResolvedValue(undefined);
-
-      await deleteSDKSession('/Users/test/vault', 'session-abc');
-
-      expect(mockFsPromises.unlink).toHaveBeenCalledWith(
-        '/Users/test/.claude/projects/-Users-test-vault/session-abc.jsonl'
-      );
-    });
-
-    it('does nothing when session file does not exist', async () => {
-      mockExistsSync.mockReturnValue(false);
-
-      await deleteSDKSession('/Users/test/vault', 'nonexistent');
-
-      expect(mockFsPromises.unlink).not.toHaveBeenCalled();
-    });
-
-    it('fails silently when unlink throws', async () => {
-      mockExistsSync.mockReturnValue(true);
-      mockFsPromises.unlink.mockRejectedValue(new Error('Permission denied'));
-
-      // Should not throw
-      await expect(deleteSDKSession('/Users/test/vault', 'session-err')).resolves.toBeUndefined();
-    });
-
-    it('does nothing for invalid session ID', async () => {
-      await deleteSDKSession('/Users/test/vault', '../invalid');
-
-      expect(mockFsPromises.unlink).not.toHaveBeenCalled();
-    });
-
-    it('deletes from the effective Claude config directory', async () => {
-      mockExistsSync.mockReturnValue(true);
-      mockFsPromises.unlink.mockResolvedValue(undefined);
-
-      await deleteSDKSession('/Users/test/vault', 'session-custom', {
-        environment: { CLAUDE_CONFIG_DIR: '/custom/claude' },
-        vaultPath: '/Users/test/vault',
-      });
-
-      expect(mockFsPromises.unlink).toHaveBeenCalledWith(
-        '/custom/claude/projects/-Users-test-vault/session-custom.jsonl',
-      );
     });
   });
 
@@ -1162,6 +1169,67 @@ describe('sdkSession', () => {
       expect(result.messages[1].toolCalls![0].status).toBe('completed');
       expect(result.messages[1].content).toContain('Let me search');
       expect(result.messages[1].content).toContain('I found 10 results about cats.');
+    });
+
+    it('hydrates Claude task mutations as TodoWrite snapshots', async () => {
+      mockExistsSync.mockReturnValue(true);
+      mockFsPromises.readFile.mockResolvedValue([
+        '{"type":"user","uuid":"u1","timestamp":"2024-01-15T10:00:00Z","message":{"content":"Fix the issue"}}',
+        '{"type":"assistant","uuid":"a1","timestamp":"2024-01-15T10:01:00Z","message":{"content":[{"type":"tool_use","id":"create-1","name":"TaskCreate","input":{"subject":"Inspect issue","activeForm":"Inspecting issue"}}]}}',
+        '{"type":"user","uuid":"r1","timestamp":"2024-01-15T10:02:00Z","toolUseResult":{"task":{"id":"1","subject":"Inspect issue"}},"message":{"content":[{"type":"tool_result","tool_use_id":"create-1","content":"Task #1 created successfully: Inspect issue"}]}}',
+        '{"type":"assistant","uuid":"a2","timestamp":"2024-01-15T10:03:00Z","message":{"content":[{"type":"tool_use","id":"create-2","name":"TaskCreate","input":{"subject":"Implement fix"}}]}}',
+        '{"type":"user","uuid":"r2","timestamp":"2024-01-15T10:04:00Z","toolUseResult":{"task":{"id":"2","subject":"Implement fix"}},"message":{"content":[{"type":"tool_result","tool_use_id":"create-2","content":"Task #2 created successfully: Implement fix"}]}}',
+        '{"type":"assistant","uuid":"a3","timestamp":"2024-01-15T10:05:00Z","message":{"content":[{"type":"tool_use","id":"update-1","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}},{"type":"tool_use","id":"delete-2","name":"TaskUpdate","input":{"taskId":"2","status":"deleted"}}]}}',
+        '{"type":"user","uuid":"r3","timestamp":"2024-01-15T10:06:00Z","toolUseResult":{"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"pending","to":"completed"}},"message":{"content":[{"type":"tool_result","tool_use_id":"update-1","content":"Updated task #1 status"}]}}',
+        '{"type":"user","uuid":"r4","timestamp":"2024-01-15T10:07:00Z","toolUseResult":{"success":true,"taskId":"2","updatedFields":["deleted"],"statusChange":{"from":"pending","to":"deleted"}},"message":{"content":[{"type":"tool_result","tool_use_id":"delete-2","content":"Updated task #2 deleted"}]}}',
+      ].join('\n'));
+
+      const result = await loadSDKSessionMessages('/Users/test/vault', 'session-task-tools');
+      const taskCalls = result.messages
+        .flatMap(message => message.toolCalls ?? [])
+        .filter(toolCall => toolCall.name === 'TodoWrite');
+
+      expect(taskCalls).toHaveLength(4);
+      expect(taskCalls[0].providerPayload).toMatchObject({
+        rawName: 'TaskCreate',
+        rawInput: { subject: 'Inspect issue', activeForm: 'Inspecting issue' },
+      });
+      expect(taskCalls.at(-1)?.input).toEqual({
+        todos: [{
+          id: '1',
+          content: 'Inspect issue',
+          activeForm: 'Inspecting issue',
+          status: 'completed',
+        }],
+      });
+    });
+
+    it('preserves Claude task state across compacted history', async () => {
+      mockExistsSync.mockReturnValue(true);
+      mockFsPromises.readFile.mockResolvedValue([
+        '{"type":"user","uuid":"u1","timestamp":"2024-01-15T10:00:00Z","message":{"content":"Fix the issue"}}',
+        '{"type":"assistant","uuid":"a1","timestamp":"2024-01-15T10:01:00Z","message":{"content":[{"type":"tool_use","id":"create-1","name":"TaskCreate","input":{"subject":"Inspect issue","activeForm":"Inspecting issue"}}]}}',
+        '{"type":"user","uuid":"r1","timestamp":"2024-01-15T10:02:00Z","toolUseResult":{"task":{"id":"1","subject":"Inspect issue"}},"message":{"content":[{"type":"tool_result","tool_use_id":"create-1","content":"Task #1 created successfully: Inspect issue"}]}}',
+        '{"type":"system","subtype":"compact_boundary","uuid":"c1","timestamp":"2024-01-15T10:03:00Z"}',
+        '{"type":"user","uuid":"summary","timestamp":"2024-01-15T10:03:01Z","isMeta":true,"message":{"content":"This session is being continued from a previous conversation"}}',
+        '{"type":"user","uuid":"u2","timestamp":"2024-01-15T10:04:00Z","message":{"content":"Continue"}}',
+        '{"type":"assistant","uuid":"a2","timestamp":"2024-01-15T10:05:00Z","message":{"content":[{"type":"tool_use","id":"update-1","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}',
+        '{"type":"user","uuid":"r2","timestamp":"2024-01-15T10:06:00Z","toolUseResult":{"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"pending","to":"completed"}},"message":{"content":[{"type":"tool_result","tool_use_id":"update-1","content":"Updated task #1 status"}]}}',
+      ].join('\n'));
+
+      const result = await loadSDKSessionMessages('/Users/test/vault', 'session-task-compact');
+      const taskCalls = result.messages
+        .flatMap(message => message.toolCalls ?? [])
+        .filter(toolCall => toolCall.name === 'TodoWrite');
+
+      expect(taskCalls.at(-1)?.input).toEqual({
+        todos: [{
+          id: '1',
+          content: 'Inspect issue',
+          activeForm: 'Inspecting issue',
+          status: 'completed',
+        }],
+      });
     });
 
     it('hydrates AskUserQuestion answers from result text when toolUseResult has no answers', async () => {

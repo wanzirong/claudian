@@ -1,16 +1,38 @@
 import '@/providers';
 
+import {
+  ProviderExecutionLifecycleRegistry,
+  type ProviderExecutionTransitionScope,
+} from '@/core/execution';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import type { ProviderId } from '@/core/providers/types';
 
 function createProviderHost(): ProviderHost {
+  const executionLifecycleRegistry = new ProviderExecutionLifecycleRegistry();
   return {
     app: {},
+    executionLifecycleRegistry,
+    runProviderExecutionTransition: <T>(
+      providerIds: ProviderId[],
+      mutation: (scope: ProviderExecutionTransitionScope) => Promise<T>,
+      parentScope?: ProviderExecutionTransitionScope,
+    ) => (
+      executionLifecycleRegistry.runTransition(
+        providerIds,
+        mutation,
+        parentScope,
+      )
+    ),
     settings: {},
     storage: {
       getAdapter: jest.fn().mockReturnValue({}),
     },
   } as unknown as ProviderHost;
+}
+
+async function flushAsyncWork(): Promise<void> {
+  await new Promise(resolve => setImmediate(resolve));
 }
 
 describe('ProviderWorkspaceRegistry', () => {
@@ -56,7 +78,7 @@ describe('ProviderWorkspaceRegistry', () => {
       listVaultEntries: jest.fn(),
       saveVaultEntry: jest.fn(),
       deleteVaultEntry: jest.fn(),
-      setRuntimeCommands: jest.fn(),
+      setCommandSnapshot: jest.fn(),
       getDropdownConfig: jest.fn(),
       refresh: jest.fn(),
     };
@@ -68,17 +90,42 @@ describe('ProviderWorkspaceRegistry', () => {
     expect(ProviderWorkspaceRegistry.getCommandCatalog('claude')).toBe(mockCatalog);
   });
 
-  it('returns the runtime command loader for a provider', () => {
-    const runtimeCommandLoader = {
+  it('returns the command loader for a provider', () => {
+    const commandLoader = {
+      getCacheFingerprint: jest.fn().mockReturnValue('enabled:bundled-cli'),
       isAvailable: jest.fn().mockReturnValue(true),
-      loadCommands: jest.fn().mockResolvedValue([]),
+      loadCommands: jest.fn().mockResolvedValue({ status: 'empty' }),
     };
 
     ProviderWorkspaceRegistry.setServices('opencode', {
-      runtimeCommandLoader: runtimeCommandLoader as any,
+      commandLoader: commandLoader as any,
     });
 
-    expect(ProviderWorkspaceRegistry.getRuntimeCommandLoader('opencode')).toBe(runtimeCommandLoader);
+    expect(ProviderWorkspaceRegistry.getCommandLoader('opencode')).toBe(commandLoader);
+  });
+
+  it('keeps editable vault repositories separate from runtime command catalogs', () => {
+    const commandCatalog = {
+      listDropdownEntries: jest.fn(),
+      setCommandSnapshot: jest.fn(),
+      getDropdownConfig: jest.fn(),
+      refresh: jest.fn(),
+    };
+    const vaultCommandRepository = {
+      listVaultEntries: jest.fn(),
+      saveVaultEntry: jest.fn(),
+      deleteVaultEntry: jest.fn(),
+    };
+
+    ProviderWorkspaceRegistry.setServices('claude', {
+      commandCatalog,
+      vaultCommandRepository,
+    });
+
+    const services = ProviderWorkspaceRegistry.getServices('claude');
+    expect(services?.commandCatalog).toBe(commandCatalog);
+    expect(services?.vaultCommandRepository).toBe(vaultCommandRepository);
+    expect(commandCatalog).not.toHaveProperty('saveVaultEntry');
   });
 
   it('returns the tab warmup policy for a provider', () => {
@@ -179,7 +226,8 @@ describe('ProviderWorkspaceRegistry', () => {
       'codex',
       'cold-start',
     );
-    await Promise.resolve();
+    await flushAsyncWork();
+    expect(initialize).toHaveBeenCalledTimes(1);
     await ProviderWorkspaceRegistry.disposeInitialized();
     finishInitialization({ dispose });
     await initialization;
@@ -195,5 +243,69 @@ describe('ProviderWorkspaceRegistry', () => {
     await ProviderWorkspaceRegistry.prepareSettings('codex');
 
     expect(prepareSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs cold provider initialization inside the execution lifecycle transition', async () => {
+    const host = createProviderHost();
+    const events: string[] = [];
+    host.executionLifecycleRegistry.registerTransitionHook('grok', {
+      beforeTransition: () => {
+        events.push('before');
+      },
+      afterTransition: () => {
+        events.push('after');
+      },
+    });
+    ProviderWorkspaceRegistry.register('grok', {
+      initialize: jest.fn(async () => {
+        events.push('initialize');
+        return { commandCatalog: {} as any };
+      }),
+    });
+
+    await ProviderWorkspaceRegistry.ensureInitialized(host, 'grok', 'cold-query');
+
+    expect(events).toEqual(['before', 'initialize', 'after']);
+    expect(host.executionLifecycleRegistry.getProviderGeneration('grok')).toBe(1);
+  });
+
+  it('rejects a nested transition started by async provider initialization', async () => {
+    const host = createProviderHost();
+    const nestedMutation = jest.fn(async () => undefined);
+    ProviderWorkspaceRegistry.register('grok', {
+      initialize: jest.fn(async (context) => {
+        await Promise.resolve();
+        await context.plugin.runProviderExecutionTransition(
+          ['grok'],
+          nestedMutation,
+          context.transitionScope,
+        );
+        return { commandCatalog: {} as any };
+      }),
+    });
+
+    const initialization = ProviderWorkspaceRegistry.ensureInitialized(
+      host,
+      'grok',
+      'nested-transition',
+    );
+    const outcome = await Promise.race([
+      initialization.then(
+        () => ({ kind: 'resolved' as const }),
+        (error: unknown) => ({ kind: 'rejected' as const, error }),
+      ),
+      new Promise<{ kind: 'timeout' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'timeout' }), 100);
+      }),
+    ]);
+
+    expect(outcome).toMatchObject({
+      kind: 'rejected',
+      error: {
+        providerId: 'grok',
+        retryable: true,
+      },
+    });
+    expect(nestedMutation).not.toHaveBeenCalled();
   });
 });

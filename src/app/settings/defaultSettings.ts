@@ -13,6 +13,7 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   effortLevel: DEFAULT_REASONING_VALUE,
   serviceTier: 'default',
   enableAutoTitleGeneration: true,
+  titleGenerationLocale: '',
   titleGenerationModel: '',
 
   excludedTags: [],
@@ -37,6 +38,7 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   providerConfigs: getBuiltInProviderDefaultConfigs(),
 
   settingsProvider: 'claude',
+  lastSelectedChatModel: null,
   savedProviderModel: {},
   savedProviderEffort: {},
   savedProviderServiceTier: {},
@@ -46,11 +48,17 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
 
   lastCustomModel: '',
 
-  maxTabs: 3,
+  maxWarmAgentProcesses: 5,
   enableAutoScroll: true,
   deferMathRenderingDuringStreaming: true,
   expandFileEditsByDefault: false,
   chatViewPlacement: 'right-sidebar',
+  enableDualPane: true,
+  enableFilePane: true,
+  dualPaneSide: 'right',
+  sessionManagerOrganization: 'list',
+  sessionManagerSort: 'last-updated',
+  pinnedLinkedNotePaths: [],
 
   hiddenProviderCommands: getDefaultHiddenProviderCommands(),
 };

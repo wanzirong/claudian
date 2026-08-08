@@ -1,4 +1,6 @@
 import type { SlashCommand, StreamChunk } from '../../core/types';
+import type { SDKToolUseResult } from '../../core/types/diff';
+import { extractAcpDiffToolUseResult } from './AcpToolResultNormalization';
 import type {
   AcpAvailableCommand,
   AcpContentBlock,
@@ -57,13 +59,20 @@ export type AcpNormalizedUpdate =
   | {
     type: 'usage';
     usage: AcpUsageUpdate;
+  }
+  | {
+    type: 'unknown';
+    update: unknown;
   };
 
 export interface AcpToolCallSnapshot {
   input: Record<string, unknown>;
   name: string;
   output: string;
+  rawInput?: unknown;
+  rawOutput?: unknown;
   status?: AcpToolCallStatus | null;
+  toolUseResult?: SDKToolUseResult;
 }
 
 type MessageRole = 'assistant' | 'thinking' | 'user';
@@ -78,6 +87,17 @@ export class AcpSessionUpdateNormalizer {
   reset(): void {
     this.seenMessages.clear();
     this.toolCalls.clear();
+  }
+
+  normalizeUnknown(update: unknown): AcpNormalizedUpdate {
+    if (
+      !isPlainObject(update)
+      || typeof update.sessionUpdate !== 'string'
+      || !KNOWN_SESSION_UPDATES.has(update.sessionUpdate)
+    ) {
+      return { type: 'unknown', update };
+    }
+    return this.normalize(update as unknown as AcpSessionUpdate);
   }
 
   normalize(update: AcpSessionUpdate): AcpNormalizedUpdate {
@@ -96,7 +116,7 @@ export class AcpSessionUpdateNormalizer {
         return { plan: update, type: 'plan' };
       case 'available_commands_update':
         return {
-          commands: update.availableCommands.map(mapAcpCommandToSlashCommand),
+          commands: normalizeAcpAvailableCommands(update.availableCommands),
           type: 'commands',
         };
       case 'current_mode_update':
@@ -149,11 +169,15 @@ export class AcpSessionUpdateNormalizer {
   }
 
   private normalizeToolCall(toolCall: AcpToolCall): Extract<AcpNormalizedUpdate, { type: 'tool_call' }> {
+    const toolUseResult = extractAcpDiffToolUseResult(toolCall.content);
     const toolState: AcpToolCallSnapshot = {
       input: normalizeToolInput(toolCall.rawInput),
       name: normalizeToolName(toolCall.title, toolCall.kind),
       output: renderToolPayload(toolCall.content, toolCall.rawOutput),
+      rawInput: toolCall.rawInput,
+      rawOutput: toolCall.rawOutput,
       status: toolCall.status,
+      ...(toolUseResult ? { toolUseResult } : {}),
     };
     this.toolCalls.set(toolCall.toolCallId, toolState);
 
@@ -169,6 +193,7 @@ export class AcpSessionUpdateNormalizer {
         content: toolState.output || defaultToolResultText(toolState.status),
         id: toolCall.toolCallId,
         isError: toolState.status === 'failed',
+        ...(toolState.toolUseResult ? { toolUseResult: toolState.toolUseResult } : {}),
         type: 'tool_result',
       });
     }
@@ -194,6 +219,17 @@ export class AcpSessionUpdateNormalizer {
 
     if (toolCallUpdate.rawInput !== undefined) {
       current.input = normalizeToolInput(toolCallUpdate.rawInput);
+      current.rawInput = toolCallUpdate.rawInput;
+    }
+    if (toolCallUpdate.rawOutput !== undefined) {
+      current.rawOutput = toolCallUpdate.rawOutput;
+    }
+    const toolUseResult = extractAcpDiffToolUseResult(toolCallUpdate.content);
+    if (toolUseResult) {
+      current.toolUseResult = {
+        ...current.toolUseResult,
+        ...toolUseResult,
+      };
     }
 
     const nextOutput = renderToolPayload(toolCallUpdate.content ?? undefined, toolCallUpdate.rawOutput)
@@ -219,6 +255,7 @@ export class AcpSessionUpdateNormalizer {
         content: current.output || defaultToolResultText(current.status),
         id: toolCallUpdate.toolCallId,
         isError: current.status === 'failed',
+        ...(current.toolUseResult ? { toolUseResult: current.toolUseResult } : {}),
         type: 'tool_result',
       });
     }
@@ -248,6 +285,26 @@ export class AcpSessionUpdateNormalizer {
     seen.add(key);
     return true;
   }
+}
+
+const KNOWN_SESSION_UPDATES = new Set([
+  'agent_message_chunk',
+  'agent_thought_chunk',
+  'available_commands_update',
+  'config_option_update',
+  'current_mode_update',
+  'plan',
+  'session_info_update',
+  'tool_call',
+  'tool_call_update',
+  'usage_update',
+  'user_message_chunk',
+]);
+
+export function normalizeAcpAvailableCommands(
+  commands: readonly AcpAvailableCommand[],
+): SlashCommand[] {
+  return commands.map(mapAcpCommandToSlashCommand);
 }
 
 function mapAcpCommandToSlashCommand(command: AcpAvailableCommand): SlashCommand {

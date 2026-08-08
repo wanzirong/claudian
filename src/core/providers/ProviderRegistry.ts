@@ -1,8 +1,16 @@
-import type { ChatRuntime } from '../runtime/ChatRuntime';
+import { getVaultPath } from '../../utils/path';
+import { InlineEditService as SharedInlineEditService } from '../auxiliary/InlineEditService';
+import { InstructionRefineService as SharedInstructionRefineService } from '../auxiliary/InstructionRefineService';
+import { TitleGenerationService as SharedTitleGenerationService } from '../auxiliary/TitleGenerationService';
+import type {
+  ProviderExecutionBackend,
+  ProviderInteractionPort,
+} from '../execution';
+import { resolveTitleGenerationLocale } from '../prompt/titleGeneration';
 import { decodeProviderModelSelectionId } from './modelSelection';
 import type { ProviderHost } from './ProviderHost';
+import { ProviderWorkspaceRegistry } from './ProviderWorkspaceRegistry';
 import {
-  type CreateChatRuntimeOptions,
   DEFAULT_CHAT_PROVIDER_ID,
   type InlineEditService,
   type InstructionRefineService,
@@ -13,7 +21,8 @@ import {
   type ProviderRegistration,
   type ProviderSettingsReconciler,
   type ProviderSettingsStorageAdapter,
-  type ProviderSubagentLifecycleAdapter,
+  type ProviderSubagentAdapter,
+  type ProviderSubagentHistoryService,
   type ProviderTaskResultInterpreter,
   type ProviderUIOption,
   type TitleGenerationCallback,
@@ -45,16 +54,33 @@ export class ProviderRegistry {
     return registration;
   }
 
-  static createChatRuntime(options: CreateChatRuntimeOptions): ChatRuntime {
-    const providerId = options.providerId ?? DEFAULT_CHAT_PROVIDER_ID;
-    return this.getProviderRegistration(providerId).createRuntime(options);
+  static createExecutionBackend(
+    plugin: ProviderHost,
+    providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID,
+  ): ProviderExecutionBackend {
+    return this.getProviderRegistration(providerId).createExecutionBackend(plugin);
+  }
+
+  static createSubagentHistoryService(
+    plugin: ProviderHost,
+    providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID,
+  ): ProviderSubagentHistoryService | null {
+    const factory = this.getProviderRegistration(providerId).createSubagentHistoryService;
+    return factory?.(plugin) ?? null;
   }
 
   static createTitleGenerationService(plugin: ProviderHost, providerId?: ProviderId): TitleGenerationService {
     if (!providerId) {
       return new RoutedTitleGenerationService(plugin);
     }
-    return this.getProviderRegistration(providerId).createTitleGenerationService(plugin);
+    const registration = this.getProviderRegistration(providerId);
+    return new SharedTitleGenerationService({
+      ...this.createAuxiliaryExecutionContext(plugin, providerId),
+      resolveLocale: () => resolveTitleGenerationLocale(plugin.settings),
+      resolveModel: registration.resolveTitleGenerationModel
+        ? () => registration.resolveTitleGenerationModel?.(plugin)
+        : undefined,
+    });
   }
 
   static resolveTitleGenerationProviderId(settings: Record<string, unknown>): ProviderId {
@@ -63,7 +89,9 @@ export class ProviderRegistry {
       : '';
 
     if (!titleModel) {
-      return DEFAULT_CHAT_PROVIDER_ID;
+      return this.isEnabled(DEFAULT_CHAT_PROVIDER_ID, settings)
+        ? DEFAULT_CHAT_PROVIDER_ID
+        : this.resolveSettingsProviderId(settings);
     }
 
     return this.resolveProviderForModel(titleModel, settings, {
@@ -73,11 +101,27 @@ export class ProviderRegistry {
   }
 
   static createInstructionRefineService(plugin: ProviderHost, providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID): InstructionRefineService {
-    return this.getProviderRegistration(providerId).createInstructionRefineService(plugin);
+    return new SharedInstructionRefineService(
+      this.createAuxiliaryExecutionContext(plugin, providerId),
+    );
   }
 
   static createInlineEditService(plugin: ProviderHost, providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID): InlineEditService {
-    return this.getProviderRegistration(providerId).createInlineEditService(plugin);
+    return new SharedInlineEditService(
+      this.createAuxiliaryExecutionContext(plugin, providerId),
+    );
+  }
+
+  private static createAuxiliaryExecutionContext(
+    plugin: ProviderHost,
+    providerId: ProviderId,
+  ) {
+    return {
+      backend: this.createExecutionBackend(plugin, providerId),
+      interactionPort: PASSIVE_AUXILIARY_INTERACTION_PORT,
+      lifecycleRegistry: plugin.executionLifecycleRegistry,
+      vaultWorkingDirectory: getVaultPath(plugin.app) ?? '.',
+    };
   }
 
   static getConversationHistoryService(
@@ -92,10 +136,10 @@ export class ProviderRegistry {
     return this.getProviderRegistration(providerId).taskResultInterpreter;
   }
 
-  static getSubagentLifecycleAdapter(
+  static getSubagentAdapter(
     providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID,
-  ): ProviderSubagentLifecycleAdapter | null {
-    return this.getProviderRegistration(providerId).subagentLifecycleAdapter ?? null;
+  ): ProviderSubagentAdapter | null {
+    return this.getProviderRegistration(providerId).subagentAdapter ?? null;
   }
 
   static getCapabilities(providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID): ProviderCapabilities {
@@ -126,7 +170,10 @@ export class ProviderRegistry {
           continue;
         }
         seenValues.add(option.value);
-        options.push(option);
+        options.push({
+          ...option,
+          label: `${this.getProviderDisplayName(providerId)}: ${option.label}`,
+        });
       }
     }
 
@@ -155,6 +202,11 @@ export class ProviderRegistry {
       .sort((a, b) => (
         this.getProviderRegistration(a).blankTabOrder - this.getProviderRegistration(b).blankTabOrder
       ));
+  }
+
+  /** Provider order as presented from top to bottom in the blank-tab model selector. */
+  static getBlankTabProviderIds(settings: Record<string, unknown>): ProviderId[] {
+    return this.getEnabledProviderIds(settings).reverse();
   }
 
   static getProviderDisplayName(providerId: ProviderId): string {
@@ -253,6 +305,22 @@ export class ProviderRegistry {
   }
 }
 
+const PASSIVE_AUXILIARY_INTERACTION_PORT: ProviderInteractionPort = {
+  requestApproval: async request => ({
+    decision: 'cancel',
+    interactionId: request.interactionId,
+  }),
+  askUserQuestion: async request => ({
+    answers: null,
+    interactionId: request.interactionId,
+  }),
+  requestPlanDecision: async request => ({
+    decision: null,
+    interactionId: request.interactionId,
+  }),
+  dismissInteraction: () => undefined,
+};
+
 interface ActiveTitleGeneration {
   service: TitleGenerationService;
 }
@@ -269,6 +337,11 @@ class RoutedTitleGenerationService implements TitleGenerationService {
   ): Promise<void> {
     const providerId = ProviderRegistry.resolveTitleGenerationProviderId(
       this.plugin.settings,
+    );
+    await ProviderWorkspaceRegistry.ensureInitialized(
+      this.plugin,
+      providerId,
+      'title-generation',
     );
     const service = ProviderRegistry.createTitleGenerationService(this.plugin, providerId);
     const generation = { service };

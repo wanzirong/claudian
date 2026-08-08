@@ -88,6 +88,45 @@ describe('OpencodeConversationHistoryService', () => {
     ]);
   });
 
+  it('recovers the last OpenCode model from native message metadata', async () => {
+    const dbPath = path.join(tmpRoot, 'model-history.db');
+    const sessionId = 'session-model';
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        create table message (
+          id text primary key,
+          session_id text not null,
+          time_created integer not null,
+          data text not null
+        );
+        create table part (
+          id text primary key,
+          session_id text not null,
+          message_id text not null,
+          data text not null
+        );
+      `);
+      db.prepare('insert into message (id, session_id, time_created, data) values (?, ?, ?, ?)').run(
+        'assistant-1',
+        sessionId,
+        1_000,
+        JSON.stringify({
+          modelID: 'gemini-3.5-flash',
+          providerID: 'google',
+          role: 'assistant',
+        }),
+      );
+    } finally {
+      db.close();
+    }
+    const conversation = createConversation(sessionId, dbPath);
+
+    await expect(new OpencodeConversationHistoryService()
+      .recoverConversationModelSelection?.(conversation, null))
+      .resolves.toBe('opencode:google/gemini-3.5-flash');
+  });
+
   it('does not open an out-of-root metadata database and uses the current local database', async () => {
     const sessionId = 'session-trusted-path';
     const xdgDataHome = path.join(tmpRoot, 'xdg');
@@ -96,6 +135,7 @@ describe('OpencodeConversationHistoryService', () => {
     seedDatabase(trustedPath, sessionId, 'Trusted prompt');
     seedDatabase(outsidePath, sessionId, 'Outside prompt');
     const conversation = createConversation(sessionId, outsidePath);
+    conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
 
     await new OpencodeConversationHistoryService().hydrateConversationHistory(
       conversation,
@@ -104,7 +144,83 @@ describe('OpencodeConversationHistoryService', () => {
     );
 
     expect(conversation.messages.map(message => message.content)).toEqual(['Trusted prompt']);
-    expect(conversation.providerState).toEqual({ databasePath: trustedPath });
+    expect(conversation.providerState).toEqual({
+      databasePath: trustedPath,
+      futureResumeCursor: { token: 'cursor-1' },
+    });
+  });
+
+  it('sanitizes known fields while preserving unknown provider state', () => {
+    const conversation = createConversation('session-1', '/tmp/opencode.db');
+    conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
+
+    expect(
+      new OpencodeConversationHistoryService().buildPersistedProviderState(conversation),
+    ).toEqual({
+      databasePath: '/tmp/opencode.db',
+      futureResumeCursor: { token: 'cursor-1' },
+    });
+  });
+
+  describe('resolveMissingConversationSession', () => {
+    it('clears a confirmed stale resume ID while preserving provider-owned state', async () => {
+      const conversation = createConversation('missing-session', '/tmp/opencode.db');
+      conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
+      const service = new OpencodeConversationHistoryService();
+
+      await expect(service.resolveMissingConversationSession(
+        conversation,
+        null,
+        'missing-session',
+      )).resolves.toBe('reset');
+
+      expect(conversation.sessionId).toBeNull();
+      expect(conversation.providerState).toEqual({
+        databasePath: '/tmp/opencode.db',
+        futureResumeCursor: { token: 'cursor-1' },
+        nativeConversationContextEstablished: false,
+      });
+    });
+
+    it('preserves a newer resume ID when the failure identifies another session', async () => {
+      const conversation = createConversation('current-session', '/tmp/opencode.db');
+      conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
+      const service = new OpencodeConversationHistoryService();
+
+      await expect(service.resolveMissingConversationSession(
+        conversation,
+        null,
+        'stale-session',
+      )).resolves.toBe('preserve');
+
+      expect(conversation.sessionId).toBe('current-session');
+      expect(conversation.providerState).toEqual({
+        databasePath: '/tmp/opencode.db',
+        futureResumeCursor: { token: 'cursor-1' },
+      });
+    });
+  });
+
+  it('marks native context established when read-only hydration proves history exists', async () => {
+    const dbPath = path.join(tmpRoot, 'opencode.db');
+    seedDatabase(dbPath, 'session-established', 'Accepted prompt');
+    const conversation = createConversation('session-established', dbPath);
+    conversation.providerState = {
+      ...conversation.providerState,
+      futureResumeCursor: { token: 'cursor-1' },
+      nativeConversationContextEstablished: false,
+    };
+
+    await new OpencodeConversationHistoryService().hydrateConversationHistory(
+      conversation,
+      null,
+    );
+
+    expect(conversation.providerState).toEqual({
+      databasePath: dbPath,
+      futureResumeCursor: { token: 'cursor-1' },
+      nativeConversationContextEstablished: true,
+    });
   });
 
   it('accepts an explicitly configured local database path', async () => {
@@ -185,6 +301,6 @@ function createConversation(sessionId: string, databasePath: string): Conversati
     providerState: { databasePath },
     sessionId,
     title: 'OpenCode conversation',
-    updatedAt: 1,
+    lastActivityAt: 1,
   };
 }

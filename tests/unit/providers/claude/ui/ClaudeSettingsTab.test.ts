@@ -5,10 +5,27 @@ import { claudeSettingsTabRenderer } from '@/providers/claude/ui/ClaudeSettingsT
 
 const mockRenderEnvironmentSettingsSection = jest.fn();
 const mockSaveSettings = jest.fn().mockResolvedValue(undefined);
+const mockSlashCommandSettings = jest.fn();
+const mockMcpSettingsManager = jest.fn();
+const mockPluginSettingsManager = jest.fn();
+const mockCliResolverReset = jest.fn();
+const mockMcpManagerLoadServers = jest.fn().mockResolvedValue(undefined);
+const mockAgentManagerLoadAgents = jest.fn().mockResolvedValue(undefined);
+const mockVaultCommandRepository = {};
 
 jest.mock('fs');
 jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
   ProviderSettingsCoordinator: {
+    canApplyProviderEnablement: jest.fn(() => true),
+    applyProviderEnablement: jest.fn((
+      settings: Record<string, unknown>,
+      providerId: string,
+      enabled: boolean,
+    ) => {
+      const providerConfigs = settings.providerConfigs as Record<string, { enabled: boolean }>;
+      providerConfigs[providerId].enabled = enabled;
+      return true;
+    }),
     reconcileTitleGenerationModelSelection: jest.fn((settings: Record<string, unknown>) => {
       const titleGenerationModel = settings.titleGenerationModel;
       const customModels = (
@@ -91,18 +108,24 @@ jest.mock('@/shared/settings/EnvironmentSettingsSection', () => ({
 }));
 
 jest.mock('@/shared/settings/McpSettingsManager', () => ({
-  McpSettingsManager: jest.fn(),
+  McpSettingsManager: jest.fn((...args: unknown[]) => mockMcpSettingsManager(...args)),
 }));
 
 jest.mock('@/providers/claude/app/ClaudeWorkspaceServices', () => ({
   getClaudeWorkspaceServices: jest.fn(() => ({
     cliResolver: {
-      reset: jest.fn(),
+      reset: mockCliResolverReset,
     },
     commandCatalog: {},
-    agentManager: {},
+    vaultCommandRepository: mockVaultCommandRepository,
+    agentManager: {
+      loadAgents: mockAgentManagerLoadAgents,
+    },
     agentStorage: {},
     mcpStorage: {},
+    mcpManager: {
+      loadServers: mockMcpManagerLoadServers,
+    },
     pluginManager: {},
   })),
 }));
@@ -112,11 +135,15 @@ jest.mock('@/providers/claude/ui/AgentSettings', () => ({
 }));
 
 jest.mock('@/providers/claude/ui/PluginSettingsManager', () => ({
-  PluginSettingsManager: jest.fn(),
+  PluginSettingsManager: jest.fn((...args: unknown[]) => mockPluginSettingsManager(...args)),
 }));
 
 jest.mock('@/providers/claude/ui/SlashCommandSettings', () => ({
-  SlashCommandSettings: jest.fn(),
+  SlashCommandSettings: class MockSlashCommandSettings {
+    constructor(...args: unknown[]) {
+      mockSlashCommandSettings(...args);
+    }
+  },
 }));
 
 jest.mock('@/i18n/i18n', () => ({
@@ -349,12 +376,10 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
     },
     saveSettings: mockSaveSettings,
     normalizeModelVariantSettings: jest.fn(() => false),
-    recycleProviderRuntimes: jest.fn().mockResolvedValue(undefined),
-    getView: jest.fn(() => ({
-      getTabManager: jest.fn(() => ({
-        broadcastToAllTabs: jest.fn().mockResolvedValue(undefined),
-      })),
-    })),
+    runProviderExecutionTransition: jest.fn(async (
+      _providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => mutation()),
     app: {
       vault: {
         adapter: {
@@ -367,14 +392,22 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
     await mutation(plugin.settings);
     await plugin.saveSettings();
   });
+  plugin.applyProviderRuntimeSettings = jest.fn(async (
+    providerIds: string[],
+    mutation: (settings: any) => void | Promise<void>,
+    onApplied?: () => void | Promise<void>,
+  ) => plugin.runProviderExecutionTransition(providerIds, async () => {
+    await plugin.mutateSettings(mutation);
+    await onApplied?.();
+  }));
   return plugin;
 }
 
 function createContext(plugin: any) {
   return {
     plugin,
-    refreshModelSelectors: jest.fn(),
-    refreshTitleGenerationModelOptions: jest.fn(),
+    notifyProviderModelOptionsChanged: jest.fn(),
+    renderAgentSkillSettings: jest.fn(),
     renderHiddenProviderCommandSetting: jest.fn(),
     renderCustomContextLimits: jest.fn(),
   };
@@ -412,6 +445,171 @@ describe('ClaudeSettingsTab', () => {
     expect(cliPathInput.placeholder).not.toContain('cli.js');
   });
 
+  it('persists Claude enablement inside its execution transition and refreshes model options', async () => {
+    let transitionActive = false;
+    const plugin = createPlugin();
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => {
+      expect(providerIds).toEqual(['claude']);
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    });
+    plugin.mutateSettings.mockImplementation(async (
+      mutation: (settings: any) => void | Promise<void>,
+    ) => {
+      expect(transitionActive).toBe(true);
+      await mutation(plugin.settings);
+      await plugin.saveSettings();
+    });
+    const context = createContext(plugin);
+
+    claudeSettingsTabRenderer.render(createContainer(), context);
+    const toggle = findSetting('settings.providerEnablement.name').toggleComponents[0];
+    await toggle.onChangeCallback?.(false);
+
+    expect(plugin.settings.providerConfigs.claude.enabled).toBe(false);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('claude');
+  });
+
+  it('warns when disabling Claude would leave no enabled provider', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    const container = createContainer();
+    const coordinator = jest.requireMock('@/core/providers/ProviderSettingsCoordinator')
+      .ProviderSettingsCoordinator;
+    coordinator.canApplyProviderEnablement.mockImplementationOnce(() => false);
+
+    claudeSettingsTabRenderer.render(container, context);
+    const warningCallIndex = container.createDiv.mock.calls.findIndex(
+      ([options]: [{ text?: string }?]) => options?.text
+        === 'settings.providerEnablement.lastProviderWarning',
+    );
+    const warningEl = container.createDiv.mock.results[warningCallIndex]?.value;
+    const toggle = findSetting('settings.providerEnablement.name').toggleComponents[0];
+
+    await toggle.onChangeCallback?.(false);
+
+    expect(warningCallIndex).toBeGreaterThanOrEqual(0);
+    expect(warningEl.toggleClass).toHaveBeenLastCalledWith('claudian-hidden', false);
+    expect(plugin.settings.providerConfigs.claude.enabled).toBe(true);
+    expect(plugin.runProviderExecutionTransition).not.toHaveBeenCalled();
+    expect(coordinator.applyProviderEnablement).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+
+    await toggle.onChangeCallback?.(true);
+  });
+
+  it('persists and applies a CLI path inside the Claude execution transition', async () => {
+    mockedExistsSync.mockImplementation((filePath: fs.PathLike) => (
+      String(filePath) === '/custom/claude'
+    ));
+    let transitionActive = false;
+    const plugin = createPlugin();
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => {
+      expect(providerIds).toEqual(['claude']);
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    });
+    plugin.mutateSettings.mockImplementation(async (
+      mutation: (settings: any) => void | Promise<void>,
+    ) => {
+      expect(transitionActive).toBe(true);
+      await mutation(plugin.settings);
+      await plugin.saveSettings();
+    });
+    mockCliResolverReset.mockImplementation(() => {
+      expect(transitionActive).toBe(true);
+    });
+
+    claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    await findSetting('settings.cliPath.name')
+      .textComponents[0]
+      .onChangeCallback?.('/custom/claude');
+
+    expect(plugin.runProviderExecutionTransition).toHaveBeenCalledWith(
+      ['claude'],
+      expect.any(Function),
+    );
+    expect(plugin.applyProviderRuntimeSettings).toHaveBeenCalledWith(
+      ['claude'],
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(plugin.settings.providerConfigs.claude.cliPathsByHost).toEqual({
+      'host-a': '/custom/claude',
+    });
+    expect(mockCliResolverReset).toHaveBeenCalledTimes(1);
+  });
+
+  it('reloads Claude MCP state inside the execution transition', async () => {
+    let transitionActive = false;
+    const plugin = createPlugin();
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => {
+      expect(providerIds).toEqual(['claude']);
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    });
+    mockMcpManagerLoadServers.mockImplementation(async () => {
+      expect(transitionActive).toBe(true);
+    });
+
+    claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    const dependencies = mockMcpSettingsManager.mock.calls[0]?.[1] as {
+      broadcastMcpReload(): Promise<void>;
+    };
+    await dependencies.broadcastMcpReload();
+
+    expect(mockMcpManagerLoadServers).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates Claude plugin and agent configuration inside the execution transition', async () => {
+    let transitionActive = false;
+    const plugin = createPlugin();
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => {
+      expect(providerIds).toEqual(['claude']);
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    });
+    mockAgentManagerLoadAgents.mockImplementation(async () => {
+      expect(transitionActive).toBe(true);
+    });
+
+    claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    const dependencies = mockPluginSettingsManager.mock.calls[0]?.[1] as {
+      restartTabs(): Promise<void>;
+    };
+    await dependencies.restartTabs();
+
+    expect(mockAgentManagerLoadAgents).toHaveBeenCalledTimes(1);
+  });
+
   it('does not render obsolete Opus and Sonnet 1M toggles', () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
@@ -420,6 +618,85 @@ describe('ClaudeSettingsTab', () => {
 
     expect(createdSettings.map(setting => setting.name)).not.toContain('settings.enableOpus1M.name');
     expect(createdSettings.map(setting => setting.name)).not.toContain('settings.enableSonnet1M.name');
+  });
+
+  it('renders Models before Safety', () => {
+    claudeSettingsTabRenderer.render(createContainer(), createContext(createPlugin()));
+
+    const headings = createdSettings.filter(setting => setting.heading).map(setting => setting.name);
+    expect(headings.indexOf('settings.models')).toBeLessThan(
+      headings.indexOf('settings.safety'),
+    );
+  });
+
+  it('renders and persists the Claude provider default from dynamic model options', async () => {
+    const plugin = createPlugin();
+    plugin.settings.providerConfigs.claude.defaultModel = 'claude-code/claude-opus-4-6';
+    const context = createContext(plugin);
+
+    claudeSettingsTabRenderer.render(createContainer(), context);
+
+    const setting = findSetting('Default model');
+    const dropdown = setting.dropdownComponents[0];
+    expect(dropdown.value).toBe('claude-code/claude-opus-4-6');
+    expect(dropdown.options).toEqual(expect.arrayContaining([
+      { value: 'opus', label: 'Opus' },
+      { value: 'claude-code/claude-opus-4-6', label: 'Opus 4.6' },
+    ]));
+
+    await dropdown.onChangeCallback?.('opus');
+
+    expect(plugin.settings.providerConfigs.claude.defaultModel).toBe('opus');
+    expect(mockSaveSettings).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+  });
+
+  it('stores an unambiguous Claude environment slot as the provider default', async () => {
+    const plugin = createPlugin();
+    plugin.settings.providerConfigs.claude.environmentVariables = [
+      'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-enterprise',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-enterprise',
+    ].join('\n');
+    const context = createContext(plugin);
+
+    claudeSettingsTabRenderer.render(createContainer(), context);
+
+    const dropdown = findSetting('Default model').dropdownComponents[0];
+    expect(dropdown.value).toBe('claude-code/claude-opus-enterprise');
+
+    await dropdown.onChangeCallback?.('claude-code/claude-sonnet-enterprise');
+
+    expect(plugin.settings.providerConfigs.claude.defaultModel).toBe('sonnet');
+  });
+
+  it('keeps Claude CRUD on its explicit vault repository without the shared manager', () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+
+    claudeSettingsTabRenderer.render(createContainer(), context);
+
+    expect(context.renderAgentSkillSettings).not.toHaveBeenCalled();
+    expect(mockSlashCommandSettings).toHaveBeenCalledWith(
+      expect.anything(),
+      plugin.app,
+      mockVaultCommandRepository,
+    );
+  });
+
+  it('scopes custom model overrides to the Claude environment section', () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    const target = createContainer();
+
+    claudeSettingsTabRenderer.render(createContainer(), context);
+
+    const environmentOptions = mockRenderEnvironmentSettingsSection.mock.calls[0]?.[0];
+    expect(environmentOptions).toEqual(expect.objectContaining({
+      scope: 'provider:claude',
+      renderCustomContextLimits: expect.any(Function),
+    }));
+    environmentOptions.renderCustomContextLimits(target);
+    expect(context.renderCustomContextLimits).toHaveBeenCalledWith(target, 'claude');
   });
 
   it('does not switch the active model while the custom models textarea is mid-edit', async () => {
@@ -436,7 +713,7 @@ describe('ClaudeSettingsTab', () => {
     expect(plugin.settings.providerConfigs.claude.customModels).toBe('claude-opus-4-6');
     expect(plugin.settings.model).toBe('claude-opus-4-6');
     expect(mockSaveSettings).not.toHaveBeenCalled();
-    expect(context.refreshModelSelectors).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
   });
 
   it('offers auto as a Claude safe mode and persists it', async () => {
@@ -478,6 +755,6 @@ describe('ClaudeSettingsTab', () => {
     expect(plugin.settings.model).toBe('sonnet');
     expect(plugin.settings.titleGenerationModel).toBe('');
     expect(mockSaveSettings).toHaveBeenCalledTimes(1);
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('claude');
   });
 });

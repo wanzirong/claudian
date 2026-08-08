@@ -14,36 +14,81 @@ import {
 } from '@/providers/codex/settings';
 
 const mockGetHostnameKey = jest.fn(() => 'host-a');
-const mockGetLegacyHostnameKey = jest.fn(() => 'legacy-host');
 const originalPlatform = process.platform;
 
 jest.mock('@/utils/env', () => ({
   ...jest.requireActual('@/utils/env'),
   getHostnameKey: () => mockGetHostnameKey(),
-  getLegacyHostnameKey: () => mockGetLegacyHostnameKey(),
 }));
 
 describe('codex settings', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetHostnameKey.mockReturnValue('host-a');
-    mockGetLegacyHostnameKey.mockReturnValue('legacy-host');
   });
 
   afterEach(() => {
     Object.defineProperty(process, 'platform', { value: originalPlatform });
   });
 
-  it('defaults installationMethod to native-windows and leaves wslDistroOverride empty', () => {
+  it('defaults installationMethod to native-windows, ultra effort off, and leaves wslDistroOverride empty', () => {
     const settings = getCodexProviderSettings({});
 
     expect(settings.customModels).toBe('');
     expect(settings.modelAliases).toEqual({});
     expect(settings.visibleModels).toBeNull();
+    expect(settings.enableUltraEffort).toBe(false);
     expect(settings.installationMethod).toBe('native-windows');
     expect(settings.wslDistroOverride).toBe('');
     expect(settings.installationMethod).toBe(DEFAULT_CODEX_PROVIDER_SETTINGS.installationMethod);
     expect(settings.wslDistroOverride).toBe(DEFAULT_CODEX_PROVIDER_SETTINGS.wslDistroOverride);
+  });
+
+  it('rejects arrays and filters mixed hostname string maps', () => {
+    expect(getCodexProviderSettings({
+      providerConfigs: {
+        codex: {
+          cliPathsByHost: ['/array/codex'],
+          wslDistroOverridesByHost: {
+            ' host-a ': ' Ubuntu ',
+            invalid: 42,
+          },
+        },
+      },
+    })).toMatchObject({
+      cliPathsByHost: {},
+      wslDistroOverridesByHost: { 'host-a': 'Ubuntu' },
+    });
+  });
+
+  it('canonically normalizes hostname installation method maps before enum handling', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const persisted = Object.create({ inherited: 'wsl' }) as Record<string, unknown>;
+    Object.defineProperty(persisted, ' legacy-host ', {
+      enumerable: true,
+      value: ' wsl ',
+    });
+    Object.defineProperty(persisted, 'malformed-host', {
+      enumerable: true,
+      value: 42,
+    });
+    Object.defineProperty(persisted, '__proto__', {
+      enumerable: true,
+      value: 'native-windows',
+    });
+
+    const methods = getCodexProviderSettings({
+      providerConfigs: {
+        codex: { installationMethodsByHost: persisted },
+      },
+    }).installationMethodsByHost;
+
+    expect(methods['legacy-host']).toBe('wsl');
+    expect(methods.__proto__).toBe('native-windows');
+    expect(Object.keys(methods).sort()).toEqual(['__proto__', 'legacy-host']);
+    expect(Object.getPrototypeOf(methods)).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(methods, '__proto__')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(methods, 'inherited')).toBe(false);
   });
 
   it('treats a null visibility filter as all discovered models', () => {
@@ -72,7 +117,7 @@ describe('codex settings', () => {
     expect(createCodexVisibleModelFilter(
       ['gpt-5.5', 'gpt-5.4-mini'],
       discoveredModels,
-    )).toBeNull();
+    )).toEqual(['gpt-5.5', 'gpt-5.4-mini']);
   });
 
   it('normalizes model aliases against the discovered catalog', () => {
@@ -139,6 +184,7 @@ describe('codex settings', () => {
       defaultReasoningEffort: 'low',
       supportedReasoningEfforts: [
         { value: 'low', description: 'Fast' },
+        { value: 'ultra', description: 'Automatic task delegation' },
       ],
     });
 
@@ -147,6 +193,21 @@ describe('codex settings', () => {
       providerConfigs: {
         codex: {
           discoveredModels,
+        },
+      },
+    });
+  });
+
+  it('persists ultra effort as an explicit Codex opt-in', () => {
+    const settingsBag: Record<string, unknown> = {};
+
+    updateCodexProviderSettings(settingsBag, { enableUltraEffort: true });
+
+    expect(getCodexProviderSettings(settingsBag).enableUltraEffort).toBe(true);
+    expect(settingsBag).toMatchObject({
+      providerConfigs: {
+        codex: {
+          enableUltraEffort: true,
         },
       },
     });
@@ -180,6 +241,36 @@ describe('codex settings', () => {
       savedProviderModel: { codex: 'gpt-5.4-mini' },
       savedProviderEffort: { codex: 'medium' },
       savedProviderServiceTier: { codex: 'default' },
+    });
+  });
+
+  it('retargets projections to the first ordered model that is currently available', () => {
+    const ultraOnlyModel = {
+      ...TEST_CODEX_CATALOG[1],
+      model: 'gpt-ultra-only',
+      displayName: 'GPT Ultra Only',
+      supportedReasoningEfforts: [{ value: 'ultra', description: 'Ultra' }],
+    };
+    const settingsBag: Record<string, unknown> = {
+      settingsProvider: 'codex',
+      model: 'gpt-5.5',
+      savedProviderModel: { codex: 'gpt-5.5' },
+      providerConfigs: {
+        codex: {
+          discoveredModels: [ultraOnlyModel, ...TEST_CODEX_CATALOG],
+          enableUltraEffort: false,
+          visibleModels: null,
+        },
+      },
+    };
+
+    updateCodexProviderSettings(settingsBag, {
+      visibleModels: ['gpt-ultra-only', 'gpt-5.4-mini'],
+    });
+
+    expect(settingsBag).toMatchObject({
+      model: 'gpt-5.4-mini',
+      savedProviderModel: { codex: 'gpt-5.4-mini' },
     });
   });
 
@@ -217,9 +308,8 @@ describe('codex settings', () => {
     expect(settings.wslDistroOverride).toBe('');
   });
 
-  it('migrates current legacy hostname-scoped settings to the opaque device key', () => {
+  it('preserves hostname-scoped settings without assigning them to the current device', () => {
     mockGetHostnameKey.mockReturnValue('device:current');
-    mockGetLegacyHostnameKey.mockReturnValue('host-a');
 
     const settings = getCodexProviderSettings({
       providerConfigs: {
@@ -241,17 +331,17 @@ describe('codex settings', () => {
     });
 
     expect(settings.cliPathsByHost).toEqual({
-      'device:current': '/host-a/codex',
+      'host-a': '/host-a/codex',
       'host-b': '/host-b/codex',
     });
-    expect(settings.installationMethod).toBe('wsl');
+    expect(settings.installationMethod).toBe('native-windows');
     expect(settings.installationMethodsByHost).toEqual({
-      'device:current': 'wsl',
+      'host-a': 'wsl',
       'host-b': 'native-windows',
     });
-    expect(settings.wslDistroOverride).toBe('Ubuntu');
+    expect(settings.wslDistroOverride).toBe('');
     expect(settings.wslDistroOverridesByHost).toEqual({
-      'device:current': 'Ubuntu',
+      'host-a': 'Ubuntu',
       'host-b': 'Debian',
     });
   });
@@ -372,7 +462,6 @@ describe('codex settings', () => {
       {
         platform: 'darwin',
         hostnameKey: 'host-a',
-        legacyHostnameKey: 'legacy-host',
       },
     );
 
@@ -403,7 +492,6 @@ describe('codex settings', () => {
       {
         platform: 'win32',
         hostnameKey: 'host-a',
-        legacyHostnameKey: 'legacy-host',
       },
     );
 

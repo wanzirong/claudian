@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 
 import { parsePathEntries, resolveNvmDefaultBin } from './path';
@@ -392,41 +391,6 @@ export function getHostnameKey(): string {
   }
 
   return cachedDeviceSettingsKey;
-}
-
-export function getLegacyHostnameKey(): string {
-  try {
-    return os.hostname();
-  } catch {
-    return '';
-  }
-}
-
-export function migrateLegacyHostnameKeyedMap<T extends string>(
-  entries: Record<string, T>,
-  currentKey: string,
-  legacyHostnameKey: string,
-): Record<string, T> {
-  if (!currentKey || !legacyHostnameKey || currentKey === legacyHostnameKey) {
-    return entries;
-  }
-
-  const hasCurrentEntry = hasOwnEntry(entries, currentKey);
-  const hasLegacyEntry = hasOwnEntry(entries, legacyHostnameKey);
-  if (!hasLegacyEntry) {
-    return entries;
-  }
-
-  const migrated = { ...entries };
-  if (!hasCurrentEntry) {
-    migrated[currentKey] = entries[legacyHostnameKey];
-  }
-  delete migrated[legacyHostnameKey];
-  return migrated;
-}
-
-function hasOwnEntry<T>(entries: Record<string, T>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(entries, key) === true;
 }
 
 export const MIN_CONTEXT_LIMIT = 1_000;

@@ -1,6 +1,6 @@
 import type { SDKToolUseResult } from './diff';
 import type { ProviderId } from './provider';
-import type { SubagentMode, ToolCallInfo } from './tools';
+import type { SubagentMode, ToolCallInfo, ToolProviderPayload } from './tools';
 
 /** Fork origin reference: identifies the source session and checkpoint. */
 export interface ForkSource {
@@ -27,12 +27,73 @@ export interface ImageAttachment {
   source: 'file' | 'paste' | 'drop';
 }
 
+export interface ExecutionInputCurrentNoteSnapshot {
+  path: string;
+  content?: string;
+}
+
+export interface ExecutionInputCursorSnapshot {
+  beforeCursor: string;
+  afterCursor: string;
+  isInbetween: boolean;
+  line: number;
+  column: number;
+}
+
+export interface ExecutionInputEditorSnapshot {
+  notePath: string;
+  mode: 'selection' | 'cursor' | 'none';
+  selectedText?: string;
+  cursorContext?: ExecutionInputCursorSnapshot;
+  lineCount?: number;
+  startLine?: number;
+}
+
+export interface ExecutionInputBrowserSnapshot {
+  source: string;
+  selectedText: string;
+  title?: string;
+  url?: string;
+}
+
+export interface ExecutionInputCanvasSnapshot {
+  canvasPath: string;
+  nodeIds: string[];
+}
+
+export interface ExecutionInputContextSnapshot {
+  currentNote?: ExecutionInputCurrentNoteSnapshot;
+  editorSelection?: ExecutionInputEditorSnapshot | null;
+  browserSelection?: ExecutionInputBrowserSnapshot | null;
+  canvasSelection?: ExecutionInputCanvasSnapshot | null;
+}
+
+/** Canonical feature-owned input, before provider-native prompt formatting. */
+export interface ExecutionInputSnapshot {
+  schemaVersion: 1;
+  canonicalText: string;
+  context?: ExecutionInputContextSnapshot;
+}
+
+export interface CitationEntry {
+  path: string;
+  lineStart: number;
+  lineEnd: number;
+  note: string;
+}
+
+export interface CitationGroup {
+  kind: 'memory';
+  entries: CitationEntry[];
+}
+
 /** Content block for preserving streaming order in messages. */
 export type ContentBlock =
   | { type: 'text'; content: string }
   | { type: 'tool_use'; toolId: string }
   | { type: 'thinking'; content: string; durationSeconds?: number }
   | { type: 'subagent'; subagentId: string; mode?: SubagentMode }
+  | { type: 'citations'; citations: CitationGroup }
   | { type: 'context_compacted' };
 
 /** Chat message with content, tool calls, and attachments. */
@@ -47,6 +108,8 @@ export interface ChatMessage {
   contentBlocks?: ContentBlock[];
   currentNote?: string;
   images?: ImageAttachment[];
+  /** Canonical submitted input correlated from Claudian-owned persistence. */
+  executionInput?: ExecutionInputSnapshot;
   /** True if this message represents a user interrupt (from SDK storage). */
   isInterrupt?: boolean;
   /** True if this message is rebuilt context sent to SDK on session reset (should be hidden). */
@@ -61,22 +124,33 @@ export interface ChatMessage {
   assistantMessageId?: string;
 }
 
+export function isCanonicalUserMessage(message: ChatMessage): boolean {
+  return message.role === 'user'
+    && !message.isInterrupt
+    && !message.isRebuiltContext;
+}
+
 /** Persisted conversation with messages and session state. */
 export interface Conversation {
   id: string;
   providerId: ProviderId;
   title: string;
   createdAt: number;
-  updatedAt: number;
-  /** Timestamp when the last agent response completed. */
-  lastResponseAt?: number;
+  /** Timestamp of the most recent user or agent conversation activity. */
+  lastActivityAt: number;
   sessionId: string | null;
   /** Conversation-owned model selection. Missing values are migrated lazily. */
   selectedModel?: string;
   /** Opaque provider-owned state bag (session tracking, fork metadata, etc.). */
   providerState?: Record<string, unknown>;
+  /** Read-only native locator retained solely for historical model recovery. */
+  modelRecoverySource?: ConversationModelRecoverySource;
   messages: ChatMessage[];
   currentNote?: string;
+  /** Whether the session is pinned in the dual-pane session manager. */
+  isPinned?: boolean;
+  /** Whether the session is archived and hidden from active session lists. */
+  isArchived?: boolean;
   /** Session-specific external context paths (directories with full access). Resets on new session. */
   externalContextPaths?: string[];
   /** Context window usage information. */
@@ -89,17 +163,31 @@ export interface Conversation {
   resumeAtMessageId?: string;
 }
 
+/** Native session locator that must never make an invalidated session resumable. */
+export interface ConversationModelRecoverySource {
+  sessionId: string | null;
+  providerState?: Record<string, unknown>;
+  resumeAtMessageId?: string;
+}
+
 /** Lightweight conversation metadata for the history dropdown. */
 export interface ConversationMeta {
   id: string;
   providerId: ProviderId;
+  /** Conversation-owned model selection, projected without hydrating history. */
+  selectedModel?: string;
   title: string;
   createdAt: number;
-  updatedAt: number;
-  /** Timestamp when the last agent response completed. */
-  lastResponseAt?: number;
+  /** Timestamp of the most recent user or agent conversation activity. */
+  lastActivityAt: number;
   messageCount: number;
   preview: string;
+  /** Vault-relative path of the note linked to this session. */
+  currentNote?: string;
+  /** Whether the session is pinned in the dual-pane session manager. */
+  isPinned?: boolean;
+  /** Whether the session is archived and hidden from active session lists. */
+  isArchived?: boolean;
   /** Status of AI title generation. */
   titleGenerationStatus?: 'pending' | 'success' | 'failed';
 }
@@ -114,15 +202,18 @@ export interface SessionMetadata {
   title: string;
   titleGenerationStatus?: 'pending' | 'success' | 'failed';
   createdAt: number;
-  updatedAt: number;
-  lastResponseAt?: number;
+  lastActivityAt: number;
   /** Session ID used for provider resume (may be cleared when invalidated). */
   sessionId?: string | null;
   /** Conversation-owned model selection. */
   selectedModel?: string;
   /** Opaque provider-owned state bag. */
   providerState?: Record<string, unknown>;
+  /** Read-only native locator retained solely for historical model recovery. */
+  modelRecoverySource?: ConversationModelRecoverySource;
   currentNote?: string;
+  isPinned?: boolean;
+  isArchived?: boolean;
   externalContextPaths?: string[];
   enabledMcpServers?: string[];
   usage?: UsageInfo;
@@ -143,7 +234,14 @@ export type StreamChunk =
   | { type: 'assistant_message_start'; itemId?: string }
   | { type: 'text'; content: string }
   | { type: 'thinking'; content: string }
-  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'citations'; citations: CitationGroup }
+  | {
+      type: 'tool_use';
+      id: string;
+      name: string;
+      input: Record<string, unknown>;
+      providerPayload?: ToolProviderPayload;
+    }
   | { type: 'tool_result'; id: string; content: string; isError?: boolean; toolUseResult?: SDKToolUseResult }
   | { type: 'tool_output'; id: string; content: string }
   | {

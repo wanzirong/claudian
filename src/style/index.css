@@ -7,13 +7,14 @@
 @import "./base/animations.css";
 
 /* Components */
-@import "./components/header.css";
 @import "./components/tabs.css";
 @import "./components/history.css";
+@import "./components/vault-file-tree.css";
 @import "./components/messages.css";
 @import "./components/nav-sidebar.css";
 @import "./components/code.css";
 @import "./components/thinking.css";
+@import "./components/citations.css";
 @import "./components/toolcalls.css";
 @import "./components/status-panel.css";
 @import "./components/subagent.css";
@@ -56,6 +57,7 @@
 @import "./settings/mcp-settings.css";
 @import "./settings/plugin-settings.css";
 @import "./settings/agent-settings.css";
+@import "./settings/agent-skills.css";
 @import "./settings/provider-model-picker.css";
 
 /* Accessibility */

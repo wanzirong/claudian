@@ -2,61 +2,87 @@ import type { App } from 'obsidian';
 
 import type { SharedAppStorage } from '../core/bootstrap/storage';
 import type { ProviderHost } from '../core/providers/ProviderHost';
-import type { AppTabManagerState, ProviderId } from '../core/providers/types';
-import type { ChatRuntime } from '../core/runtime/ChatRuntime';
-import type { ClaudianSettings, Conversation, ConversationMeta } from '../core/types';
-import type { TabData, TabId, TabManagerViewHost } from './chat/tabs/types';
+import type { ProviderId } from '../core/providers/types';
+import type {
+  ClaudianSettings,
+  Conversation,
+  ConversationMeta,
+  StoredChatModelSelection,
+} from '../core/types';
+import type { ChatExecutionPersistence } from './chat/execution/ChatExecutionCoordinator';
+import type { WarmExecutionPool } from './chat/execution/WarmExecutionPool';
+import type { AssembledTabRuntime, TabId, TabManagerViewHost } from './chat/tabs/types';
 
 export interface FeatureTabManagerHost {
-  getAllTabs(): TabData[];
-  getTab(tabId: TabId): TabData | null;
+  canCreateTab(): boolean;
+  getAllTabs(): AssembledTabRuntime[];
+  getTab(tabId: TabId): AssembledTabRuntime | null;
   switchToTab(tabId: TabId): Promise<void>;
-  broadcastToAllTabs(action: (runtime: ChatRuntime) => Promise<void>): Promise<void>;
-  recycleProviderRuntimes(providerIds: ProviderId | ProviderId[]): Promise<void>;
+  closeTab(tabId: TabId, force?: boolean): Promise<boolean>;
+  primeProviderExecution(providerIds?: ProviderId | ProviderId[]): void;
+  invalidateProviderResources(providerIds: ProviderId | ProviderId[], generation: number): void;
 }
 
 export interface FeatureViewHost extends TabManagerViewHost {
-  getActiveTab(): TabData | null;
+  getActiveTab(): AssembledTabRuntime | null;
   getTabManager(): FeatureTabManagerHost | null;
-  refreshModelSelector(): void;
+  notifyConversationListChanged(): void;
+  refreshModelSelector(providerId?: ProviderId): void;
   refreshTabControls(): void;
+  refreshDualPaneLayout(): void;
   updateHiddenProviderCommands(): void;
+  invalidateProviderResources(providerIds: ProviderId[], generation: number): void;
+}
+
+export interface ChatModelSelectionPort {
+  beginIntent(): number;
+  commitIntent(
+    intent: number,
+    selection: StoredChatModelSelection,
+    isStillValid: () => boolean,
+  ): Promise<boolean>;
 }
 
 /** Application capabilities consumed by user-facing features. */
 export interface FeatureHost {
   readonly app: App;
+  readonly chatModelSelection: ChatModelSelectionPort;
+  readonly executionPersistence: ChatExecutionPersistence;
   readonly providerHost: ProviderHost;
   readonly settings: ClaudianSettings;
   readonly storage: SharedAppStorage;
+  readonly warmExecutionPool: WarmExecutionPool;
 
   mutateSettings(
     mutation: (settings: ClaudianSettings) => void | Promise<void>,
   ): Promise<void>;
   getActiveEnvironmentVariables(providerId?: ProviderId): string;
+  getAgentSkillResourceGeneration(): number;
+  notifyAgentSkillsChanged(): Promise<void>;
+  notifyProviderChatOptionsChanged(providerId: ProviderId): void;
 
   createConversation(options?: {
     providerId?: ProviderId;
     sessionId?: string;
     selectedModel?: string;
+    currentNote?: string;
   }): Promise<Conversation>;
   switchConversation(id: string): Promise<Conversation | null>;
-  deleteConversation(
-    id: string,
-    options?: { deleteProviderSession?: boolean },
-  ): Promise<void>;
+  deleteConversation(id: string): Promise<void>;
   handleMissingProviderSession(
     id: string,
     missingProviderSessionId?: string,
   ): Promise<'deleted' | 'reset' | 'preserved' | 'not_found'>;
   renameConversation(id: string, title: string): Promise<void>;
+  setConversationPinned(id: string, isPinned: boolean): Promise<void>;
+  setLinkedNotePinned(notePath: string, isPinned: boolean): Promise<void>;
+  setConversationArchived(id: string, isArchived: boolean): Promise<void>;
   updateConversation(id: string, updates: Partial<Conversation>): Promise<void>;
   getConversationById(id: string): Promise<Conversation | null>;
   getCachedConversation(id: string): Conversation | null;
   getConversationSync(id: string): Conversation | null;
   getConversationList(): ConversationMeta[];
 
-  persistTabManagerState(state: AppTabManagerState): Promise<void>;
   getView(): FeatureViewHost | null;
   getAllViews(): FeatureViewHost[];
   findConversationAcrossViews(
