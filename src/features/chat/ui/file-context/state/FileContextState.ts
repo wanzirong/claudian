@@ -1,7 +1,6 @@
 export class FileContextState {
   private attachedFiles: Set<string> = new Set();
   private sessionStarted = false;
-  private mentionedMcpServers: Set<string> = new Set();
   private currentNoteSent = false;
   private lineRangeMentions: Map<string, { startLine: number; endLine: number }> = new Map();
 
@@ -30,7 +29,6 @@ export class FileContextState {
     this.sessionStarted = false;
     this.currentNoteSent = false;
     this.attachedFiles.clear();
-    this.clearMcpMentions();
     this.lineRangeMentions.clear();
   }
 
@@ -38,7 +36,6 @@ export class FileContextState {
     this.currentNoteSent = hasMessages;
     this.attachedFiles.clear();
     this.sessionStarted = hasMessages;
-    this.clearMcpMentions();
     this.lineRangeMentions.clear();
   }
 
@@ -61,29 +58,6 @@ export class FileContextState {
     this.attachedFiles.clear();
   }
 
-  getMentionedMcpServers(): Set<string> {
-    return new Set(this.mentionedMcpServers);
-  }
-
-  clearMcpMentions(): void {
-    this.mentionedMcpServers.clear();
-  }
-
-  setMentionedMcpServers(mentions: Set<string>): boolean {
-    const changed =
-      mentions.size !== this.mentionedMcpServers.size ||
-      [...mentions].some(name => !this.mentionedMcpServers.has(name));
-
-    if (changed) {
-      this.mentionedMcpServers = new Set(mentions);
-    }
-
-    return changed;
-  }
-
-  addMentionedMcpServer(name: string): void {
-    this.mentionedMcpServers.add(name);
-  }
 
   getLineRangeMentions(): Map<string, { startLine: number; endLine: number }> {
     return new Map(this.lineRangeMentions);

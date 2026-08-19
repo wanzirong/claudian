@@ -69,6 +69,7 @@ import { type InlineEditContext, InlineEditModal } from './features/inline-edit/
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n/i18n';
 import type { Locale } from './i18n/types';
+import { deleteLegacyMcpConfig } from './providers/claude/storage/LegacyMcpConfigCleanup';
 import { buildCursorContext } from './utils/editor';
 import { revealWorkspaceLeaf } from './utils/obsidianCompat';
 import { getVaultPath } from './utils/path';
@@ -145,6 +146,7 @@ export default class ClaudianPlugin extends Plugin {
   private remainingSessionMetadataLoad: Promise<void> | null = null;
   private providerChatOptionsChangeTail: Promise<void> = Promise.resolve();
   private isUnloading = false;
+  private applicationShutdownPromise: Promise<void> | null = null;
 
   get executionPersistence(): ChatExecutionPersistence {
     return this.conversationRepository;
@@ -317,11 +319,24 @@ export default class ClaudianPlugin extends Plugin {
       this.sessionMetadataLoadTimer = null;
     }
     StartupProfiler.freeze();
-    void Promise.all(
-      this.getAllViews().map(view => view.flushCurrentTabState()),
-    ).catch(() => undefined);
-    void this.executionLifecycleRegistry.dispose();
-    void ProviderWorkspaceRegistry.disposeInitialized();
+    this.applicationShutdownPromise ??= this.shutdownApplication();
+    void this.applicationShutdownPromise.catch(() => undefined);
+  }
+
+  private async shutdownApplication(): Promise<void> {
+    await Promise.allSettled(
+      this.getAllViews().map(view => view.prepareForPluginUnload()),
+    );
+    try {
+      await this.executionLifecycleRegistry.dispose();
+    } catch {
+      // Continue releasing provider workspaces even if execution cleanup fails.
+    }
+    try {
+      await ProviderWorkspaceRegistry.disposeInitialized();
+    } catch {
+      // Obsidian teardown has no error channel; workspace cleanup is best effort.
+    }
   }
 
   async activateView() {
@@ -404,6 +419,11 @@ export default class ClaudianPlugin extends Plugin {
     this.hasLoadedAllSessionMetadata = false;
     const sharedStorage = new SharedStorageService(this);
     this.storage = sharedStorage;
+    try {
+      await deleteLegacyMcpConfig(sharedStorage.getAdapter());
+    } catch {
+      new Notice('Failed to remove obsolete Claude configuration');
+    }
     const { claudian } = await sharedStorage.initialize();
     this.settings = {
       ...DEFAULT_CLAUDIAN_SETTINGS,
@@ -895,7 +915,6 @@ export default class ClaudianPlugin extends Plugin {
       isPinned: meta.isPinned,
       isArchived: meta.isArchived,
       externalContextPaths: meta.externalContextPaths,
-      enabledMcpServers: meta.enabledMcpServers,
       usage: meta.usage,
       titleGenerationStatus: meta.titleGenerationStatus,
       resumeAtMessageId: meta.resumeAtMessageId,

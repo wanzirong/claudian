@@ -14,7 +14,13 @@ import { isDefaultClaudeModel, resolveContextWindowSize } from '../types/models'
 import { createTransformStreamState, type TransformStreamState } from './toolInputStreamState';
 
 type ToolUseFields = { id: string; name: string; input: Record<string, unknown> };
-type ToolResultFields = { id: string; content: string; isError?: boolean; toolUseResult?: SDKToolUseResult };
+type ToolResultFields = {
+  id: string;
+  content: string;
+  isError?: boolean;
+  isBlocked?: boolean;
+  toolUseResult?: SDKToolUseResult;
+};
 type AsyncSubagentCompletionStatus = ClaudeAsyncSubagentCompletionEvent['status'];
 
 export { createTransformStreamState };
@@ -321,24 +327,39 @@ function samePromptUsage(a: PromptUsageSnapshot, b: PromptUsageSnapshot): boolea
 
 function buildUsageInfo(promptUsage: PromptUsageSnapshot, options?: TransformOptions): UsageInfo {
   const model = options?.intendedModel ?? 'sonnet';
-  const contextWindowResolution = resolveContextWindowSize(
-    model,
-    options?.customContextLimits,
-    options?.authoritativeContextWindow,
-  );
-  const { contextWindow } = contextWindowResolution;
-  const percentage = Math.min(100, Math.max(0, Math.round((promptUsage.contextTokens / contextWindow) * 100)));
-
-  return {
+  return recalculateClaudeUsageContextWindow({
     model,
     inputTokens: promptUsage.inputTokens,
     cacheCreationInputTokens: promptUsage.cacheCreationInputTokens,
     cacheReadInputTokens: promptUsage.cacheReadInputTokens,
-    contextWindow,
-    ...(contextWindowResolution.source === 'runtime' ? { contextWindowIsAuthoritative: true } : {}),
+    contextWindow: 0,
     contextTokens: promptUsage.contextTokens,
-    percentage,
+    percentage: 0,
+  }, options?.customContextLimits, options?.authoritativeContextWindow);
+}
+
+export function recalculateClaudeUsageContextWindow(
+  usage: UsageInfo,
+  customContextLimits?: Record<string, number>,
+  runtimeContextWindow?: number,
+): UsageInfo {
+  const contextWindowResolution = resolveContextWindowSize(
+    usage.model ?? 'sonnet',
+    customContextLimits,
+    runtimeContextWindow,
+  );
+  const { contextWindow } = contextWindowResolution;
+  const nextUsage: UsageInfo = {
+    ...usage,
+    contextWindow,
+    percentage: Math.min(100, Math.max(0, Math.round((usage.contextTokens / contextWindow) * 100))),
   };
+  if (contextWindowResolution.source === 'runtime') {
+    nextUsage.contextWindowIsAuthoritative = true;
+  } else {
+    delete nextUsage.contextWindowIsAuthoritative;
+  }
+  return nextUsage;
 }
 
 export function createTransformUsageState(): TransformUsageState {
@@ -413,6 +434,13 @@ export function* transformSDKMessage(
         if (notification) {
           yield notification;
         }
+      } else if (message.subtype === 'permission_denied') {
+        yield emitToolResult(message.agent_id ?? null, {
+          id: message.tool_use_id,
+          content: message.message,
+          isError: true,
+          isBlocked: true,
+        });
       }
       break;
 
@@ -584,14 +612,6 @@ export function* transformSDKMessage(
         }
         options.usageState.clear();
       }
-      if (isResultError(message)) {
-        const content = message.errors.filter((e) => e.trim().length > 0).join('\n');
-        yield {
-          type: 'error',
-          content: content || `Result error: ${message.subtype}`,
-        };
-      }
-
       // Usage is now extracted from assistant messages for accuracy (excludes subagent tokens)
       // Result message usage is aggregated across main + subagents, causing inaccurate spikes
 
@@ -601,6 +621,13 @@ export function* transformSDKMessage(
         if (selectedEntry) {
           yield { type: 'context_window', contextWindow: selectedEntry.contextWindow };
         }
+      }
+      if (isResultError(message)) {
+        const content = message.errors.filter((e) => e.trim().length > 0).join('\n');
+        yield {
+          type: 'error',
+          content: content || `Result error: ${message.subtype}`,
+        };
       }
       break;
 

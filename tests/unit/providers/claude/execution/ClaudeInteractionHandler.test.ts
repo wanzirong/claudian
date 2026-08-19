@@ -23,6 +23,7 @@ function createPort(): jest.Mocked<ProviderInteractionPort> {
 
 function createHandler(
   port: jest.Mocked<ProviderInteractionPort>,
+  onToolBlocked: jest.Mock = jest.fn(),
 ): CanUseTool {
   return createClaudeExecutionCanUseTool({
     interactionPort: port,
@@ -31,6 +32,7 @@ function createHandler(
     isToolAllowed: () => true,
     getPermissionMode: () => 'normal',
     resolveSdkPermissionMode: () => 'default',
+    onToolBlocked,
   });
 }
 
@@ -41,6 +43,62 @@ const nativeOptions = {
 };
 
 describe('createClaudeExecutionCanUseTool', () => {
+  it('allows only the current invocation for an allow-once decision', async () => {
+    const port = createPort();
+    port.requestApproval.mockImplementation(async (request) => ({
+      interactionId: request.interactionId,
+      decision: 'allow',
+    }));
+    const handler = createHandler(port);
+    const input = { command: 'ls /external/path' };
+    const suggestions = [{
+      type: 'addRules' as const,
+      behavior: 'allow' as const,
+      rules: [{ toolName: 'Bash', ruleContent: 'ls *' }],
+      destination: 'session' as const,
+    }];
+
+    const result = await handler('Bash', input, {
+      ...nativeOptions,
+      suggestions,
+    });
+
+    expect(result).toEqual({
+      behavior: 'allow',
+      updatedInput: input,
+      decisionClassification: 'user_temporary',
+    });
+  });
+
+  it('applies provider suggestions only for an always-allow decision', async () => {
+    const port = createPort();
+    const handler = createHandler(port);
+    const input = { command: 'git status' };
+    const suggestions = [{
+      type: 'addRules' as const,
+      behavior: 'allow' as const,
+      rules: [{ toolName: 'Bash', ruleContent: 'git *' }],
+      destination: 'session' as const,
+    }];
+
+    const result = await handler('Bash', input, {
+      ...nativeOptions,
+      suggestions,
+    });
+
+    expect(result).toEqual({
+      behavior: 'allow',
+      updatedInput: input,
+      updatedPermissions: [{
+        type: 'addRules',
+        behavior: 'allow',
+        rules: [{ toolName: 'Bash', ruleContent: 'git *' }],
+        destination: 'projectSettings',
+      }],
+      decisionClassification: 'user_permanent',
+    });
+  });
+
   it('routes approvals with stable native/local identity and dismisses the exact interaction', async () => {
     const port = createPort();
     const handler = createHandler(port);
@@ -68,6 +126,25 @@ describe('createClaudeExecutionCanUseTool', () => {
       'claude:session-local:native-tool-1',
       'resolved',
     );
+  });
+
+  it('reports a denied approval against its native tool identity', async () => {
+    const port = createPort();
+    port.requestApproval.mockImplementation(async (request) => ({
+      interactionId: request.interactionId,
+      decision: 'deny',
+    }));
+    const onToolBlocked = jest.fn();
+    const handler = createHandler(port, onToolBlocked);
+
+    const result = await handler('Bash', { command: 'rm -rf /' }, nativeOptions);
+
+    expect(result).toEqual({
+      behavior: 'deny',
+      message: 'User denied this action.',
+      interrupt: false,
+    });
+    expect(onToolBlocked).toHaveBeenCalledWith('native-tool-1');
   });
 
   it('routes questions and injects Claude Code compatible custom-answer support', async () => {
@@ -128,8 +205,9 @@ describe('createClaudeExecutionCanUseTool', () => {
       sessionInstanceId: 'session-local',
       getTurnId: () => 'turn-local',
       isToolAllowed: (toolName) => toolName === 'Read',
-    getPermissionMode: () => 'normal',
+      getPermissionMode: () => 'normal',
       resolveSdkPermissionMode: () => 'default',
+      onToolBlocked: jest.fn(),
     });
 
     const result = await handler('Edit', {}, nativeOptions);

@@ -24,7 +24,6 @@ import type { ImageContextManager } from '../ui/ImageContext';
 import type {
   ContextUsageMeter,
   ExternalContextSelector,
-  McpServerSelector,
   ModelSelector,
   ModeSelector,
   PermissionToggle,
@@ -123,7 +122,6 @@ export interface TabUIComponents {
   readonly modeSelector: ModeSelector;
   readonly thinkingBudgetSelector: ThinkingBudgetSelector;
   readonly externalContextSelector: ExternalContextSelector;
-  readonly mcpServerSelector: McpServerSelector;
   readonly permissionToggle: PermissionToggle;
   readonly serviceTierToggle: ServiceTierToggle;
   readonly sendStopButton: SendStopButton;
@@ -312,6 +310,6 @@ export interface TabBarItem {
   providerId: ProviderId;
   isActive: boolean;
   isStreaming: boolean;
-  needsAttention: boolean;
+  attention: TabAttention;
   canClose: boolean;
 }

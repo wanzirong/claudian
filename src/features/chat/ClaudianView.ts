@@ -402,11 +402,10 @@ export class ClaudianView extends ItemView {
     this.eventRefs = [];
     this.restoreActiveInputToTabContent();
 
-    const shutdownSnapshotPromise = this.captureShutdownSnapshot(
+    const shutdownSnapshotPromise = this.ensureShutdownSnapshot(
       tabManager,
       tabStatePersistence,
     );
-    this.shutdownSnapshotPromise = shutdownSnapshotPromise;
     try {
       await shutdownSnapshotPromise;
       const ownsCloseLifecycle = this.viewShutdownStarted === true
@@ -433,6 +432,25 @@ export class ClaudianView extends ItemView {
         this.shutdownSnapshotPromise = null;
       }
     }
+  }
+
+  async prepareForPluginUnload(): Promise<void> {
+    const tabManager = this.tabManager;
+    tabManager?.beginShutdown();
+    await this.ensureShutdownSnapshot(tabManager, this.tabStatePersistence);
+  }
+
+  private ensureShutdownSnapshot(
+    tabManager: TabManager | null,
+    tabStatePersistence: TabStatePersistenceCoordinator | null,
+  ): Promise<void> {
+    if (this.shutdownSnapshotPromise) return this.shutdownSnapshotPromise;
+    const shutdownSnapshotPromise = this.captureShutdownSnapshot(
+      tabManager,
+      tabStatePersistence,
+    );
+    this.shutdownSnapshotPromise = shutdownSnapshotPromise;
+    return shutdownSnapshotPromise;
   }
 
   private async captureShutdownSnapshot(
@@ -915,6 +933,31 @@ export class ClaudianView extends ItemView {
       showOpenStateLabels: navigationMode === 'history',
       showOpenStateActions: navigationMode === 'history' && !isArchiveView,
       preserveListState: true,
+      showInlinePinAction: navigationMode === 'sessions',
+      onRequestInlineRename: ({ beginRename, conversationId }) => {
+        if (navigationMode === 'sessions' && this.isSessionSearchActive) {
+          this.closeSessionSearch();
+        }
+        const restoreAndRename = () => {
+          if (
+            navigationMode === 'history'
+            && (signal.aborted || this.historyDropdown !== container)
+          ) return;
+          const targetItem = Array.from(
+            container.querySelectorAll<HTMLElement>('.claudian-history-item'),
+          ).find(item => item.getAttribute('data-conversation-id') === conversationId);
+          if (!targetItem) return;
+
+          if (navigationMode === 'history') {
+            container.addClass('visible');
+          }
+          beginRename(targetItem);
+        };
+        scheduleAnimationFrame(
+          restoreAndRename,
+          container.ownerDocument.defaultView,
+        );
+      },
       sessionScope: isArchiveView ? 'archived' : 'active',
       sessionActionMode: isArchiveView ? 'archived' : 'active',
       historyHeaderLabel: isArchiveView ? 'Archived' : 'Sessions',
@@ -1188,7 +1231,6 @@ export class ClaudianView extends ItemView {
     return new VaultFileTree({
       app: this.plugin.app,
       hostEl,
-      sourceLeaf: this.leaf,
     });
   }
 
@@ -1978,6 +2020,7 @@ export class ClaudianView extends ItemView {
   private cancelHistoryRendering(): void {
     this.historyRenderAbortController?.abort();
     this.historyRenderAbortController = null;
+    this.historyDropdownDirty = true;
   }
 
   private cancelSessionSidebarRendering(): void {
@@ -2215,13 +2258,14 @@ export class ClaudianView extends ItemView {
         || this.isSessionSearchComposing
         || this.vaultFileTree?.isComposingSearch()
       ) return;
+      const activeTab = this.tabManager?.getActiveTab();
+      if (activeTab?.controllers.conversationController.cancelInlineRename()) return false;
       if (this.vaultFileTree?.handleEscape(e)) return false;
       if (this.isSessionSearchActive) {
         this.closeSessionSearch();
         return false;
       }
       if (!e.defaultPrevented) {
-        const activeTab = this.tabManager?.getActiveTab();
         if (activeTab?.state.isStreaming) {
           activeTab.controllers.inputController.cancelStreaming();
         }

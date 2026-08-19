@@ -1,5 +1,5 @@
 
-import { TFile, TFolder } from 'obsidian';
+import { Notice, TFile, TFolder } from 'obsidian';
 
 import { ConversationPersistenceStore } from '@/core/bootstrap/ConversationPersistenceStore';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
@@ -1112,21 +1112,43 @@ describe('ClaudianPlugin', () => {
       expect(disposeSpy).toHaveBeenCalledTimes(1);
     });
 
-    it('flushes the current tab identity when views are not closed first', async () => {
+    it('drains views before disposing execution and workspace resources', async () => {
       await plugin.onload();
-      const flushCurrentTabState = jest.fn().mockResolvedValue(undefined);
+      let resolveViewDrain!: () => void;
+      const viewDrain = new Promise<void>((resolve) => {
+        resolveViewDrain = resolve;
+      });
+      const prepareForPluginUnload = jest.fn(() => viewDrain);
       mockApp.workspace.getLeavesOfType.mockReturnValue([{
         view: {
-          flushCurrentTabState,
+          prepareForPluginUnload,
           getTabManager: jest.fn(),
         },
       }]);
+      const disposeExecution = jest.spyOn(
+        plugin.executionLifecycleRegistry,
+        'dispose',
+      ).mockResolvedValue(undefined);
+      const disposeWorkspaces = jest.spyOn(
+        ProviderWorkspaceRegistry,
+        'disposeInitialized',
+      ).mockResolvedValue(undefined);
 
       plugin.onunload();
       await Promise.resolve();
-      await Promise.resolve();
 
-      expect(flushCurrentTabState).toHaveBeenCalledTimes(1);
+      expect(prepareForPluginUnload).toHaveBeenCalledTimes(1);
+      expect(disposeExecution).not.toHaveBeenCalled();
+      expect(disposeWorkspaces).not.toHaveBeenCalled();
+
+      resolveViewDrain();
+      await (plugin as any).applicationShutdownPromise;
+
+      expect(disposeExecution).toHaveBeenCalledTimes(1);
+      expect(disposeWorkspaces).toHaveBeenCalledTimes(1);
+      expect(disposeExecution.mock.invocationCallOrder[0]).toBeLessThan(
+        disposeWorkspaces.mock.invocationCallOrder[0],
+      );
     });
   });
 
@@ -1220,6 +1242,33 @@ describe('ClaudianPlugin', () => {
   });
 
   describe('loadSettings', () => {
+    it('deletes the legacy Claude MCP configuration', async () => {
+      const files = installVaultFiles({
+        '.claude/mcp.json': JSON.stringify({
+          mcpServers: {
+            legacy: { command: 'legacy-server' },
+          },
+        }),
+      });
+
+      await plugin.loadSettings();
+
+      expect(mockApp.vault.adapter.remove).toHaveBeenCalledWith('.claude/mcp.json');
+      expect(files.has('.claude/mcp.json')).toBe(false);
+    });
+
+    it('continues loading when the legacy Claude MCP configuration cannot be deleted', async () => {
+      mockApp.vault.adapter.exists.mockImplementation(async (path: string) => (
+        path === '.claude/mcp.json'
+      ));
+      mockApp.vault.adapter.remove.mockRejectedValue(new Error('permission denied'));
+
+      await expect(plugin.loadSettings()).resolves.toBeUndefined();
+
+      expect(plugin.settings).toBeDefined();
+      expect(Notice).toHaveBeenCalledWith('Failed to remove obsolete Claude configuration');
+    });
+
     it('should merge saved data with defaults', async () => {
       // Mock claudian-settings.json exists with custom values (Claudian-specific settings)
       mockApp.vault.adapter.exists.mockImplementation(async (path: string) => {

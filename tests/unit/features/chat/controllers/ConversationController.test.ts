@@ -90,11 +90,6 @@ function createMockDeps(overrides: Record<string, unknown> = {}): ConversationCo
     getImageContextManager: () => ({
       clearImages: jest.fn(),
     }) as any,
-    getMcpServerSelector: () => ({
-      clearEnabled: jest.fn(),
-      getEnabledServers: jest.fn().mockResolvedValue(new Set()),
-      setEnabledServers: jest.fn(),
-    }) as any,
     getExternalContextSelector: () => ({
       getExternalContexts: jest.fn().mockReturnValue([]),
       setExternalContexts: jest.fn(),
@@ -2598,6 +2593,40 @@ describe('ConversationController', () => {
         expect(onSetConversationPinned).toHaveBeenCalledWith('pinned', false);
       });
 
+      it('hides the inline pin action without removing the context-menu action', () => {
+        const container = createMockEl();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'active', title: 'Active', createdAt: 2 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          onSetConversationArchived: jest.fn().mockResolvedValue(undefined),
+          onSetConversationPinned: jest.fn().mockResolvedValue(undefined),
+          sessionActionMode: 'active',
+          showInlinePinAction: false,
+          showOpenStateActions: false,
+        });
+
+        const item = container.querySelector('.claudian-history-item')!;
+        expect(item.querySelector('.claudian-pin-btn')).toBeNull();
+        expect(item.querySelector('.claudian-archive-btn')).not.toBeNull();
+
+        item.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+        const menu = (Menu as typeof Menu & {
+          instances: Array<{ items: Array<{ title: string }> }>;
+        }).instances.at(-1)!;
+        expect(menu.items.map(menuItem => menuItem.title)).toEqual([
+          'Pin',
+          'Rename',
+          'Archive',
+        ]);
+      });
+
       it('keeps rename in the active context menu and delete in Archived only', () => {
         const activeContainer = createMockEl();
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
@@ -2624,7 +2653,7 @@ describe('ConversationController', () => {
           }>;
         }).instances.at(-1)!;
         expect(menu.useNativeMenu).toBe(false);
-        expect(menu.items.map(item => item.title)).toEqual(['Pin', 'Archive', 'Rename']);
+        expect(menu.items.map(item => item.title)).toEqual(['Pin', 'Rename', 'Archive']);
 
         const archivedContainer = createMockEl();
         (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
@@ -2651,6 +2680,60 @@ describe('ConversationController', () => {
         }).instances.at(-1)!;
         expect(menu.useNativeMenu).toBe(false);
         expect(menu.items.map(item => item.title)).toEqual(['Restore', 'Delete']);
+      });
+
+      it('defers inline rename until the transient history surface is restored', async () => {
+        const container = createMockEl();
+        const onRerender = jest.fn();
+        const onRequestInlineRename = jest.fn();
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'active', title: 'Original title', createdAt: 2 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          onRerender,
+          onRequestInlineRename,
+          sessionActionMode: 'active',
+          showOpenStateActions: true,
+        });
+
+        const item = container.querySelector('.claudian-history-item')!;
+        const title = item.querySelector('.claudian-history-item-title')!;
+        title.replaceWith = jest.fn();
+        item.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+
+        const menu = (Menu as typeof Menu & {
+          instances: Array<{
+            items: Array<{ title: string; clickHandler: (() => void) | null }>;
+          }>;
+        }).instances.at(-1)!;
+        menu.items.find(menuItem => menuItem.title === 'Rename')?.clickHandler?.();
+
+        expect(title.replaceWith).not.toHaveBeenCalled();
+        expect(item.querySelector('.claudian-rename-input')).toBeNull();
+        expect(onRequestInlineRename).toHaveBeenCalledWith({
+          beginRename: expect.any(Function),
+          conversationId: 'active',
+        });
+
+        onRequestInlineRename.mock.calls[0][0].beginRename(item);
+        const input = item.querySelector('.claudian-rename-input')!;
+        expect(title.replaceWith).toHaveBeenCalledWith(input);
+        input.value = 'Renamed title';
+        input.blur();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(deps.plugin.renameConversation).toHaveBeenCalledWith(
+          'active',
+          'Renamed title',
+        );
+        expect(onRerender).toHaveBeenCalledTimes(1);
       });
     });
   });
@@ -2794,6 +2877,83 @@ describe('ConversationController', () => {
 
       expect(deps.plugin.renameConversation).toHaveBeenCalledWith('conv-1', 'New title');
       expect(onRerender).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not persist an unchanged inline rename', async () => {
+      const container = createMockEl();
+      const onRerender = jest.fn();
+      (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+        { id: 'conv-1', title: 'Original title', createdAt: 1000 },
+      ]);
+
+      controller.renderHistoryDropdown(container, {
+        onSelectConversation: jest.fn(),
+        onRerender,
+      });
+
+      const item = container.querySelector('.claudian-history-item')!;
+      const title = item.querySelector('.claudian-history-item-title')!;
+      title.replaceWith = jest.fn();
+      item.querySelector('.claudian-history-item-actions')!.children[0].click();
+      const input = item.querySelector('.claudian-rename-input')!;
+      input.value = '  Original title  ';
+      input.blur();
+      await Promise.resolve();
+
+      expect(deps.plugin.renameConversation).not.toHaveBeenCalled();
+      expect(onRerender).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancels the active inline rename without persisting the draft', async () => {
+      const container = createMockEl();
+      const onRerender = jest.fn();
+      (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+        { id: 'conv-1', title: 'Original title', createdAt: 1000 },
+      ]);
+
+      controller.renderHistoryDropdown(container, {
+        onSelectConversation: jest.fn(),
+        onRerender,
+      });
+
+      const item = container.querySelector('.claudian-history-item')!;
+      const title = item.querySelector('.claudian-history-item-title')!;
+      title.replaceWith = jest.fn();
+      item.querySelector('.claudian-history-item-actions')!.children[0].click();
+      const input = item.querySelector('.claudian-rename-input')!;
+      input.value = 'Unsaved title';
+
+      expect(controller.cancelInlineRename()).toBe(true);
+      await Promise.resolve();
+
+      expect(input.value).toBe('Original title');
+      expect(deps.plugin.renameConversation).not.toHaveBeenCalled();
+      expect(onRerender).toHaveBeenCalledTimes(1);
+      expect(controller.cancelInlineRename()).toBe(false);
+    });
+
+    it('releases inline rename ownership when its surface rerenders without blur', () => {
+      const container = createMockEl();
+      const options = {
+        onSelectConversation: jest.fn(),
+        onRerender: jest.fn(),
+      };
+      (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+        { id: 'conv-1', title: 'Original title', createdAt: 1000 },
+      ]);
+
+      controller.renderHistoryDropdown(container, options);
+      const item = container.querySelector('.claudian-history-item')!;
+      const title = item.querySelector('.claudian-history-item-title')!;
+      title.replaceWith = jest.fn();
+      item.querySelector('.claudian-history-item-actions')!.children[0].click();
+      const input = item.querySelector('.claudian-rename-input')!;
+      input.value = 'Detached draft';
+
+      controller.renderHistoryDropdown(container, options);
+
+      expect(controller.cancelInlineRename()).toBe(false);
+      expect(deps.plugin.renameConversation).not.toHaveBeenCalled();
     });
 
     it('should delete conversation and reload active when deleting current conversation', async () => {
@@ -3105,151 +3265,31 @@ describe('ConversationController - Title Generation', () => {
   });
 });
 
-describe('ConversationController - MCP Server Persistence', () => {
-  let controller: ConversationController;
-  let deps: ConversationControllerDeps;
-  let mockMcpServerSelector: any;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockMcpServerSelector = {
-      clearEnabled: jest.fn(),
-      getEnabledServers: jest.fn().mockReturnValue(new Set(['mcp-server-1', 'mcp-server-2'])),
-      setEnabledServers: jest.fn(),
+describe('ConversationController - provider switching', () => {
+  it('should ensure the tab service matches the switched conversation provider', async () => {
+    const ensureExecutionForConversation = jest.fn().mockResolvedValue(undefined);
+    const switchedConversation = {
+      id: 'new-conv',
+      providerId: 'codex',
+      title: 'Codex Conversation',
+      messages: [],
+      sessionId: null,
+      createdAt: Date.now(),
+      lastActivityAt: Date.now(),
     };
-    deps = createMockDeps({
-      getMcpServerSelector: () => mockMcpServerSelector,
+    const deps = createMockDeps({
+      ensureExecutionForConversation,
+      plugin: {
+        ...createMockDeps().plugin,
+        switchConversation: jest.fn().mockResolvedValue(switchedConversation),
+      } as any,
     });
-    controller = new ConversationController(deps);
-  });
+    const controller = new ConversationController(deps);
+    deps.state.currentConversationId = 'old-conv';
 
-  describe('save', () => {
-    it('should save enabled MCP servers to conversation', async () => {
-      deps.state.currentConversationId = 'conv-1';
+    await controller.switchTo('new-conv');
 
-      await controller.save();
-
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          enabledMcpServers: ['mcp-server-1', 'mcp-server-2'],
-        }),
-      );
-    });
-
-    it('should save undefined when no MCP servers enabled', async () => {
-      mockMcpServerSelector.getEnabledServers.mockReturnValue(new Set());
-      deps.state.currentConversationId = 'conv-1';
-
-      await controller.save();
-
-      expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
-        'conv-1',
-        expect.objectContaining({
-          enabledMcpServers: undefined,
-        }),
-      );
-    });
-  });
-
-  describe('loadActive', () => {
-    it('should restore enabled MCP servers from conversation', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue({
-        id: 'conv-1',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: ['restored-server-1', 'restored-server-2'],
-      });
-
-      await controller.loadActive();
-
-      expect(mockMcpServerSelector.setEnabledServers).toHaveBeenCalledWith([
-        'restored-server-1',
-        'restored-server-2',
-      ]);
-    });
-
-    it('should clear MCP servers when conversation has none', async () => {
-      deps.state.currentConversationId = 'conv-1';
-      (deps.plugin.getConversationById as jest.Mock).mockResolvedValue({
-        id: 'conv-1',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: undefined,
-      });
-
-      await controller.loadActive();
-
-      expect(mockMcpServerSelector.clearEnabled).toHaveBeenCalled();
-    });
-  });
-
-  describe('switchTo', () => {
-    it('should restore enabled MCP servers when switching conversations', async () => {
-      deps.state.currentConversationId = 'old-conv';
-      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue({
-        id: 'new-conv',
-        providerId: 'claude',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: ['switched-server'],
-      });
-
-      await controller.switchTo('new-conv');
-
-      expect(mockMcpServerSelector.setEnabledServers).toHaveBeenCalledWith(['switched-server']);
-    });
-
-    it('should clear MCP servers when switching to conversation with no servers', async () => {
-      deps.state.currentConversationId = 'old-conv';
-      (deps.plugin.switchConversation as jest.Mock).mockResolvedValue({
-        id: 'new-conv',
-        providerId: 'claude',
-        messages: [],
-        sessionId: null,
-        enabledMcpServers: undefined,
-      });
-
-      await controller.switchTo('new-conv');
-
-      expect(mockMcpServerSelector.clearEnabled).toHaveBeenCalled();
-    });
-
-    it('should ensure the tab service matches the switched conversation provider', async () => {
-      const ensureExecutionForConversation = jest.fn().mockResolvedValue(undefined);
-      const switchedConversation = {
-        id: 'new-conv',
-        providerId: 'codex',
-        title: 'Codex Conversation',
-        messages: [],
-        sessionId: null,
-        createdAt: Date.now(),
-        lastActivityAt: Date.now(),
-      };
-
-      deps = createMockDeps({
-        ensureExecutionForConversation,
-        plugin: {
-          ...createMockDeps().plugin,
-          switchConversation: jest.fn().mockResolvedValue(switchedConversation),
-        } as any,
-      });
-      controller = new ConversationController(deps);
-      deps.state.currentConversationId = 'old-conv';
-
-      await controller.switchTo('new-conv');
-
-      expect(ensureExecutionForConversation).toHaveBeenCalledWith(switchedConversation);
-    });
-  });
-
-  describe('createNew', () => {
-    it('should clear enabled MCP servers for new conversation', async () => {
-      await controller.createNew();
-
-      expect(mockMcpServerSelector.clearEnabled).toHaveBeenCalled();
-    });
+    expect(ensureExecutionForConversation).toHaveBeenCalledWith(switchedConversation);
   });
 });
 
