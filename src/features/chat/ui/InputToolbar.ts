@@ -1017,11 +1017,12 @@ export interface SendStopCallbacks {
   onStop: () => void;
 }
 
+/** Composer send button that becomes a stop button while a turn is streaming. */
 export class SendStopButton {
-  private container: HTMLElement;
-  private btnEl: HTMLElement;
+  private readonly container: HTMLElement;
+  private readonly btnEl: HTMLElement;
   private streaming = false;
-  private callbacks: SendStopCallbacks;
+  private readonly callbacks: SendStopCallbacks;
 
   constructor(parentEl: HTMLElement, callbacks: SendStopCallbacks) {
     this.callbacks = callbacks;

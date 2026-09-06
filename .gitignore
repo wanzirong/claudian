@@ -5,6 +5,8 @@ styles.css
 *.js.map
 dist/
 build/
+!tests/integration/build/
+!tests/integration/build/*.test.ts
 
 # Dependencies
 node_modules/
@@ -95,4 +97,3 @@ CLAUDE.local.md
 
 .claude/
 .codex/
-docs/superpowers/

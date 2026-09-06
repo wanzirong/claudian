@@ -11,18 +11,19 @@ import type {
 import type { BrowserSelectionContext } from '../../../utils/browser';
 import type { CanvasSelectionContext } from '../../../utils/canvas';
 import type { EditorSelectionContext } from '../../../utils/editor';
+import type { LineRangeMention } from '../../../utils/LineRangeMention';
 import type { ThinkingBlockState } from '../rendering/ThinkingBlockRenderer';
 import type { WriteEditState } from '../rendering/WriteEditRenderer';
 
 export interface ChatTurnRequest {
   text: string;
   images?: ImageAttachment[];
-  currentNotePath?: string;
+  linkedContentPath?: string;
   editorSelection?: EditorSelectionContext | null;
   browserSelection?: BrowserSelectionContext | null;
   canvasSelection?: CanvasSelectionContext | null;
   externalContextPaths?: string[];
-  lineRangeMentions?: Map<string, { startLine: number; endLine: number }>;
+  lineRangeMentions?: Map<string, LineRangeMention>;
 }
 
 /** Queued message waiting to be sent after current streaming completes. */
@@ -44,10 +45,19 @@ export interface PendingToolCall {
 
 export type TabAttentionKind = 'review' | 'action-required';
 
-export type TabAttention = {
-  kind: TabAttentionKind;
-  since: number;
-} | null;
+export type TabReviewOutcome = 'completed' | 'error';
+
+export type TabAttention =
+  | {
+      kind: 'review';
+      outcome: TabReviewOutcome;
+      since: number;
+    }
+  | {
+      kind: 'action-required';
+      since: number;
+    }
+  | null;
 
 /** Stored selection state from editor polling. */
 export interface StoredSelection {
