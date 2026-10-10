@@ -39,8 +39,6 @@ export class SendStopButton {
   private updateDisplay(): void {
     this.buttonEl.toggleClass('claudian-send-stop-btn--streaming', this.streaming);
     setIcon(this.buttonEl, this.streaming ? 'square' : 'arrow-up');
-    const label = this.streaming ? 'Stop generating' : 'Send message';
-    this.buttonEl.setAttribute('aria-label', label);
-    this.buttonEl.setAttribute('title', label);
+    this.buttonEl.setAttribute('aria-label', this.streaming ? 'Stop generating' : 'Send message');
   }
 }
