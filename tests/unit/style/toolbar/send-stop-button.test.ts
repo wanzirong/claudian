@@ -18,14 +18,20 @@ describe('Send/stop button styles', () => {
   });
 
   it('keeps the brand fill in every state where Obsidian restores native chrome', () => {
-    // A native button gets Obsidian's own fill back on hover, focus and active; any rule
-    // reaching the button in those states may only restate the brand surface.
+    // A native button gets Obsidian's own fill back on hover, focus, active and disabled;
+    // any rule reaching the button in those states may only restate the brand surface.
     const fills = rules()
       .filter(rule => rule.selectorText.includes('.claudian-send-stop-btn')
-        && /:(hover|focus|focus-visible|active)|:is\(/.test(rule.selectorText))
+        && /:(hover|focus|focus-visible|active|disabled)|:is\(/.test(rule.selectorText))
       .map(rule => rule.style.getPropertyValue('background').trim())
       .filter(Boolean);
     expect(fills).toEqual(['var(--claudian-brand)']);
+  });
+
+  it('marks the idle empty-composer state without dropping the fill', () => {
+    const disabledRule = rules().find(rule => rule.selectorText === 'button.claudian-send-stop-btn:disabled');
+    expect(disabledRule?.style.getPropertyValue('opacity')).toBe('0.4');
+    expect(disabledRule?.style.getPropertyValue('background')).toBe('');
   });
 
   it('takes the button chrome back from the host', () => {

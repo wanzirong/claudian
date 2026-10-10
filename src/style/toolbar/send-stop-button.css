@@ -5,7 +5,7 @@
 /* Filled primary surface on a native button: the reset must name the states where
    Obsidian restores its own chrome, per the control-reset rule. */
 button.claudian-send-stop-btn,
-button.claudian-send-stop-btn:is(:hover, :focus, :focus-visible, :active) {
+button.claudian-send-stop-btn:is(:hover, :focus, :focus-visible, :active, :disabled) {
   appearance: none;
   display: flex;
   align-items: center;
@@ -26,6 +26,12 @@ button.claudian-send-stop-btn:is(:hover, :focus, :focus-visible, :active) {
 
 button.claudian-send-stop-btn:hover {
   opacity: 0.85;
+}
+
+/* Idle with an empty composer: the action exists but has nothing to act on. */
+button.claudian-send-stop-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 button.claudian-send-stop-btn:focus-visible {

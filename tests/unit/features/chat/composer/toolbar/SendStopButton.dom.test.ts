@@ -10,13 +10,24 @@ HTMLElement.prototype.toggleClass = function (classes, value) {
   for (const name of typeof classes === 'string' ? [classes] : classes) this.classList.toggle(name, value);
 };
 
-function createButton() {
+function createButton(sendable = true) {
   const host = document.body.createDiv();
   const onSend = jest.fn();
   const onStop = jest.fn();
-  const control = new SendStopButton(host, { onSend, onStop });
+  let canSend = sendable;
+  const control = new SendStopButton(host, { onSend, onStop }, () => canSend);
   const button = within(host).getByRole<HTMLButtonElement>('button', { name: 'Send message' });
-  return { host, button, onSend, onStop, control };
+  return {
+    host,
+    button,
+    onSend,
+    onStop,
+    control,
+    setSendable: (value: boolean) => {
+      canSend = value;
+      control.refresh();
+    },
+  };
 }
 
 afterEach(() => {
@@ -28,6 +39,7 @@ describe('SendStopButton', () => {
   it('sends while idle and interrupts while streaming', async () => {
     const { host, button, onSend, onStop, control } = createButton();
     expect(button.type).toBe('button');
+    expect(button.disabled).toBe(false);
     expect(await axe(host)).toHaveNoViolations();
 
     button.click();
@@ -49,6 +61,30 @@ describe('SendStopButton', () => {
     expect(button.classList.contains('claudian-send-stop-btn--streaming')).toBe(false);
     button.click();
     expect(onSend).toHaveBeenCalledTimes(2);
+  });
+
+  it('is inactive while idle with an empty composer', () => {
+    const { button, onSend, onStop, setSendable } = createButton(false);
+    expect(button.disabled).toBe(true);
+
+    button.click();
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onStop).not.toHaveBeenCalled();
+
+    setSendable(true);
+    expect(button.disabled).toBe(false);
+  });
+
+  it('stays interruptible while streaming even with an empty composer', () => {
+    const { button, onStop, control, setSendable } = createButton(false);
+    setSendable(false);
+
+    control.setStreaming(true);
+
+    expect(button.disabled).toBe(false);
+    button.click();
+    expect(onStop).toHaveBeenCalledTimes(1);
   });
 
   it('swaps the icon with the streaming state', () => {

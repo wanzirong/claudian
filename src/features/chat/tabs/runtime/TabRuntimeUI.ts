@@ -375,6 +375,17 @@ function buildInputToolbar(
     onStop: () => {
       runtimeRef.current()?.controllers.inputController.cancelStreaming();
     },
+  }, () => {
+    const tab = runtimeRef.current();
+    return !!tab && (tab.dom.inputEl.value.trim().length > 0 || tab.ui.contextTray.hasContent);
+  });
+  // Programmatic composer rewrites do not emit input; a turn's streaming edges re-read the state.
+  const refreshSendStopButton = (): void => sendStopButton.refresh();
+  dom.inputEl.addEventListener('input', refreshSendStopButton);
+  dom.inputEl.addEventListener('compositionend', refreshSendStopButton);
+  options.registerCleanup('tab send/stop button state', () => {
+    dom.inputEl.removeEventListener('input', refreshSendStopButton);
+    dom.inputEl.removeEventListener('compositionend', refreshSendStopButton);
   });
   return { ...toolbarComponents, sendStopButton };
 }
@@ -398,6 +409,7 @@ export function buildTabRuntimeUI(
     onDidChange: () => {
       runtimeRef.current()?.renderer.scrollToBottomIfNeeded();
       runtimeRef.current()?.ui.promptSuggestion.refresh();
+      runtimeRef.current()?.ui.sendStopButton.refresh();
     },
   });
   options.registerCleanup('tab composer context tray', () => contextTray.destroy());
